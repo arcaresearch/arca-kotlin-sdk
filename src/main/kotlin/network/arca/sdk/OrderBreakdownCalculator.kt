@@ -113,7 +113,6 @@ internal fun computeOrderBreakdown(opts: OrderBreakdownOptions): OrderBreakdown 
         }
         OrderBreakdownAmountType.NOTIONAL -> amount
         OrderBreakdownAmountType.TOKENS -> amount * price
-        else -> amount
     }
 
     val factor = 10.0.pow(szDecimals.toDouble())

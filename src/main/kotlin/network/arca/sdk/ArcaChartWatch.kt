@@ -73,7 +73,9 @@ public suspend fun Arca.watchEquityChart(
     val isLiveTail = fromInstant != null && toInstant != null &&
         abs(toInstant.toEpochMilli() - createdAtMs) <= LIVE_TAIL_THRESHOLD_S * 1000
     val windowSeconds: Long =
-        if (isLiveTail && fromInstant != null && toInstant != null) {
+        if (isLiveTail) {
+            // isLiveTail already implies fromInstant/toInstant are non-null
+            // (see its definition above); the compiler smart-casts them here.
             maxOf(0L, toInstant.epochSecond - fromInstant.epochSecond)
         } else {
             0L
@@ -329,7 +331,9 @@ public suspend fun Arca.watchPnlChart(
     val isLiveTail = fromInstant != null && toInstant != null &&
         abs(toInstant.toEpochMilli() - createdAtMs) <= LIVE_TAIL_THRESHOLD_S * 1000
     val windowSeconds: Long =
-        if (isLiveTail && fromInstant != null && toInstant != null) {
+        if (isLiveTail) {
+            // isLiveTail already implies fromInstant/toInstant are non-null
+            // (see its definition above); the compiler smart-casts them here.
             maxOf(0L, toInstant.epochSecond - fromInstant.epochSecond)
         } else {
             0L
