@@ -1,0 +1,120 @@
+# Arca Kotlin SDK — AI Context
+
+> com.github.arcaresearch:arca-kotlin-sdk — Kotlin/Android SDK for the Arca
+> financial infrastructure platform (accounts, payments, perpetuals trading,
+> real-time streaming, audit trails). Hand-written port of the Swift SDK; full
+> feature parity. Targets JVM 1.8 bytecode (Android minSdk 24+).
+
+```kotlin
+// settings.gradle.kts: repositories { maven { url = uri("https://jitpack.io") } }
+dependencies { implementation("com.github.arcaresearch:arca-kotlin-sdk:v0.1.0") }
+```
+
+Package is `network.arca.sdk`; the published Maven artifactId is `arca-sdk`.
+Most calls are extension functions on the `Arca` class (`import network.arca.sdk.*`).
+
+## Conventions (Kotlin-specific)
+
+- Reads are `suspend` functions; mutations return a handle immediately (request runs in the background coroutine scope).
+- Money/amount values are decimal strings ("50", "0.01").
+- Market ids are canonical `{exchange}:{id}` ("hl:0:BTC", "hl:1:TSLA"), case-sensitive.
+- Market-data timestamps are Unix epoch ms; all others are RFC 3339 UTC strings.
+- Errors are a sealed `ArcaException`: Validation, Unauthorized, Forbidden, NotFound(code),
+  Conflict(code), Internal, Exchange(code), Network(cause), Decoding(cause),
+  NonJsonResponse(statusCode, body), OperationFailed(operation), Unknown(code). Branch with `when`.
+- Client-side only: authenticate with a scoped JWT (never embed an API key in an app).
+- Always call `arca.close()` (e.g. ViewModel.onCleared) to tear down the socket + coroutine scope.
+
+## Initialization
+
+```kotlin
+// Scoped JWT (realm read from claims)
+val arca = Arca(token = jwt)
+// With explicit realm + auto-refresh
+val arca = Arca(token = jwt, realmId = "my-realm", tokenProvider = { fetchToken() })
+// Provider only (suspend; fetches the first token now)
+val arca = Arca.withTokenProvider(tokenProvider = { fetchToken() }, realmId = "my-realm")
+```
+
+## Operation & order handles
+
+Mutations return `OperationHandle<R>` (HTTP runs in background):
+- `submitted(): R`            — HTTP response before settlement (may be pending)
+- `settled(): R` / `settle()` — suspends until terminal; throws ArcaException.OperationFailed on failed/expired
+- `settled(timeoutSeconds: Double)` — throws ArcaException.Unknown("TIMEOUT") past the deadline
+
+`placeOrder(...)` returns `OrderHandle` (wraps OperationHandle):
+- `filled(timeoutSeconds = 30.0): SimOrderWithFills`
+- `fills(timeoutSeconds = 300.0): Flow<SimFill>` — closes on terminal status
+- `cancel(path)` / `resize(newSize, path)` (sized orders only)
+
+## Intent -> method
+
+| Intent | Method |
+|---|---|
+| Create wallet | arca.ensureDenominatedArca(ref) |
+| Create any object | arca.ensureArca(ref, type) |
+| Delete object | arca.ensureDeleted(ref, sweepTo?, liquidatePositions?) |
+| Get object | arca.getObject(path) |
+| Balances | arca.getBalances(id) / getBalancesByPath(path) |
+| Transfer | arca.transfer(path, from, to, amount) |
+| Fund (dev) | arca.fundAccount(arcaRef, amount) |
+| Withdraw (dev) | arca.defundAccount(arcaPath, amount) |
+| Payment link | arca.createPaymentLink(type, arcaRef, amount) -> resp.paymentLink.url |
+| Idempotency nonce | arca.nonce(path) |
+| Aggregation | arca.getPathAggregation(path, asOf?) |
+| Equity history | arca.getEquityHistory(path, from, to, points) |
+| P&L history | arca.getPnlHistory(path, from, to, points) |
+| Operation detail | arca.getOperation(id) |
+| Create exchange | arca.ensurePerpsExchange(ref) |
+| Place order | arca.placeOrder(path, objectId, market, side, orderType, size, price?, leverage?, ...) |
+| Cancel / close | arca.cancelOrder(...) / arca.closePosition(...) |
+| Position TP/SL | arca.setStopLoss / setTakeProfit / setPositionTpsl / clearPositionTpsl |
+| Open with atomic bracket | arca.openWithBracket(...) -> entry + takeProfit?/stopLoss? handles |
+| Exchange state | arca.getExchangeState(id) |
+| Active asset data | arca.getActiveAssetData(objectId, market, ...) |
+| Set leverage / margin | arca.updateLeverage / updateIsolatedMargin / setMarginMode |
+| Market meta | arca.getMarketMeta() / market(id) / resolveMarkets(symbol, opts) |
+| Mids/tickers/book | arca.getMarketMids / getMarketTickers / getOrderBook |
+| Candles | arca.getCandles(market, interval, options) |
+
+## Watch streams (real-time)
+
+Each factory opens the shared WebSocket and returns a stream exposing a `StateFlow`
+snapshot + a `Flow` of `updates`; call `ready()` to suspend until the first snapshot
+and `stop()` when done.
+
+| Method | Snapshot / updates |
+|---|---|
+| arca.watchPrices() | StateFlow<Map<String,String>> prices |
+| arca.watchObject(path) | StateFlow<ObjectValuation?> valuation |
+| arca.watchObjects(paths) | StateFlow<Map<String,ObjectValuation>> valuations |
+| arca.watchOperations(path) | Flow<Pair<Operation, RealmEvent>> |
+| arca.watchExchangeState(id) | StateFlow<ExchangeState?> |
+| arca.watchFills(id) | Flow<Pair<Fill, RealmEvent>> |
+| arca.watchFunding(id) | Flow<Pair<FundingPayment, EventEnvelope>> |
+| arca.watchEquityChart(path, from, to) | StateFlow<List<EquityPoint>> + EquityChartUpdate |
+| arca.watchPnlChart(path, from, to) | StateFlow<List<PnlPoint>> + PnlChartUpdate |
+| arca.watchCandleChart(market, interval, ...) | StateFlow<List<Candle>> + CandleChartUpdate |
+| arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> |
+
+Lower-level: `arca.ws` is the WebSocketManager (events flow, typed event flows,
+onGap, onResume, onAuthenticated, ensureConnected, disconnect).
+
+## Anti-patterns
+
+1. Reuse a nonce path on retry; do not call nonce() inside a retry loop.
+2. Use canonical market ids ("hl:0:BTC", never "BTC"); resolve a display symbol via resolveMarkets(symbol).
+3. fundAccount/defundAccount are dev-only; use createPaymentLink in production.
+4. size is base-asset units, not USD. Min notional is $10.
+5. Always close() the Arca instance (and stop() each watch) to release the socket + scope.
+
+## TP/SL is an OCO bracket; openWithBracket is atomic
+
+setPositionTpsl stamps one auto-generated ocoGroupId on both legs; when either fills
+(even partially) the venue cancels the other (cancelReason="sibling_filled"). A TP/SL
+leg closes the WHOLE position by default (sizeToMax); set a base-unit size for a
+reduce-only partial (min-notional waived) — when sized, setPositionTpsl does NOT
+auto-link the legs. openWithBracket(...) opens a position and attaches its reduce-only
+TP/SL triggers as one atomic, all-or-nothing batch; the trigger legs arm only when the
+entry fills, and it returns one OrderHandle per leg.

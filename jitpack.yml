@@ -1,0 +1,14 @@
+# JitPack build configuration for the Arca Kotlin/Android SDK mirror
+# (arcaresearch/arca-kotlin-sdk). JitPack builds this repo on demand the first
+# time a consumer requests a given version, then caches the resulting Maven
+# artifact. The `maven-publish` plugin in build.gradle.kts produces the
+# `network.arca:arca-sdk` publication; JitPack re-coordinates it under
+# `com.github.arcaresearch:arca-kotlin-sdk:<tag>`.
+#
+# The build only needs a JDK >= 17 to drive Gradle; the produced bytecode
+# targets JVM 1.8 so it stays consumable from Android (minSdk 24+).
+jdk:
+  - openjdk17
+
+install:
+  - ./gradlew publishToMavenLocal
