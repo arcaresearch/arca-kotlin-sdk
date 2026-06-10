@@ -47,6 +47,10 @@ private fun bucketBoundary(epochSeconds: Long, resolutionSeconds: Long): Long =
  * the bucket boundary crosses, the live point is promoted to historical and a
  * new live point starts.
  *
+ * The SDK-appended live point always carries [ChartPointStatus.OPEN] so
+ * consumers can identify it explicitly (e.g. to restyle, drop, or re-anchor
+ * the live tip) instead of inferring it from its timestamp.
+ *
  * The stream buffers the latest value and drops intermediate updates if the
  * consumer is slow. Updates are also dropped if the live point hasn't
  * materially changed. Call [EquityChartStream.stop] when done.
@@ -136,7 +140,9 @@ public suspend fun Arca.watchEquityChart(
 
     val initialChart = trimmed.toMutableList()
     aggStream.aggregation.value?.let { agg ->
-        initialChart.add(EquityPoint(timestamp = iso8601String(Instant.now()), equityUsd = agg.totalEquityUsd))
+        initialChart.add(
+            EquityPoint(timestamp = iso8601String(Instant.now()), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN),
+        )
     }
 
     val stream = EquityChartStream()
@@ -223,7 +229,7 @@ public suspend fun Arca.watchEquityChart(
                     liveEquity = live
 
                     val allPoints = historical.toMutableList().apply {
-                        add(EquityPoint(timestamp = iso8601String(Instant.now()), equityUsd = live))
+                        add(EquityPoint(timestamp = iso8601String(Instant.now()), equityUsd = live, status = ChartPointStatus.OPEN))
                     }
                     val prevPoints = stream.chartMut.value
                     if (prevPoints.size == allPoints.size && prevPoints.lastOrNull()?.equityUsd == live) {
@@ -300,6 +306,13 @@ public suspend fun Arca.watchEquityChart(
  * Create a live P&L chart that merges historical data with real-time
  * aggregation updates and operation flows. The last point reflects current
  * live P&L; operation events update cumulative flows client-side.
+ *
+ * The SDK-appended live point always carries [ChartPointStatus.OPEN] so
+ * consumers can identify it explicitly (e.g. to restyle, drop, or re-anchor
+ * the live tip) instead of inferring it from its timestamp. Note its basis:
+ * the live point derives from the live aggregation (equity including
+ * unrealized P&L on open positions), while historical buckets come from the
+ * server's history projection.
  *
  * The stream buffers the latest value and drops intermediate updates if the
  * consumer is slow. Updates are also dropped if the live point hasn't
@@ -395,7 +408,9 @@ public suspend fun Arca.watchPnlChart(
     aggStream.aggregation.value?.let { agg ->
         val liveEq = parseDoubleOrZero(agg.totalEquityUsd)
         val pnl = liveEq - startingEquity - cumInflows + cumOutflows
-        initialChart.add(PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = formatUsd(pnl), equityUsd = agg.totalEquityUsd))
+        initialChart.add(
+            PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = formatUsd(pnl), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN),
+        )
         if (anchor == PnlAnchor.EQUITY) initialChart = applyEquityAnchor(initialChart).toMutableList()
     }
 
@@ -500,7 +515,7 @@ public suspend fun Arca.watchPnlChart(
                     val liveEq = parseDoubleOrZero(agg.totalEquityUsd)
                     val pnl = liveEq - startingEquity - cumInflows + cumOutflows
                     var allPoints = historical.toMutableList().apply {
-                        add(PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = formatUsd(pnl), equityUsd = agg.totalEquityUsd))
+                        add(PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = formatUsd(pnl), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN))
                     }
                     if (anchor == PnlAnchor.EQUITY) allPoints = applyEquityAnchor(allPoints).toMutableList()
 

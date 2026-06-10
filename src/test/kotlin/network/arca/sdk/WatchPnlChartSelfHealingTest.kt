@@ -115,4 +115,44 @@ class WatchPnlChartSelfHealingTest {
             "watchPnlChart must capture the previous live equity BEFORE overwriting liveEquity with the new agg.",
         )
     }
+
+    /**
+     * Gobi v1.0.0 feedback (2026-06-09): the SDK-appended live point derives
+     * from the live aggregation (equity including unrealized P&L), while
+     * historical buckets come from the server projection — when the two bases
+     * diverge, the chart draws a cliff at the tip that clients could only
+     * detect by timestamp inference. Every synthetic live point ("now"-stamped
+     * construction) must therefore carry `status = ChartPointStatus.OPEN` so
+     * consumers can identify and handle it explicitly.
+     *
+     * Boundary-promotion points (stamped `Instant.ofEpochSecond(...)`) are
+     * intentionally NOT stamped — they become historical.
+     */
+    @Test
+    fun everySyntheticLivePointIsStampedOpen() {
+        val source = loadChartWatchSource()
+        val equityBody = functionBody(source, named = "watchEquityChart", until = "fun Arca.watchPnlChart(")
+            ?: fail("watchEquityChart not found in source")
+        val pnlBody = functionBody(source, named = "watchPnlChart", until = "fun Arca.watchEquityChartLive(")
+            ?: fail("watchPnlChart not found in source")
+
+        for ((name, body) in listOf("watchEquityChart" to equityBody, "watchPnlChart" to pnlBody)) {
+            val liveStamp = "timestamp = iso8601String(Instant.now())"
+            var idx = body.indexOf(liveStamp)
+            var count = 0
+            while (idx >= 0) {
+                count++
+                // The OPEN stamp must appear within the same construction —
+                // a short window after the timestamp argument.
+                val window = body.substring(idx, minOf(body.length, idx + 220))
+                assertTrue(
+                    window.contains("status = ChartPointStatus.OPEN"),
+                    "$name: synthetic live point #$count is missing `status = ChartPointStatus.OPEN` — " +
+                        "consumers must be able to identify the SDK-appended live tip without timestamp inference. Window:\n$window",
+                )
+                idx = body.indexOf(liveStamp, idx + 1)
+            }
+            assertTrue(count >= 3, "$name: expected at least 3 synthetic live point constructions, found $count")
+        }
+    }
 }
