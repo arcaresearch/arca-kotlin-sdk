@@ -246,6 +246,8 @@ public suspend fun Arca.watchObjects(paths: List<String>, exchange: String = "si
     if (uniquePaths.isEmpty()) {
         val empty = ObjectsWatchStream(emptyList())
         empty.setState(WatchStreamState.CONNECTED)
+        // Mirror Swift: yield one empty snapshot so `updates` consumers resolve.
+        empty.push(emptyMap())
         empty.stopAction = {}
         return empty
     }

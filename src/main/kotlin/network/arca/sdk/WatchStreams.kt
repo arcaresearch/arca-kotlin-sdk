@@ -100,9 +100,30 @@ public abstract class BaseWatchStream internal constructor() {
     }
 }
 
+/**
+ * Backing flow for event-semantics streams (operations, balances, candles,
+ * funding, fills): every event matters, so a sizeable buffer absorbs bursts;
+ * nothing is replayed to late collectors (processing an event twice is worse
+ * than missing a pre-subscription one).
+ */
 private fun <T> updatesFlow(): MutableSharedFlow<T> = MutableSharedFlow(
     replay = 0,
     extraBufferCapacity = 256,
+    onBufferOverflow = BufferOverflow.DROP_OLDEST,
+)
+
+/**
+ * Backing flow for snapshot-semantics streams (valuations, aggregations,
+ * prices, charts, exchange state, max order size): each emission is a full
+ * snapshot, so only the latest matters. `replay = 1` retains it for collectors
+ * that attach after the stream was constructed — the Kotlin analog of the
+ * Swift SDK's `AsyncStream(bufferingPolicy: .bufferingNewest(1))`, which keeps
+ * the initial snapshot (emitted before any consumer is attached) deliverable.
+ * Slow collectors drop intermediate snapshots rather than accumulating them.
+ */
+private fun <T> snapshotUpdatesFlow(): MutableSharedFlow<T> = MutableSharedFlow(
+    replay = 1,
+    extraBufferCapacity = 0,
     onBufferOverflow = BufferOverflow.DROP_OLDEST,
 )
 
@@ -178,7 +199,7 @@ public class BalanceWatchStream internal constructor() : BaseWatchStream() {
 public class ObjectWatchStream internal constructor(public val path: String) : BaseWatchStream() {
     internal val watchIdMut: MutableStateFlow<String?> = MutableStateFlow(null)
     internal val valuationMut: MutableStateFlow<ObjectValuation?> = MutableStateFlow(null)
-    internal val updatesMut: MutableSharedFlow<ObjectValuation> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<ObjectValuation> = snapshotUpdatesFlow()
     private val callbacks = CallbackRegistry<ObjectValuation>()
 
     /** Watch ID assigned by the server (used for unsubscribe). */
@@ -207,7 +228,7 @@ public class ObjectsWatchStream internal constructor(
     public val childStreams: List<ObjectWatchStream>,
 ) : BaseWatchStream() {
     internal val valuationsMut: MutableStateFlow<Map<String, ObjectValuation>> = MutableStateFlow(emptyMap())
-    internal val updatesMut: MutableSharedFlow<Map<String, ObjectValuation>> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<Map<String, ObjectValuation>> = snapshotUpdatesFlow()
     private val callbacks = CallbackRegistry<Map<String, ObjectValuation>>()
 
     /** Latest valuations keyed by Arca object path. */
@@ -231,7 +252,7 @@ public class ObjectsWatchStream internal constructor(
 /** A stream of real-time aggregation updates with client-side revaluation. */
 public class AggregationWatchStream internal constructor(public val watchId: String) : BaseWatchStream() {
     internal val aggregationMut: MutableStateFlow<PathAggregation?> = MutableStateFlow(null)
-    internal val updatesMut: MutableSharedFlow<PathAggregation> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<PathAggregation> = snapshotUpdatesFlow()
     private val callbacks = CallbackRegistry<PathAggregation>()
 
     /** Current aggregation (updated on structural changes and price ticks). */
@@ -255,7 +276,7 @@ public class AggregationWatchStream internal constructor(public val watchId: Str
 /** A stream of real-time mid prices. */
 public class MarketPriceStream internal constructor() : BaseWatchStream() {
     internal val pricesMut: MutableStateFlow<Map<String, String>> = MutableStateFlow(emptyMap())
-    internal val updatesMut: MutableSharedFlow<Map<String, String>> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<Map<String, String>> = snapshotUpdatesFlow()
 
     /** Current mid prices, populated on first snapshot and refreshed on reconnect. */
     public val prices: StateFlow<Map<String, String>> get() = pricesMut.asStateFlow()
@@ -274,7 +295,7 @@ public class MarketPriceStream internal constructor() : BaseWatchStream() {
 /** Merges historical equity data with a live aggregation stream. */
 public class EquityChartStream internal constructor() : BaseWatchStream() {
     internal val chartMut: MutableStateFlow<List<network.arca.sdk.models.EquityPoint>> = MutableStateFlow(emptyList())
-    internal val updatesMut: MutableSharedFlow<EquityChartUpdate> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<EquityChartUpdate> = snapshotUpdatesFlow()
 
     /** Current chart points (historical + live tail). */
     public val chart: StateFlow<List<network.arca.sdk.models.EquityPoint>> get() = chartMut.asStateFlow()
@@ -293,7 +314,7 @@ public class EquityChartStream internal constructor() : BaseWatchStream() {
 /** Merges historical P&L data with a live aggregation stream and operation events. */
 public class PnlChartStream internal constructor() : BaseWatchStream() {
     internal val chartMut: MutableStateFlow<List<network.arca.sdk.models.PnlPoint>> = MutableStateFlow(emptyList())
-    internal val updatesMut: MutableSharedFlow<network.arca.sdk.models.PnlChartUpdate> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<network.arca.sdk.models.PnlChartUpdate> = snapshotUpdatesFlow()
 
     /** Current P&L chart points (historical + live tail). */
     public val chart: StateFlow<List<network.arca.sdk.models.PnlPoint>> get() = chartMut.asStateFlow()
@@ -327,7 +348,7 @@ public class CandleWatchStream internal constructor() : BaseWatchStream() {
 public class CandleChartStream internal constructor() : BaseWatchStream() {
     internal val historySnapshotMut: MutableStateFlow<InitialHistoryState> = MutableStateFlow(InitialHistoryState.Loading)
     internal val candlesMut: MutableStateFlow<List<Candle>> = MutableStateFlow(emptyList())
-    internal val updatesMut: MutableSharedFlow<CandleChartUpdate> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<CandleChartUpdate> = snapshotUpdatesFlow()
     private val callbacks = CallbackRegistry<CandleChartUpdate>()
 
     /** State of the initial REST history load. */
@@ -384,7 +405,7 @@ public data class MaxOrderSizeWatchOptions(
 /** A stream that recomputes [ActiveAssetData] whenever exchange state or mid prices change. */
 public class MaxOrderSizeWatchStream internal constructor() : BaseWatchStream() {
     internal val activeAssetDataMut: MutableStateFlow<ActiveAssetData?> = MutableStateFlow(null)
-    internal val updatesMut: MutableSharedFlow<ActiveAssetData> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<ActiveAssetData> = snapshotUpdatesFlow()
 
     /** Latest derived active asset data (null until first computation). */
     public val activeAssetData: StateFlow<ActiveAssetData?> get() = activeAssetDataMut.asStateFlow()
@@ -403,7 +424,7 @@ public class MaxOrderSizeWatchStream internal constructor() : BaseWatchStream() 
 /** A stream of real-time exchange state updates for an Arca exchange object. */
 public class ExchangeStateWatchStream internal constructor() : BaseWatchStream() {
     internal val exchangeStateMut: MutableStateFlow<ExchangeState?> = MutableStateFlow(null)
-    internal val updatesMut: MutableSharedFlow<ExchangeState> = updatesFlow()
+    internal val updatesMut: MutableSharedFlow<ExchangeState> = snapshotUpdatesFlow()
 
     /** Current exchange state (positions, orders, margin). */
     public val exchangeState: StateFlow<ExchangeState?> get() = exchangeStateMut.asStateFlow()

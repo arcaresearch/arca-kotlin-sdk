@@ -84,6 +84,12 @@ Each factory opens the shared WebSocket and returns a stream exposing a `StateFl
 snapshot + a `Flow` of `updates`; call `ready()` to suspend until the first snapshot
 and `stop()` when done.
 
+Snapshot-typed `updates` flows (prices, valuations, aggregation, exchange state,
+max order size, equity/P&L/candle charts) replay the latest snapshot to collectors
+that attach late, and drop intermediate snapshots for slow collectors (latest-only).
+Event-typed `updates` flows (operations, balances, fills, funding, raw candles) do
+not replay; collect before mutating to observe every event.
+
 | Method | Snapshot / updates |
 |---|---|
 | arca.watchPrices() | StateFlow<Map<String,String>> prices |

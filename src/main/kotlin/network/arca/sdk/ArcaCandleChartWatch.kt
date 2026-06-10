@@ -201,6 +201,15 @@ public suspend fun Arca.watchCandleChart(
     stream.candlesMut.value = initialCandles
     stream.setState(WatchStreamState.CONNECTED)
 
+    // Emit the initial history snapshot through `updates`/`onUpdate` so
+    // consumers that only listen to the update stream render the chart without
+    // waiting for the first live candle. Mirrors the Swift SDK, where the
+    // initial snapshot is yielded into the buffered AsyncStream at creation;
+    // the snapshot flow's `replay = 1` keeps it for late collectors.
+    initialCandles.lastOrNull()?.let { last ->
+        stream.push(CandleChartUpdate(candles = initialCandles, latestCandle = last))
+    }
+
     if (!needsRetry && history.candles.isNotEmpty()) {
         coverage.add(startTime, nowMs)
     }

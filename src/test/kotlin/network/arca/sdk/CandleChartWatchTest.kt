@@ -2,7 +2,9 @@ package network.arca.sdk
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import network.arca.sdk.models.CandleInterval
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -157,6 +159,53 @@ class CandleChartWatchTest {
         assertTrue(requestCount >= 2, "Should have fetched at least 2 gaps")
         val sequentialMs = requestCount * 150L
         assertTrue(elapsed < sequentialMs, "Gaps should be fetched concurrently: ${elapsed}ms < ${sequentialMs}ms")
+
+        stream.stop()
+        arca.close()
+    }
+
+    @Test
+    fun watchCandleChartEmitsInitialHistorySnapshotToLateUpdatesCollector() = runBlocking {
+        val arca = makeArca()
+        val intervalMs = CandleInterval.ONE_MINUTE.milliseconds
+        val initialStart = AtomicLong(0)
+
+        dispatcher.handler = { request, index ->
+            when (index) {
+                0 -> {
+                    initialStart.set(query(request, "startTime") ?: 0)
+                    val s = initialStart.get()
+                    CandleResp(body = envelope(s + intervalMs to "100", s + intervalMs * 2 to "200"))
+                }
+                else -> CandleResp(error = true)
+            }
+        }
+
+        val stream = arca.watchCandleChart(market = "hl:0:BTC", interval = CandleInterval.ONE_MINUTE, count = 2)
+
+        // A consumer that only listens to `updates` and attaches after
+        // construction must still receive the initial REST history snapshot —
+        // no live candle event ever arrives in this test. (Regression: the
+        // initial snapshot was never pushed and `updates` had no replay, so
+        // pure-updates consumers rendered nothing until the first live tick.)
+        val update = withTimeout(2_000) { stream.updates.first() }
+        assertEquals(2, update.candles.size)
+        assertEquals(listOf("100", "200"), update.candles.map { it.c })
+        assertEquals(update.candles.last(), update.latestCandle)
+
+        stream.stop()
+        arca.close()
+    }
+
+    @Test
+    fun watchObjectsWithEmptyPathsYieldsEmptySnapshotToUpdates() = runBlocking {
+        val arca = makeArca()
+        val stream = arca.watchObjects(paths = emptyList())
+
+        // Mirrors Swift, which yields one empty snapshot into the buffered
+        // stream so `updates` consumers resolve immediately.
+        val snapshot = withTimeout(2_000) { stream.updates.first() }
+        assertTrue(snapshot.isEmpty(), "Expected an empty initial snapshot, got $snapshot")
 
         stream.stop()
         arca.close()
