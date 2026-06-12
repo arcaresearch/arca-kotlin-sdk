@@ -24,6 +24,12 @@ Most calls are extension functions on the `Arca` class (`import network.arca.sdk
   NonJsonResponse(statusCode, body), OperationFailed(operation), Unknown(code). Branch with `when`.
 - Client-side only: authenticate with a scoped JWT (never embed an API key in an app).
 - Always call `arca.close()` (e.g. ViewModel.onCleared) to tear down the socket + coroutine scope.
+- Token-provider clients refresh ~30s before expiry, retry once on 401, and retry once on 403
+  (`FORBIDDEN` / `REALM_SCOPE_MISMATCH` — cached token valid but minted for a different identity,
+  e.g. after a signed-in-user switch; a 403-triggered refresh also forces the live WebSocket to
+  reconnect). `onAuthError` fires when a 401/403 survives the refresh — tear down and rebuild.
+- An `Arca` instance is bound to the identity its tokens are minted for: on identity change call
+  `close()` and build a fresh instance with the new user's provider.
 
 ## Initialization
 

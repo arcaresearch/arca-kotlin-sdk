@@ -240,8 +240,33 @@ public class Arca private constructor(
                 .readTimeout(0, TimeUnit.MILLISECONDS)
                 .build()
 
-            val onUnauthorized: (suspend () -> String)? =
-                if (tokenProvider != null) ({ tokenManager.refreshToken() }) else null
+            // The ws manager is constructed after the HTTP client; the
+            // refresh callback captures this holder so a 403-triggered
+            // refresh can force the live socket onto the new identity.
+            var wsRef: WebSocketManager? = null
+            val onUnauthorized: (suspend (AuthRefreshTrigger) -> String)? =
+                if (tokenProvider != null) {
+                    { trigger ->
+                        val fresh = tokenManager.refreshToken()
+                        if (trigger == AuthRefreshTrigger.FORBIDDEN) {
+                            // The cached token was valid but its scope no longer
+                            // matched the request (e.g. the app switched signed-in
+                            // users). A live WebSocket session is still
+                            // authenticated under the old identity — force it to
+                            // re-auth and re-subscribe with the fresh token. A
+                            // disconnected socket needs no force: its next connect
+                            // pulls a fresh token via getToken.
+                            wsRef?.let { sock ->
+                                val live = sock.status != network.arca.sdk.models.ConnectionStatus.DISCONNECTED
+                                sock.updateToken(fresh)
+                                if (live) sock.reconnect()
+                            }
+                        }
+                        fresh
+                    }
+                } else {
+                    null
+                }
             val wsGetToken: (suspend () -> String)? =
                 if (tokenProvider != null) ({ tokenManager.refreshToken() }) else null
             val onAuthError: (Throwable) -> Unit = { error -> tokenManager.emitAuthError(error) }
@@ -264,6 +289,7 @@ public class Arca private constructor(
                 log = logger,
                 lifecycleBridge = lifecycleBridge,
             )
+            wsRef = ws
 
             val arca = Arca(
                 realmId = resolved,

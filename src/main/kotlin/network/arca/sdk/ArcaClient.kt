@@ -27,18 +27,30 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /**
+ * Why the client is asking for a fresh credential:
+ * - [UNAUTHORIZED] — HTTP 401: the credential is invalid or expired.
+ * - [FORBIDDEN] — HTTP 403 `FORBIDDEN` / `REALM_SCOPE_MISMATCH`: the
+ *   credential is still valid but its scope no longer covers the request
+ *   (e.g. the app switched signed-in users, so the provider would now mint
+ *   a token for a different identity).
+ */
+public enum class AuthRefreshTrigger { UNAUTHORIZED, FORBIDDEN }
+
+/**
  * Low-level HTTP client for the Arca API, built on OkHttp + coroutines.
  *
  * Handles bearer-token injection, the standard `{ success, data, error }`
  * envelope, automatic retries for transient `502/503/504` responses, and a
- * single `401` retry that refreshes the token via [onUnauthorized]. All methods
- * are `suspend` and cancellation-aware; concurrent calls run in parallel.
+ * single auth-refresh retry (on `401`, and on `403` `FORBIDDEN` /
+ * `REALM_SCOPE_MISMATCH`) that refreshes the token via [onUnauthorized].
+ * All methods are `suspend` and cancellation-aware; concurrent calls run in
+ * parallel.
  */
 public class ArcaClient(
     token: String,
     baseUrl: String,
     private val httpClient: OkHttpClient,
-    private val onUnauthorized: (suspend () -> String)? = null,
+    private val onUnauthorized: (suspend (AuthRefreshTrigger) -> String)? = null,
     private val onAuthError: ((Throwable) -> Unit)? = null,
     private val logger: ArcaLogger = ArcaLogger.disabled,
 ) {
@@ -88,19 +100,40 @@ public class ArcaClient(
                 onAuthError?.invoke(e)
                 throw e
             }
-            logger.notice("auth", metadata = mapOf("httpMethod" to method, "path" to path)) {
-                "401 received, refreshing token and retrying"
+            return refreshAndRetry(AuthRefreshTrigger.UNAUTHORIZED, refresh, method, path, query, body, deserializer)
+        } catch (e: ArcaException.Forbidden) {
+            // A 403 on a provider-backed client can mean the cached token is
+            // valid but scoped to a different identity than the provider
+            // would now mint for (e.g. the app switched signed-in users).
+            // Refresh once and retry. Without a provider this is a plain
+            // permission denial: rethrow without emitting onAuthError.
+            val refresh = onUnauthorized ?: throw e
+            return refreshAndRetry(AuthRefreshTrigger.FORBIDDEN, refresh, method, path, query, body, deserializer)
+        }
+    }
+
+    private suspend fun <T> refreshAndRetry(
+        trigger: AuthRefreshTrigger,
+        refresh: suspend (AuthRefreshTrigger) -> String,
+        method: String,
+        path: String,
+        query: Map<String, String>?,
+        body: JsonElement?,
+        deserializer: KSerializer<T>,
+    ): T {
+        val status = if (trigger == AuthRefreshTrigger.FORBIDDEN) "403" else "401"
+        logger.notice("auth", metadata = mapOf("httpMethod" to method, "path" to path)) {
+            "$status received, refreshing token and retrying"
+        }
+        try {
+            currentToken = refresh(trigger)
+            return requestWithRetry(method, path, query, body, deserializer)
+        } catch (refreshError: Throwable) {
+            logger.error("auth", refreshError, mapOf("httpMethod" to method, "path" to path)) {
+                "token refresh failed after $status"
             }
-            try {
-                currentToken = refresh()
-                return requestWithRetry(method, path, query, body, deserializer)
-            } catch (refreshError: Throwable) {
-                logger.error("auth", refreshError, mapOf("httpMethod" to method, "path" to path)) {
-                    "token refresh failed after 401"
-                }
-                onAuthError?.invoke(refreshError)
-                throw refreshError
-            }
+            onAuthError?.invoke(refreshError)
+            throw refreshError
         }
     }
 

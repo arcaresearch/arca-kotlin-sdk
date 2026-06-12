@@ -22,8 +22,22 @@ public sealed class ArcaException(
     /** Authentication failed (HTTP 401). */
     public class Unauthorized(message: String, errorId: String? = null) : ArcaException(message, errorId)
 
-    /** Forbidden — insufficient permissions (HTTP 403). */
-    public class Forbidden(message: String, errorId: String? = null) : ArcaException(message, errorId)
+    /**
+     * Forbidden — insufficient permissions (HTTP 403). [code] carries the
+     * domain-specific variant (`FORBIDDEN` or `REALM_SCOPE_MISMATCH`).
+     *
+     * On a token-provider client a 403 commonly means the cached token is
+     * still valid but scoped to a different identity than the one the
+     * provider would now mint for (e.g. the app switched signed-in users).
+     * The SDK reacts by re-invoking the provider once and retrying; an
+     * unrecoverable 403 is surfaced through `onAuthError` so integrators
+     * can tear down and rebuild the [Arca] instance.
+     */
+    public class Forbidden(
+        message: String,
+        errorId: String? = null,
+        public val code: String = "FORBIDDEN",
+    ) : ArcaException(message, errorId)
 
     /**
      * Resource not found (HTTP 404). [code] carries the domain-specific
@@ -75,7 +89,7 @@ public fun mapApiError(code: String, message: String, errorId: String?): ArcaExc
 
     "UNAUTHORIZED", "UNAUTHENTICATED" -> ArcaException.Unauthorized(message, errorId)
 
-    "FORBIDDEN" -> ArcaException.Forbidden(message, errorId)
+    "FORBIDDEN", "REALM_SCOPE_MISMATCH" -> ArcaException.Forbidden(message, errorId, code)
 
     "NOT_FOUND", "USER_NOT_FOUND", "REALM_NOT_FOUND", "OBJECT_NOT_FOUND",
     "ORG_NOT_FOUND", "ORDER_NOT_FOUND", "ACCOUNT_NOT_FOUND",
