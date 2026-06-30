@@ -83,6 +83,7 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Market meta | arca.getMarketMeta() / market(id) / resolveMarkets(symbol, opts) |
 | Mids/tickers/book | arca.getMarketMids / getMarketTickers / getOrderBook |
 | Candles | arca.getCandles(market, interval, options) |
+| OI history | arca.getOIHistory(market, interval, options) -> OHLC open interest + 24h ntlVlm + mark; intervals 1m/5m/1h/1d |
 
 ## Watch streams (real-time)
 
@@ -93,8 +94,8 @@ and `stop()` when done.
 Snapshot-typed `updates` flows (prices, valuations, aggregation, exchange state,
 max order size, equity/P&L/candle charts) replay the latest snapshot to collectors
 that attach late, and drop intermediate snapshots for slow collectors (latest-only).
-Event-typed `updates` flows (operations, balances, fills, funding, raw candles) do
-not replay; collect before mutating to observe every event.
+Event-typed `updates` flows (operations, balances, fills, funding, raw candles,
+open-interest bars) do not replay; collect before mutating to observe every event.
 
 Equity/P&L chart streams append an SDK-synthesized live tip derived from the live
 aggregation (equity incl. unrealized P&L); it always carries
@@ -114,6 +115,7 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchEquityChart(path, from, to) | StateFlow<List<EquityPoint>> + EquityChartUpdate |
 | arca.watchPnlChart(path, from, to) | StateFlow<List<PnlPoint>> + PnlChartUpdate |
 | arca.watchCandleChart(market, interval, ...) | StateFlow<List<Candle>> + CandleChartUpdate |
+| arca.watchOI(coins, intervals) | Flow<OIEvent> (market, interval, bar, isClosed) |
 | arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> |
 
 Lower-level: `arca.ws` is the WebSocketManager (events flow, typed event flows,

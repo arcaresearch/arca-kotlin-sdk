@@ -30,6 +30,7 @@ import network.arca.sdk.internal.arcaJson
 import network.arca.sdk.models.Candle
 import network.arca.sdk.models.CandleEvent
 import network.arca.sdk.models.CandleInterval
+import network.arca.sdk.models.OIEvent
 import network.arca.sdk.models.ConnectionStatus
 import network.arca.sdk.models.EventType
 import network.arca.sdk.models.ExchangeState
@@ -98,6 +99,7 @@ public class WebSocketManager internal constructor(
 
     private var subscribedMids: Pair<String, List<String>>? = null
     private var subscribedCandles: Pair<List<String>, List<CandleInterval>>? = null
+    private var subscribedOI: Pair<List<String>, List<CandleInterval>>? = null
     private var shouldReconnect = false
     private var reconnectAttempt = 0
     private var reconnectJob: Job? = null
@@ -106,6 +108,7 @@ public class WebSocketManager internal constructor(
     private var midsRefs = 0
     private var midsExchange = "sim"
     private val candleRefCoins = HashMap<String, MutableSet<String>>()
+    private val oiRefCoins = HashMap<String, MutableSet<String>>()
     private val chartHistoryWatches = HashMap<String, ChartWatch>()
     private val unsubJobs = HashMap<String, Job>()
     private var idleDisconnectJob: Job? = null
@@ -231,6 +234,20 @@ public class WebSocketManager internal constructor(
         lock.withLock {
             subscribedCandles = null
             sendMessage(buildJsonObject { put("action", "unsubscribe_candles") })
+        }
+    }
+
+    public fun subscribeOI(coins: List<String>, intervals: List<CandleInterval>) {
+        lock.withLock {
+            subscribedOI = coins to intervals
+            sendMessage(subscribeOIMsg(coins, intervals.map { it.wire }))
+        }
+    }
+
+    public fun unsubscribeOI() {
+        lock.withLock {
+            subscribedOI = null
+            sendMessage(buildJsonObject { put("action", "unsubscribe_oi") })
         }
     }
 
@@ -372,6 +389,55 @@ public class WebSocketManager internal constructor(
         sendMessage(subscribeCandlesMsg(allCoins, intervals.map { it.wire }))
     }
 
+    public fun acquireOI(coins: List<String>, intervals: List<CandleInterval>) {
+        lock.withLock {
+            cancelIdleTimerLocked()
+            for (coin in coins) {
+                val set = oiRefCoins.getOrPut(coin) { mutableSetOf() }
+                intervals.forEach { set.add(it.wire) }
+            }
+            ensureConnectedLocked()
+            syncOISubscriptionLocked()
+        }
+    }
+
+    public fun releaseOI(coins: List<String>, intervals: List<CandleInterval>) {
+        lock.withLock {
+            for (coin in coins) {
+                val ivs = oiRefCoins[coin] ?: continue
+                intervals.forEach { ivs.remove(it.wire) }
+                if (ivs.isEmpty()) oiRefCoins.remove(coin)
+            }
+            unsubJobs["oi"] = scope.launch {
+                delay(UNSUB_DEBOUNCE_MS)
+                if (!isActive) return@launch
+                finishOIRelease()
+            }
+        }
+    }
+
+    private fun finishOIRelease() {
+        lock.withLock {
+            unsubJobs.remove("oi")
+            syncOISubscriptionLocked()
+            maybeStartIdleTimerLocked()
+        }
+    }
+
+    private fun syncOISubscriptionLocked() {
+        if (oiRefCoins.isEmpty()) {
+            subscribedOI = null
+            sendMessage(buildJsonObject { put("action", "unsubscribe_oi") })
+            return
+        }
+        val allCoins = oiRefCoins.keys.toList()
+        val allIntervals = mutableSetOf<String>()
+        oiRefCoins.values.forEach { allIntervals.addAll(it) }
+        val intervals = allIntervals.mapNotNull { CandleInterval.fromWire(it) }
+        subscribedOI = allCoins to intervals
+        sendMessage(subscribeOIMsg(allCoins, intervals.map { it.wire }))
+    }
+
     public fun watchChartHistory(target: String, kind: String = "path", objectId: String? = null): String {
         val watchId = UUID.randomUUID().toString()
         lock.withLock {
@@ -392,7 +458,7 @@ public class WebSocketManager internal constructor(
     }
 
     private fun hasAnyInterestLocked(): Boolean =
-        pathRefs.isNotEmpty() || midsRefs > 0 || candleRefCoins.isNotEmpty() || chartHistoryWatches.isNotEmpty()
+        pathRefs.isNotEmpty() || midsRefs > 0 || candleRefCoins.isNotEmpty() || oiRefCoins.isNotEmpty() || chartHistoryWatches.isNotEmpty()
 
     private fun maybeStartIdleTimerLocked() {
         if (hasAnyInterestLocked() || idleDisconnectJob != null) return
@@ -488,6 +554,8 @@ public class WebSocketManager internal constructor(
 
     public fun candleClosedEvents(): Flow<CandleEvent> = filtered { event -> decodeCandleEvent(event, closedOnly = true) }
 
+    public fun oiEvents(): Flow<OIEvent> = filtered { event -> decodeOIEvent(event) }
+
     public fun objectValuationEvents(): Flow<ObjectValuationEvent> = filtered { event ->
         val valuation = event.valuation
         val path = event.path
@@ -561,6 +629,14 @@ public class WebSocketManager internal constructor(
         val interval = event.interval?.let { CandleInterval.fromWire(it) } ?: return null
         val candle = event.candle ?: return null
         return CandleEvent(market, interval, candle)
+    }
+
+    private fun decodeOIEvent(event: RealmEvent): OIEvent? {
+        if (event.type != EventType.OI_UPDATED.wire) return null
+        val market = event.market ?: return null
+        val interval = event.interval?.let { CandleInterval.fromWire(it) } ?: return null
+        val bar = event.bar ?: return null
+        return OIEvent(market, interval, bar, event.isClosed ?: false)
     }
 
     // MARK: - Gap detection + handlers
@@ -781,11 +857,15 @@ public class WebSocketManager internal constructor(
 
             subscribedMids?.let { sendMessage(authlessSubscribeMids(it.first, it.second)) }
             subscribedCandles?.let { sendMessage(subscribeCandlesMsg(it.first, it.second.map { iv -> iv.wire })) }
+            subscribedOI?.let { sendMessage(subscribeOIMsg(it.first, it.second.map { iv -> iv.wire })) }
             if (midsRefs > 0 && subscribedMids == null) {
                 sendMessage(authlessSubscribeMids(midsExchange, emptyList()))
             }
             if (candleRefCoins.isNotEmpty() && subscribedCandles == null) {
                 syncCandleSubscriptionLocked()
+            }
+            if (oiRefCoins.isNotEmpty() && subscribedOI == null) {
+                syncOISubscriptionLocked()
             }
             pathRefs.keys.forEach { path ->
                 sendMessage(buildJsonObject { put("action", "watch"); put("path", path) })
@@ -938,6 +1018,12 @@ public class WebSocketManager internal constructor(
         put("coins", buildJsonArray { coins.forEach { add(it) } })
         put("intervals", buildJsonArray { intervals.forEach { add(it) } })
         put("batch", true)
+    }
+
+    private fun subscribeOIMsg(coins: List<String>, intervals: List<String>): JsonObject = buildJsonObject {
+        put("action", "subscribe_oi")
+        put("coins", buildJsonArray { coins.forEach { add(it) } })
+        put("intervals", buildJsonArray { intervals.forEach { add(it) } })
     }
 
     private fun watchChartHistoryMsg(watchId: String, target: String, kind: String, objectId: String?): JsonObject =

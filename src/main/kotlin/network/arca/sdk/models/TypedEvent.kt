@@ -56,6 +56,7 @@ public sealed class TypedEvent {
     // Market data
     public data class CandleClosed(val candle: CandleEvent, override val envelope: EventEnvelope) : TypedEvent()
     public data class CandleUpdated(val candle: CandleEvent, override val envelope: EventEnvelope) : TypedEvent()
+    public data class OIUpdated(val oi: OIEvent, override val envelope: EventEnvelope) : TypedEvent()
     public data class TradeExecuted(val trade: TradeEvent, override val envelope: EventEnvelope) : TypedEvent()
     public data class MidsUpdated(val mids: Map<String, String>, override val envelope: EventEnvelope) : TypedEvent()
 
@@ -108,6 +109,7 @@ public sealed class TypedEvent {
                     event.funding?.let { FundingPaymentEvent(it, envelope) } ?: Unknown(event)
                 EventType.CANDLE_CLOSED -> candleEvent(event)?.let { CandleClosed(it, envelope) } ?: Unknown(event)
                 EventType.CANDLE_UPDATED -> candleEvent(event)?.let { CandleUpdated(it, envelope) } ?: Unknown(event)
+                EventType.OI_UPDATED -> oiEvent(event)?.let { OIUpdated(it, envelope) } ?: Unknown(event)
                 EventType.TRADE_EXECUTED -> {
                     val market = event.market
                     val trade = event.trade
@@ -145,6 +147,13 @@ public sealed class TypedEvent {
             val interval = event.interval?.let { CandleInterval.fromWire(it) } ?: return null
             val candle = event.candle ?: return null
             return CandleEvent(market, interval, candle)
+        }
+
+        private fun oiEvent(event: RealmEvent): OIEvent? {
+            val market = event.market ?: return null
+            val interval = event.interval?.let { CandleInterval.fromWire(it) } ?: return null
+            val bar = event.bar ?: return null
+            return OIEvent(market, interval, bar, event.isClosed ?: false)
         }
     }
 }

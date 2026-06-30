@@ -16,6 +16,7 @@ import network.arca.sdk.models.ArcaBalance
 import network.arca.sdk.models.Candle
 import network.arca.sdk.models.CandleChartUpdate
 import network.arca.sdk.models.CandleEvent
+import network.arca.sdk.models.OIEvent
 import network.arca.sdk.models.EquityChartUpdate
 import network.arca.sdk.models.EventEnvelope
 import network.arca.sdk.models.ExchangeState
@@ -338,6 +339,20 @@ public class CandleWatchStream internal constructor() : BaseWatchStream() {
     public val updates: Flow<CandleEvent> get() = updatesMut.asSharedFlow()
 
     internal fun push(event: CandleEvent) {
+        updatesMut.tryEmit(event)
+    }
+}
+
+// MARK: - OIWatchStream
+
+/** A stream of real-time open-interest bar updates. */
+public class OIWatchStream internal constructor() : BaseWatchStream() {
+    internal val updatesMut: MutableSharedFlow<OIEvent> = updatesFlow()
+
+    /** A stream of OI bar events (both closed and in-progress). */
+    public val updates: Flow<OIEvent> get() = updatesMut.asSharedFlow()
+
+    internal fun push(event: OIEvent) {
         updatesMut.tryEmit(event)
     }
 }

@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import network.arca.sdk.models.ActiveAssetData
 import network.arca.sdk.models.CandleEvent
 import network.arca.sdk.models.CandleInterval
+import network.arca.sdk.models.OIEvent
 import network.arca.sdk.models.ConnectionStatus
 import network.arca.sdk.models.EventEnvelope
 import network.arca.sdk.models.ExchangeState
@@ -732,6 +733,55 @@ public suspend fun Arca.watchCandles(coins: List<String>, intervals: List<Candle
     stream.stopAction = {
         jobs.forEach { it.cancel() }
         ws.releaseCandles(coins, intervals)
+    }
+    return stream
+}
+
+// MARK: - watchOI
+
+/**
+ * Subscribe to real-time open-interest + 24h-notional bar updates for one or
+ * more markets. OI is a Tier-3 ambient stream (slow-moving, self-correcting,
+ * no gap recovery). Each [OIEvent] carries a single bar; `isClosed` is true on
+ * a finalized (rolled-over) bucket. Call [OIWatchStream.stop] when done.
+ *
+ * @param coins Canonical coin IDs to watch (e.g. `["hl:0:BTC", "hl:0:ETH"]`).
+ * @param intervals OI intervals (defaults to 1m + 5m).
+ */
+public suspend fun Arca.watchOI(
+    coins: List<String>,
+    intervals: List<CandleInterval> = listOf(CandleInterval.ONE_MINUTE, CandleInterval.FIVE_MINUTES),
+): OIWatchStream {
+    ws.ensureConnected()
+
+    val stream = OIWatchStream()
+    stream.setState(WatchStreamState.CONNECTED)
+    val coinSet = coins.toSet()
+    val jobs = mutableListOf<Job>()
+
+    jobs += scope.launch {
+        ws.statusStream.collect { s ->
+            when (s) {
+                ConnectionStatus.DISCONNECTED -> stream.setState(WatchStreamState.RECONNECTING)
+                ConnectionStatus.CONNECTED -> stream.setState(WatchStreamState.CONNECTED)
+                else -> {}
+            }
+        }
+    }
+
+    ws.acquireOI(coins, intervals)
+
+    jobs += scope.launch {
+        ws.oiEvents().collect { event: OIEvent ->
+            if (coinSet.isEmpty() || coinSet.contains(event.market)) {
+                stream.push(event)
+            }
+        }
+    }
+
+    stream.stopAction = {
+        jobs.forEach { it.cancel() }
+        ws.releaseOI(coins, intervals)
     }
     return stream
 }

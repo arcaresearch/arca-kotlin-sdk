@@ -33,6 +33,10 @@ public data class RealmEvent(
     public val market: String? = null,
     public val interval: String? = null,
     public val candle: Candle? = null,
+    /** Open-interest bar, present on `oi.updated` events (wire key `oi`). */
+    @SerialName("oi") public val bar: OIBar? = null,
+    /** True when an `oi.updated` bar is finalized (bucket rolled over). */
+    public val isClosed: Boolean? = null,
     @SerialName("fill") internal val fillRaw: JsonElement? = null,
     public val funding: FundingPayment? = null,
     public val trade: MarketTrade? = null,

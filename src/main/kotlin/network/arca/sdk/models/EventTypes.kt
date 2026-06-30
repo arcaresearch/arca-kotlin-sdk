@@ -14,6 +14,7 @@ public enum class EventType(public val wire: String) {
     MIDS_UPDATED("mids.updated"),
     CANDLE_CLOSED("candle.closed"),
     CANDLE_UPDATED("candle.updated"),
+    OI_UPDATED("oi.updated"),
     TRADE_EXECUTED("trade.executed"),
     TRADES_BATCH("trades.batch"),
     REALM_CREATED("realm.created"),

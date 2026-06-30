@@ -31,6 +31,7 @@ import network.arca.sdk.models.OrderOperationResponse
 import network.arca.sdk.models.OrderSide
 import network.arca.sdk.models.OrderStatus
 import network.arca.sdk.models.OrderType
+import network.arca.sdk.models.OIHistoryResponse
 import network.arca.sdk.models.PositionListResponse
 import network.arca.sdk.models.PositionSide
 import network.arca.sdk.models.SetMarginModeResponse
@@ -1048,6 +1049,48 @@ public suspend fun Arca.getCandles(
     if (skipBackfill) query["skipBackfill"] = "true"
     val result: CandlesResponse = client.get("/exchange/market/candles/$market", query = query)
     historyCache.set(key, result)
+    return result
+}
+
+/**
+ * Get open-interest + 24h-notional-volume history for a market.
+ *
+ * Each bar tracks open interest (OHLC over the bucket, base-asset units) plus
+ * the rolling 24h notional volume ([OIBar.ntlVlm], USD) and last mark price
+ * ([OIBar.mark]) at the bucket close; USD OI ≈ `oiClose * mark`. Deep history
+ * (~1 year) is seeded from a one-time 0xArchive backfill ([OIBar.s] == "0xa").
+ *
+ * @param market Canonical coin ID (e.g. `hl:0:BTC`).
+ * @param interval OI interval (e.g. [CandleInterval.ONE_MINUTE]).
+ * @param startTime Optional start time in epoch milliseconds.
+ * @param endTime Optional end time in epoch milliseconds.
+ */
+public suspend fun Arca.getOIHistory(
+    market: String,
+    interval: CandleInterval,
+    startTime: Long? = null,
+    endTime: Long? = null,
+): OIHistoryResponse {
+    val key = buildCacheKey(
+        "oiHistory",
+        mapOf(
+            "market" to market,
+            "interval" to interval.wire,
+            "startTime" to startTime?.toString(),
+            "endTime" to endTime?.toString(),
+        ),
+    )
+    historyCache.get<OIHistoryResponse>(key)?.let { return it }
+
+    coroutineContext.ensureActive()
+
+    val query = mutableMapOf("interval" to interval.wire)
+    if (startTime != null) query["startTime"] = startTime.toString()
+    if (endTime != null) query["endTime"] = endTime.toString()
+    val result: OIHistoryResponse = client.get("/exchange/market/oi/$market", query = query)
+    if (result.bars.isNotEmpty()) {
+        historyCache.set(key, result)
+    }
     return result
 }
 

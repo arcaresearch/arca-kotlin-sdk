@@ -144,6 +144,42 @@ public data class CandleEvent(
     public val candle: Candle,
 )
 
+// MARK: - Open Interest
+
+/**
+ * A single open-interest / 24h-notional bar. The OHLC values track open
+ * interest (base-asset units) over the bucket; [ntlVlm] is the rolling 24h
+ * notional volume (USD) at bucket close; [mark] is the last mark price in the
+ * bucket (USD OI ≈ `oiClose * mark`). [s] is the data source (null/"" =
+ * self-recorded, "0xa" = 0xArchive backfill).
+ */
+@Serializable
+public data class OIBar(
+    public val t: Long,
+    public val oiOpen: String,
+    public val oiHigh: String,
+    public val oiLow: String,
+    public val oiClose: String,
+    public val ntlVlm: String,
+    public val mark: String? = null,
+    public val s: String? = null,
+)
+
+@Serializable
+public data class OIHistoryResponse(
+    public val market: String,
+    public val interval: String,
+    public val bars: List<OIBar>,
+)
+
+/** Emitted by open-interest streams on each bar change. */
+public data class OIEvent(
+    public val market: String,
+    public val interval: CandleInterval,
+    public val bar: OIBar,
+    public val isClosed: Boolean,
+)
+
 /** A single trade from the market-wide trade tape. */
 @Serializable
 public data class MarketTrade(
