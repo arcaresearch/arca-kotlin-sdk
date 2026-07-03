@@ -121,6 +121,14 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 Lower-level: `arca.ws` is the WebSocketManager (events flow, typed event flows,
 onGap, onResume, onAuthenticated, ensureConnected, disconnect).
 
+`watchCandleChart` self-heals: it refetches recent candles on every WS re-auth
+and app-foreground, and additionally detects seams in the live candle data
+itself — a live candle whose bucket skips past the last held bucket, or a WS
+deliverySeq gap, triggers a throttled refetch (10s cooldown, bounded to the
+last 50 bars) of the affected window so server-side backfill corrections reach
+already-open charts. The raw `watchCandles` flow is an unhealed event tap —
+build charts on `watchCandleChart`.
+
 ## Anti-patterns
 
 1. Reuse a nonce path on retry; do not call nonce() inside a retry loop.

@@ -19,10 +19,28 @@ import network.arca.sdk.models.ConnectionStatus
 import network.arca.sdk.models.LoadRangeResult
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 private const val GAP_RECOVERY_CANDLES = 50
+
+/** Minimum spacing between data-driven seam-heal refetches (ms). */
+private const val SEAM_HEAL_COOLDOWN_MS = 10_000L
+
+/**
+ * Detect a bucket seam: a live candle whose bucket skips ahead of the last
+ * held bucket by more than one interval means at least one whole bucket is
+ * missing in between (either a quiet market or candles missed while the
+ * socket stayed nominally connected, e.g. an upstream ingest stall).
+ * Returns the start of the seam window (the last held bucket, so the
+ * possibly-partial bar is refetched too), or null when there is no seam.
+ */
+internal fun detectSeamStart(prevLatestT: Long, incomingT: Long, intervalMs: Long): Long? {
+    if (prevLatestT <= 0L) return null
+    if (incomingT - prevLatestT <= intervalMs) return null
+    return prevLatestT
+}
 
 private data class PendingCandleRange(val from: Long, val to: Long)
 
@@ -137,7 +155,11 @@ internal fun dedupCandles(candles: List<Candle>): List<Candle> {
  * Create a live candle chart that merges historical candle data with real-time
  * WebSocket updates. The candle array stays sorted and deduped; new bars appear
  * automatically as candle events arrive. On WebSocket reconnection, recent
- * candles are refetched to fill any gap.
+ * candles are refetched to fill any gap. The stream also self-heals seams
+ * detected in the live data itself: a delivery-sequence gap or a live candle
+ * that skips past the last held bucket triggers a throttled refetch of the
+ * affected window, so server-side backfill corrections reach already-open
+ * charts.
  *
  * Use [CandleChartStream.ensureRange] when the visible viewport changes (zoom,
  * resize, jump to date). Use [CandleChartStream.loadMore] for simple backward
@@ -267,6 +289,46 @@ public suspend fun Arca.watchCandleChart(
         }
     }
 
+    // Data-driven seam healing state: the earliest armed seam start (or null
+    // when disarmed), a single-flight flag, and the cooldown anchor.
+    val seamLock = ReentrantLock()
+    var seamFrom: Long? = null
+    val seamHealing = AtomicBoolean(false)
+    val lastSeamHealAt = AtomicLong(0)
+
+    // Heal a detected bucket seam by refetching `[seamFrom, latestT]`
+    // (bounded to the last GAP_RECOVERY_CANDLES bars). Single-flight with a
+    // cooldown; a seam skipped while cooling down stays armed in `seamFrom`
+    // and is retried on the next live event. Quiet markets legitimately skip
+    // buckets, so an empty refetch simply disarms the seam.
+    suspend fun healSeam(latestT: Long) {
+        val from: Long = seamLock.withLock {
+            val armed = seamFrom ?: return
+            val now = System.currentTimeMillis()
+            if (seamHealing.get() || now - lastSeamHealAt.get() < SEAM_HEAL_COOLDOWN_MS) return
+            seamFrom = null
+            seamHealing.set(true)
+            lastSeamHealAt.set(now)
+            maxOf(armed, latestT - interval.milliseconds * GAP_RECOVERY_CANDLES)
+        }
+        try {
+            val res = runCatching { getCandles(market = market, interval = interval, startTime = from, endTime = latestT) }
+                .getOrElse { e ->
+                    log.warning("candle", e, mapOf("market" to market, "interval" to interval.wire)) { "seam heal refetch failed" }
+                    // Re-arm so the next live event retries after the cooldown.
+                    seamLock.withLock { seamFrom = seamFrom?.let { minOf(it, from) } ?: from }
+                    null
+                }
+            if (res != null && res.candles.isNotEmpty()) {
+                val snapshot = mergeCandles(res.candles)
+                coverage.add(from, latestT)
+                snapshot.lastOrNull()?.let { yieldSnapshot(snapshot, it) }
+            }
+        } finally {
+            seamHealing.set(false)
+        }
+    }
+
     // Drains the coalesced pending range queue, fetching each coverage gap
     // concurrently and merging the results. Returns the number of candles loaded.
     suspend fun drainPendingRanges(): Int {
@@ -377,9 +439,20 @@ public suspend fun Arca.watchCandleChart(
             if (event.market != market || event.interval != interval) return@collect
             val latest = event.candle
             val snapshot: List<Candle>
+            val prevLatestT: Long
             lock.withLock {
+                prevLatestT = candles.lastOrNull()?.t ?: 0L
                 applyCandle(latest, candles)
                 snapshot = candles.toList()
+            }
+            // Data-driven seam detection: arm when the live candle skips
+            // past the last held bucket, then heal off the collector so
+            // fetches never block event processing.
+            detectSeamStart(prevLatestT, latest.t, interval.milliseconds)?.let { seamStart ->
+                seamLock.withLock { seamFrom = seamFrom?.let { minOf(it, seamStart) } ?: seamStart }
+            }
+            if (seamLock.withLock { seamFrom != null }) {
+                scope.launch { healSeam(latest.t) }
             }
             stream.candlesMut.value = snapshot
             if (stream.historySnapshotMut.value is InitialHistoryState.Loaded) {
@@ -406,6 +479,16 @@ public suspend fun Arca.watchCandleChart(
     // App foreground after a hidden period.
     jobs += scope.launch {
         ws.resumeStream.collect { recoverGap() }
+    }
+
+    // Recover when the server-assigned deliverySeq shows dropped frames
+    // (throttled — deliverySeq is connection-wide, so gaps can burst).
+    val gapId = ws.onGap {
+        val now = System.currentTimeMillis()
+        if (!seamHealing.get() && now - lastSeamHealAt.get() >= SEAM_HEAL_COOLDOWN_MS) {
+            lastSeamHealAt.set(now)
+            scope.launch { recoverGap() }
+        }
     }
 
     if (needsRetry) {
@@ -437,6 +520,7 @@ public suspend fun Arca.watchCandleChart(
     stream.stopAction = {
         stopped.set(true)
         jobs.forEach { it.cancel() }
+        ws.removeGapHandler(gapId)
         ws.releaseCandles(listOf(market), listOf(interval))
     }
 
