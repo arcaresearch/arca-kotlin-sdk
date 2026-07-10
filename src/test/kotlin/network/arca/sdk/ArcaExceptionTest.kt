@@ -46,6 +46,8 @@ class ArcaExceptionTest {
         val variants = listOf(
             "CONFLICT", "ALREADY_EXISTS", "ALREADY_MEMBER", "ALREADY_DELETED",
             "DUPLICATE_REALM", "ALREADY_REVOKED", "IDEMPOTENCY_VIOLATION",
+            // Order-placement conflicts carry their specific code.
+            "NO_LIQUIDITY", "MARKET_DELISTED",
         )
         for (code in variants) {
             val error = mapApiError(code, "Conflict", null)

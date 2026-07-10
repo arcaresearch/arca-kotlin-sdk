@@ -46,7 +46,12 @@ public sealed class ArcaException(
     public class NotFound(public val code: String, message: String, errorId: String? = null) :
         ArcaException(message, errorId)
 
-    /** Conflict (HTTP 409). Covers duplicates, idempotency violations, etc. */
+    /**
+     * Conflict (HTTP 409). Covers duplicates, idempotency violations, and
+     * order-placement conflicts where [code] carries the specific reason:
+     * `NO_LIQUIDITY` (empty book side, retry or use a marketable limit) or
+     * `MARKET_DELISTED` (market delisted, positions settled by the venue).
+     */
     public class Conflict(public val code: String, message: String, errorId: String? = null) :
         ArcaException(message, errorId)
 
@@ -98,6 +103,10 @@ public fun mapApiError(code: String, message: String, errorId: String?): ArcaExc
 
     "CONFLICT", "ALREADY_EXISTS", "ALREADY_MEMBER", "ALREADY_DELETED",
     "DUPLICATE_REALM", "ALREADY_REVOKED", "IDEMPOTENCY_VIOLATION",
+    // Order-placement conflicts (409): well-formed request the venue can't fill.
+    // NO_LIQUIDITY = empty book side (retry / marketable limit); MARKET_DELISTED
+    // = market delisted, positions settled by the venue, no new orders accepted.
+    "NO_LIQUIDITY", "MARKET_DELISTED",
     -> ArcaException.Conflict(code, message, errorId)
 
     "INTERNAL_ERROR" -> ArcaException.Internal(message, errorId)
