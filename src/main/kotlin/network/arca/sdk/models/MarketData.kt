@@ -55,6 +55,15 @@ public data class Market(
     public val index: Int,
     public val szDecimals: Int,
     public val maxLeverage: Int,
+    /**
+     * Minimum order notional in USD (`size * price`) for this market. Use
+     * [Arca.getMinOrderSize] to convert it into a minimum order size in
+     * base-asset units, or [Arca.validateOrderSize] to check a size before
+     * placing an order. Reduce-only orders and unsized (`sizeToMax`) triggers
+     * are exempt. Null when served by an older backend; clients fall back to
+     * the venue-wide [Arca.getOrderLimits] default.
+     */
+    public val minOrderNotionalUsd: Double? = null,
     public val onlyIsolated: Boolean,
     /** Supported margin modes: `["isolated"]` or `["cross", "isolated"]`. */
     public val marginModes: List<String>? = null,

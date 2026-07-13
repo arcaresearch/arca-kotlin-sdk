@@ -80,6 +80,9 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Exchange state | arca.getExchangeState(id) |
 | Active asset data | arca.getActiveAssetData(objectId, market, ...) |
 | Set leverage / margin | arca.updateLeverage / updateIsolatedMargin / setMarginMode |
+| Order limits | arca.getOrderLimits() -> OrderLimits(minOrderNotionalUsd = 10.0) |
+| Min order size (UI gating) | arca.getMinOrderSize(market|marketId, price, reduceOnly?, isTrigger?, sizeToMax?) -> MinOrderSize(minSize, minNotionalUsd); ceil to szDecimals; reduce-only / unsized-trigger exempt |
+| Validate order size (advisory) | arca.validateOrderSize(market|marketId, price, size, ...) -> OrderSizeValidation(ok, minSize, minNotionalUsd, reason?) |
 | Market meta | arca.getMarketMeta() / market(id) / resolveMarkets(symbol, opts) |
 | Mids/tickers/book | arca.getMarketMids / getMarketTickers / getOrderBook |
 | Candles | arca.getCandles(market, interval, options) |

@@ -341,3 +341,43 @@ public data class FeeTarget(
     public val arcaPath: String,
     public val percentage: Int,
 )
+
+// MARK: - Order limits
+
+/**
+ * Static venue-wide order limits returned by [network.arca.sdk.getOrderLimits].
+ * Hyperliquid enforces a $10 minimum notional (`size * price`) on every
+ * non-reduce-only order. Reduce-only orders and unsized (`sizeToMax`) triggers
+ * are exempt so dust positions can always be closed.
+ */
+public data class OrderLimits(
+    /** Minimum order notional in USD (size * price). Hyperliquid: 10. */
+    public val minOrderNotionalUsd: Double,
+)
+
+/**
+ * The smallest valid order for a market at a given price, returned by
+ * [network.arca.sdk.getMinOrderSize].
+ */
+public data class MinOrderSize(
+    /**
+     * Minimum order size in base-asset units (decimal string), rounded up to
+     * the market's `szDecimals` precision. For exempt orders this is a single
+     * size tick (`10^-szDecimals`).
+     */
+    public val minSize: String,
+    /** USD notional floor applied. Zero for exempt (reduce-only / unsized-trigger) orders. */
+    public val minNotionalUsd: Double,
+)
+
+/** Result of [network.arca.sdk.validateOrderSize]. */
+public data class OrderSizeValidation(
+    /** True when the order clears the minimum (or is exempt). */
+    public val ok: Boolean,
+    /** The minimum order size in base-asset units. */
+    public val minSize: String,
+    /** USD notional floor applied. Zero for exempt orders. */
+    public val minNotionalUsd: Double,
+    /** Human-readable explanation when [ok] is false; null when valid. */
+    public val reason: String? = null,
+)

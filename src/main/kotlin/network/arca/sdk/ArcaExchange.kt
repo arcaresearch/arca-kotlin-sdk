@@ -25,10 +25,13 @@ import network.arca.sdk.models.LeverageSetting
 import network.arca.sdk.models.MarginMode
 import network.arca.sdk.models.Market
 import network.arca.sdk.models.MarketTickersResponse
+import network.arca.sdk.models.MinOrderSize
 import network.arca.sdk.models.Operation
+import network.arca.sdk.models.OrderLimits
 import network.arca.sdk.models.OrderListResponse
 import network.arca.sdk.models.OrderOperationResponse
 import network.arca.sdk.models.OrderSide
+import network.arca.sdk.models.OrderSizeValidation
 import network.arca.sdk.models.OrderStatus
 import network.arca.sdk.models.OrderType
 import network.arca.sdk.models.OIHistoryResponse
@@ -49,6 +52,9 @@ import network.arca.sdk.models.UpdateIsolatedMarginResponse
 import network.arca.sdk.models.UpdateLeverageResponse
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
+import kotlin.math.ceil
+import kotlin.math.pow
+import kotlin.math.roundToLong
 
 // MARK: - Exchange (Perps) Operations
 
@@ -969,6 +975,167 @@ public suspend fun Arca.preloadMarketMeta() {
 public suspend fun Arca.refreshMarketMeta() {
     ensureMetaLoaded(forceRefresh = true)
 }
+
+/**
+ * Venue-wide order limits (e.g. the $10 minimum notional). Static; no network
+ * call. Reduce-only orders and unsized (`sizeToMax`) triggers are exempt so
+ * dust positions can always be closed.
+ */
+public fun Arca.getOrderLimits(): OrderLimits = OrderLimits(minOrderNotionalUsd = 10.0)
+
+/**
+ * Compute the minimum valid order size for a resolved [market] at a given
+ * [price].
+ *
+ * The venue enforces a minimum order **notional** (`size * price`), but a UI
+ * that takes a size in base-asset units needs that expressed as a minimum
+ * **size**. This converts the market's `minOrderNotionalUsd` into a size,
+ * rounded **up** to the market's `szDecimals` precision so the result always
+ * clears the floor. Reduce-only orders and unsized (`sizeToMax`) triggers are
+ * exempt (any positive size down to one tick).
+ */
+public fun Arca.getMinOrderSize(
+    market: Market,
+    price: Double,
+    reduceOnly: Boolean = false,
+    isTrigger: Boolean = false,
+    sizeToMax: Boolean = false,
+): MinOrderSize = computeMinOrderSize(
+    szDecimals = market.szDecimals,
+    minNotionalUsd = market.minOrderNotionalUsd ?: getOrderLimits().minOrderNotionalUsd,
+    price = price,
+    reduceOnly = reduceOnly,
+    isTrigger = isTrigger,
+    sizeToMax = sizeToMax,
+)
+
+/**
+ * Compute the minimum valid order size for a market id at a given price.
+ * Fetches (and caches) market metadata via [market]; falls back to the
+ * venue-wide [getOrderLimits] default when the market is unknown or carries no
+ * `minOrderNotionalUsd`.
+ */
+public suspend fun Arca.getMinOrderSize(
+    marketId: String,
+    price: Double,
+    reduceOnly: Boolean = false,
+    isTrigger: Boolean = false,
+    sizeToMax: Boolean = false,
+): MinOrderSize {
+    val m = market(marketId)
+    return computeMinOrderSize(
+        szDecimals = m?.szDecimals ?: 5,
+        minNotionalUsd = m?.minOrderNotionalUsd ?: getOrderLimits().minOrderNotionalUsd,
+        price = price,
+        reduceOnly = reduceOnly,
+        isTrigger = isTrigger,
+        sizeToMax = sizeToMax,
+    )
+}
+
+/**
+ * Validate an order size against a resolved [market]'s minimum before placing
+ * an order. Advisory only — the server (sim-exchange and Hyperliquid) remains
+ * the authoritative enforcement point; use this to gate a UI.
+ */
+public fun Arca.validateOrderSize(
+    market: Market,
+    price: Double,
+    size: Double,
+    reduceOnly: Boolean = false,
+    isTrigger: Boolean = false,
+    sizeToMax: Boolean = false,
+): OrderSizeValidation {
+    val min = getMinOrderSize(market, price, reduceOnly, isTrigger, sizeToMax)
+    return checkOrderSize(min, price, size, reduceOnly, isTrigger, sizeToMax)
+}
+
+/** Validate an order size for a market id. Fetches market metadata as needed. */
+public suspend fun Arca.validateOrderSize(
+    marketId: String,
+    price: Double,
+    size: Double,
+    reduceOnly: Boolean = false,
+    isTrigger: Boolean = false,
+    sizeToMax: Boolean = false,
+): OrderSizeValidation {
+    val min = getMinOrderSize(marketId, price, reduceOnly, isTrigger, sizeToMax)
+    return checkOrderSize(min, price, size, reduceOnly, isTrigger, sizeToMax)
+}
+
+private fun computeMinOrderSize(
+    szDecimals: Int,
+    minNotionalUsd: Double,
+    price: Double,
+    reduceOnly: Boolean,
+    isTrigger: Boolean,
+    sizeToMax: Boolean,
+): MinOrderSize {
+    val factor = 10.0.pow(szDecimals)
+    val tick = 1.0 / factor
+
+    // Reduce-only and unsized trigger orders are exempt from the notional
+    // minimum — any positive size down to one tick is allowed.
+    if (reduceOnly || (isTrigger && sizeToMax)) {
+        return MinOrderSize(formatSizeToDecimals(tick, szDecimals), 0.0)
+    }
+
+    if (!price.isFinite() || price <= 0) {
+        return MinOrderSize(formatSizeToDecimals(tick, szDecimals), minNotionalUsd)
+    }
+
+    // Round up to szDecimals precision. Subtract a tiny epsilon on the scaled
+    // value so floating-point noise on an exact boundary (e.g. 10 / 100000)
+    // doesn't overshoot by a full tick.
+    var minSizeNum = ceil(minNotionalUsd / price * factor - 1e-6) / factor
+    if (minSizeNum < tick) minSizeNum = tick
+    return MinOrderSize(formatSizeToDecimals(minSizeNum, szDecimals), minNotionalUsd)
+}
+
+private fun checkOrderSize(
+    min: MinOrderSize,
+    price: Double,
+    size: Double,
+    reduceOnly: Boolean,
+    isTrigger: Boolean,
+    sizeToMax: Boolean,
+): OrderSizeValidation {
+    if (!size.isFinite() || size <= 0) {
+        return OrderSizeValidation(ok = false, minSize = min.minSize, minNotionalUsd = min.minNotionalUsd, reason = "Order size must be a positive number.")
+    }
+
+    // Exempt orders (reduce-only / unsized trigger) only need a positive size.
+    if (reduceOnly || (isTrigger && sizeToMax)) {
+        return OrderSizeValidation(ok = true, minSize = min.minSize, minNotionalUsd = min.minNotionalUsd)
+    }
+
+    val minSizeNum = min.minSize.toDoubleOrNull() ?: 0.0
+    if (size < minSizeNum) {
+        val notional = if (price.isFinite()) size * price else 0.0
+        val reason = "Order notional \$${"%.2f".format(notional)} is below venue minimum of " +
+            "\$${formatNotionalUsd(min.minNotionalUsd)}. Minimum size is ${min.minSize}."
+        return OrderSizeValidation(ok = false, minSize = min.minSize, minNotionalUsd = min.minNotionalUsd, reason = reason)
+    }
+
+    return OrderSizeValidation(ok = true, minSize = min.minSize, minNotionalUsd = min.minNotionalUsd)
+}
+
+/**
+ * Format a size to at most [decimals] fractional digits, stripping trailing
+ * zeros, for use as a canonical decimal string (e.g. "0.0001", "3.34", "10").
+ */
+private fun formatSizeToDecimals(value: Double, decimals: Int): String {
+    if (decimals <= 0) return value.roundToLong().toString()
+    var s = "%.${decimals}f".format(value)
+    if (s.contains(".")) {
+        s = s.trimEnd('0').trimEnd('.')
+    }
+    return if (s.isEmpty()) "0" else s
+}
+
+/** Format a USD notional dropping a trailing `.0` (e.g. 10.0 -> "10", 10.5 -> "10.5"). */
+private fun formatNotionalUsd(value: Double): String =
+    if (value == value.toLong().toDouble()) value.toLong().toString() else value.toString()
 
 /** Get current mid prices for all assets. */
 public suspend fun Arca.getMarketMids(): SimMidsResponse =
