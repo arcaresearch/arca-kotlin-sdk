@@ -48,11 +48,13 @@ private fun makeOrderOperation(
 private fun makeFill(
     id: String = "fill_1",
     orderId: String = "ord_abc",
+    cloid: String? = null,
     size: String = "0.5",
     price: String = "50000",
 ): SimFill = SimFill(
     id = SimFillId(id),
     orderId = SimOrderId(orderId),
+    cloid = cloid,
     accountId = SimAccountId("acc_1"),
     realmId = RealmId("rlm_test"),
     market = "BTC",
@@ -160,6 +162,37 @@ class OrderHandleTest {
         assertTrue(latch.await(2, TimeUnit.SECONDS))
         assertEquals("0.5", receivedFill?.size)
         assertEquals("ord_abc", receivedFill?.orderId?.value)
+        unsub()
+    }
+
+    @Test
+    fun onFillMatchesPendingBracketChildByCloid() {
+        // Pending normalTpsl child: outcome carries the cloid but NO venue
+        // orderId, so extractOrderId falls back to the raw outcome. Only cloid
+        // identity can correlate the fill once the venue arms the child.
+        val cloid = "0xdeadbeefdeadbeefdeadbeefdeadbeef"
+        val op = makeOrderOperation(
+            state = OperationState.COMPLETED,
+            outcome = """{"orderId":"","cloid":"$cloid","tpsl":"tp"}""",
+        )
+        val inner = OperationHandle(scope, submit = { OrderOperationResponse(operation = op) }, waitForSettlement = { op })
+
+        // The fill's venue orderId is a real oid (not the operation id); only
+        // its cloid ties it to this handle.
+        val matchingFill = makeFill(orderId = "venue-oid-999", cloid = cloid, size = "0.01", price = "72000")
+        val deps = unexpectedDeps(
+            fillEvents = { flowOf(matchingFill to RealmEvent(realmId = "rlm_test", type = "fill.recorded")) },
+        )
+        val handle = orderHandle(inner, "/op/order/bracket-1", deps)
+
+        var receivedFill: SimFill? = null
+        val latch = CountDownLatch(1)
+        val unsub = handle.onFill { fill ->
+            receivedFill = fill
+            latch.countDown()
+        }
+        assertTrue(latch.await(2, TimeUnit.SECONDS))
+        assertEquals(cloid, receivedFill?.cloid)
         unsub()
     }
 

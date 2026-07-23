@@ -119,9 +119,10 @@ public class OrderHandle internal constructor(
             withTimeout((timeoutSeconds * 1000).toLong()) {
                 val response = inner.submitted()
                 val orderId = extractOrderId(response.operation.outcome)
+                val cloid = extractCloid(response.operation.outcome)
 
                 deps.fillEvents().collect { (fill, _) ->
-                    if (fill.orderId.value == orderId) {
+                    if (fillMatches(fill, orderId, cloid)) {
                         emit(fill)
                         val detail = deps.getOrder(objectId, orderId)
                         val status = detail.order.status
@@ -156,8 +157,9 @@ public class OrderHandle internal constructor(
             runCatching {
                 val response = inner.submitted()
                 val orderId = extractOrderId(response.operation.outcome)
+                val cloid = extractCloid(response.operation.outcome)
                 deps.fillEvents().collect { (fill, _) ->
-                    if (fill.orderId.value == orderId) callback(fill)
+                    if (fillMatches(fill, orderId, cloid)) callback(fill)
                 }
             }
         }
@@ -220,6 +222,33 @@ public class OrderHandle internal constructor(
                 arcaJson.parseToJsonElement(raw).jsonObject["orderId"]?.jsonPrimitive?.contentOrNull
             }.getOrNull()
             return parsed?.takeIf { it.isNotEmpty() } ?: raw
+        }
+
+        /**
+         * The order's client id (Hyperliquid cloid) from the placement outcome.
+         * A `normalTpsl` bracket child is not a live venue order until the entry
+         * fills and the venue arms it — until then it has NO venue order id
+         * (extractOrderId falls back to the raw outcome) and is addressable only
+         * by its cloid, so fill matching must also key on it. Returns null when
+         * the outcome carries no cloid (e.g. sim orders).
+         */
+        private fun extractCloid(outcome: String?): String? {
+            val raw = outcome?.takeIf { it.isNotEmpty() } ?: return null
+            return runCatching {
+                arcaJson.parseToJsonElement(raw).jsonObject["cloid"]?.jsonPrimitive?.contentOrNull
+            }.getOrNull()?.takeIf { it.isNotEmpty() }
+        }
+
+        /**
+         * Whether a fill belongs to this order. Matches on the venue order id
+         * when the order is live, OR on the cloid — the latter is the only
+         * handle a still-pending bracket child has before the venue assigns it
+         * an oid.
+         */
+        private fun fillMatches(fill: SimFill, orderId: String, cloid: String?): Boolean {
+            if (fill.orderId.value.isNotEmpty() && fill.orderId.value == orderId) return true
+            if (!cloid.isNullOrEmpty() && !fill.cloid.isNullOrEmpty() && fill.cloid == cloid) return true
+            return false
         }
     }
 }

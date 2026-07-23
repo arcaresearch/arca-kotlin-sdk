@@ -80,18 +80,23 @@ class ArcaExchangeBracketTest {
         assertEquals("0.01", orders[0].str("size"))
         assertFalse(orders[0].containsKey("reduceOnly"), "entry must not be reduce-only")
 
+        // normalTpsl children are FIXED-SIZE: they default to the entry's size
+        // and never carry sizeToMax (that is the whole-position positionTpsl
+        // model, which this endpoint rejects).
         val tp = orders.first { it.str("tpsl") == "tp" }
         assertEquals("sell", tp.str("side"))
         assertEquals(true, tp.bool("reduceOnly"))
-        assertEquals(true, tp.bool("sizeToMax"))
+        assertFalse(tp.containsKey("sizeToMax"), "normalTpsl child must NOT carry sizeToMax")
         assertEquals(true, tp.bool("isTrigger"))
         assertEquals("72000", tp.str("triggerPx"))
-        assertEquals("0", tp.str("size"))
+        assertEquals("0.01", tp.str("size"), "defaults to the entry size")
 
         val sl = orders.first { it.str("tpsl") == "sl" }
         assertEquals("sell", sl.str("side"))
         assertEquals("58000", sl.str("triggerPx"))
         assertEquals(true, sl.bool("reduceOnly"))
+        assertFalse(sl.containsKey("sizeToMax"), "normalTpsl child must NOT carry sizeToMax")
+        assertEquals("0.01", sl.str("size"), "defaults to the entry size")
     }
 
     @Test
@@ -120,14 +125,16 @@ class ArcaExchangeBracketTest {
         result.entry.submitted()
 
         val orders = (posts[0]["orders"] as JsonArray).map { it.jsonObject }
+        // Explicit takeProfitSz → sized partial close (no sizeToMax).
         val tp = orders.first { it.str("tpsl") == "tp" }
         assertEquals("0.01", tp.str("size"))
         assertFalse(tp.containsKey("sizeToMax"), "sized TP must NOT carry sizeToMax")
         assertEquals(true, tp.bool("reduceOnly"))
 
+        // No explicit size → defaults to the entry's fixed size (never sizeToMax).
         val sl = orders.first { it.str("tpsl") == "sl" }
-        assertEquals("0", sl.str("size"))
-        assertEquals(true, sl.bool("sizeToMax"))
+        assertEquals("0.02", sl.str("size"), "defaults to the entry size")
+        assertFalse(sl.containsKey("sizeToMax"), "default SL must NOT carry sizeToMax")
     }
 
     @Test

@@ -140,12 +140,29 @@ build charts on `watchCandleChart`.
 4. size is base-asset units, not USD. Min notional is $10.
 5. Always close() the Arca instance (and stop() each watch) to release the socket + scope.
 
-## TP/SL is an OCO bracket; openWithBracket is atomic
+## TP/SL is an OCO bracket; openWithBracket is a linked normalTpsl bracket
 
 setPositionTpsl stamps one auto-generated ocoGroupId on both legs; when either fills
-(even partially) the venue cancels the other (cancelReason="sibling_filled"). A TP/SL
-leg closes the WHOLE position by default (sizeToMax); set a base-unit size for a
-reduce-only partial (min-notional waived) — when sized, setPositionTpsl does NOT
-auto-link the legs. openWithBracket(...) opens a position and attaches its reduce-only
-TP/SL triggers as one atomic, all-or-nothing batch; the trigger legs arm only when the
-entry fills, and it returns one OrderHandle per leg.
+(even partially) the venue cancels the other (cancelReason="sibling_filled"). A
+setPositionTpsl / setStopLoss / setTakeProfit leg closes the WHOLE position by default
+(sizeToMax, Hyperliquid positionTpsl); set a base-unit size for a reduce-only partial
+(min-notional waived) — when sized, setPositionTpsl does NOT auto-link the legs.
+
+openWithBracket(...) opens a position and attaches its reduce-only TP/SL triggers as a
+linked normalTpsl bracket: one signature links the legs (NOT globally all-or-none — HL
+only guarantees whole-payload rejection for pre-validation failures). normalTpsl is a
+FIXED-SIZE parent-order bracket: each trigger child defaults to the ENTRY's size (NOT a
+whole-position sizeToMax trigger); pass takeProfitSz/stopLossSz for a smaller
+partial-close child. The trigger legs arm only when the entry fills; until then a child
+is not a live venue order (no venue order id — addressable only by its cloid), its
+handle matches fills by cloid, and cancelling it before activation cancels the parent
+bracket. Returns one OrderHandle per leg.
+
+## resize / modifyOrder on Hyperliquid is a cancel-replace
+
+resize(newSize, path) treats newSize as the new TOTAL order size. On Hyperliquid this is
+a cancel-replace: the venue cancels the old order id and places a replacement with a NEW
+order id, retaining the cloid; the platform re-correlates later fills/cancels on the
+replacement back to the original placement operation. newSize must exceed the
+already-filled quantity (a resize at-or-below the filled amount is rejected). Unsized
+(sizeToMax) whole-position triggers have no size to amend and are rejected.

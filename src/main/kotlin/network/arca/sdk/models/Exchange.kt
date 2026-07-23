@@ -122,6 +122,12 @@ public data class SimOrder(
 public data class SimFill(
     public val id: SimFillId,
     public val orderId: SimOrderId,
+    /**
+     * Client order id (Hyperliquid cloid). A `normalTpsl` bracket child is not
+     * a live venue order until the entry fills and the venue arms it — until
+     * then it has no venue [orderId], so its fills correlate only by [cloid].
+     */
+    public val cloid: String? = null,
     public val accountId: SimAccountId? = null,
     public val realmId: RealmId? = null,
     public val market: String,
