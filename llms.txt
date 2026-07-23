@@ -87,6 +87,7 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Mids/tickers/book | arca.getMarketMids / getMarketTickers / getOrderBook |
 | Candles | arca.getCandles(market, interval, options) |
 | OI history | arca.getOIHistory(market, interval, options) -> OHLC open interest + 24h ntlVlm + mark; intervals 1m/5m/1h/1d |
+| Funding history | arca.getFundingHistory(market, startTime?, endTime?) -> SETTLED funding observations {t, fundingRate, premium?, s?}; no interval (event series); default 7d, max 30d; HIP-3 supported; not predicted (use ticker funding/nextFundingTime) |
 
 ## Watch streams (real-time)
 

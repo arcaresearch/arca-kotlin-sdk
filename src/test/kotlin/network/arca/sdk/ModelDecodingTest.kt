@@ -27,6 +27,7 @@ import network.arca.sdk.models.ExchangeState
 import network.arca.sdk.models.ExplorerSummary
 import network.arca.sdk.models.Fill
 import network.arca.sdk.models.FundAccountResponse
+import network.arca.sdk.models.FundingHistoryResponse
 import network.arca.sdk.models.LeverageSetting
 import network.arca.sdk.models.LeverageType
 import network.arca.sdk.models.MarginMode
@@ -1670,5 +1671,42 @@ class ModelDecodingTest {
         assertEquals("act_01abc", resp.accountId)
         assertEquals("hl:0:BTC", resp.market)
         assertEquals(MarginMode.ISOLATED, resp.marginMode)
+    }
+
+    @Test
+    fun fundingHistoryResponseDecoding() {
+        // Market-wide SETTLED funding history (getFundingHistory). The second
+        // observation omits premium and source to exercise the optional fields.
+        val json = """
+            {
+                "market": "hl:0:BTC",
+                "funding": [
+                    { "t": 1700000000000, "fundingRate": "0.0000125", "premium": "0.00008", "s": "hl" },
+                    { "t": 1700003600000, "fundingRate": "0.0000130" }
+                ]
+            }
+        """.trimIndent()
+        val resp = arcaJson.decodeFromString<FundingHistoryResponse>(json)
+        assertEquals("hl:0:BTC", resp.market)
+        assertEquals(2, resp.funding.size)
+
+        assertEquals(1700000000000L, resp.funding[0].t)
+        assertEquals("0.0000125", resp.funding[0].fundingRate)
+        assertEquals("0.00008", resp.funding[0].premium)
+        assertEquals("hl", resp.funding[0].s)
+
+        // Optional premium/source absent -> null, not empty string.
+        assertEquals(1700003600000L, resp.funding[1].t)
+        assertEquals("0.0000130", resp.funding[1].fundingRate)
+        assertNull(resp.funding[1].premium)
+        assertNull(resp.funding[1].s)
+    }
+
+    @Test
+    fun fundingHistoryEmptyResponseDecoding() {
+        // 200 + empty list is the canonical "no history" response.
+        val resp = arcaJson.decodeFromString<FundingHistoryResponse>("""{ "market": "hl:0:BTC", "funding": [] }""")
+        assertEquals("hl:0:BTC", resp.market)
+        assertTrue(resp.funding.isEmpty())
     }
 }

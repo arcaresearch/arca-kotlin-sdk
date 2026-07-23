@@ -34,6 +34,7 @@ import network.arca.sdk.models.OrderSide
 import network.arca.sdk.models.OrderSizeValidation
 import network.arca.sdk.models.OrderStatus
 import network.arca.sdk.models.OrderType
+import network.arca.sdk.models.FundingHistoryResponse
 import network.arca.sdk.models.OIHistoryResponse
 import network.arca.sdk.models.PositionListResponse
 import network.arca.sdk.models.PositionSide
@@ -1276,6 +1277,52 @@ public suspend fun Arca.getOIHistory(
     if (endTime != null) query["endTime"] = endTime.toString()
     val result: OIHistoryResponse = client.get("/exchange/market/oi/$market", query = query)
     if (result.bars.isNotEmpty()) {
+        historyCache.set(key, result)
+    }
+    return result
+}
+
+/**
+ * Get market-wide SETTLED funding-rate history for a market.
+ *
+ * Returns the venue's real settlement series — each observation carries the
+ * settlement time ([FundingObservation.t], Unix ms), the settled
+ * [FundingObservation.fundingRate], and the [FundingObservation.premium] — in
+ * chronological order. This is distinct from the account-scoped funding
+ * *payments* (`watchFunding`); these are the market-wide rates that drive those
+ * payments. [market] must be a canonical market id (e.g. `hl:0:BTC`,
+ * `hl:1:TSLA`); HIP-3 markets are supported where history exists. Funding is an
+ * event series, so there is no interval. The default window is the trailing 7
+ * days; the documented maximum window is 30 days. Values are settled rates,
+ * never predicted — read the ticker's funding + nextFundingTime for the
+ * current/predicted rate.
+ *
+ * @param market Canonical market ID (e.g. `hl:0:BTC`).
+ * @param startTime Optional start time in epoch milliseconds.
+ * @param endTime Optional end time in epoch milliseconds.
+ */
+public suspend fun Arca.getFundingHistory(
+    market: String,
+    startTime: Long? = null,
+    endTime: Long? = null,
+): FundingHistoryResponse {
+    val key = buildCacheKey(
+        "fundingHistory",
+        mapOf(
+            "market" to market,
+            "startTime" to startTime?.toString(),
+            "endTime" to endTime?.toString(),
+        ),
+    )
+    historyCache.get<FundingHistoryResponse>(key)?.let { return it }
+
+    coroutineContext.ensureActive()
+
+    val query = mutableMapOf<String, String>()
+    if (startTime != null) query["startTime"] = startTime.toString()
+    if (endTime != null) query["endTime"] = endTime.toString()
+    val result: FundingHistoryResponse = client.get("/exchange/market/funding/$market", query = query)
+    if (result.funding.isNotEmpty()) {
         historyCache.set(key, result)
     }
     return result

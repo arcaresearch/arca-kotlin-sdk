@@ -181,6 +181,28 @@ public data class OIHistoryResponse(
     public val bars: List<OIBar>,
 )
 
+/**
+ * A single SETTLED funding-rate observation for a market. Unlike [OIBar] /
+ * [Candle] this is not interval-bucketed — it is a raw event at the venue's real
+ * settlement timestamp ([t], Unix ms), so a market's true funding schedule is
+ * preserved. [fundingRate]/[premium] are settled historical rates, never
+ * predicted (use the ticker's funding + nextFundingTime for the
+ * current/predicted rate). [s] is the data source ("hl").
+ */
+@Serializable
+public data class FundingObservation(
+    public val t: Long,
+    public val fundingRate: String,
+    public val premium: String? = null,
+    public val s: String? = null,
+)
+
+@Serializable
+public data class FundingHistoryResponse(
+    public val market: String,
+    public val funding: List<FundingObservation>,
+)
+
 /** Emitted by open-interest streams on each bar change. */
 public data class OIEvent(
     public val market: String,
