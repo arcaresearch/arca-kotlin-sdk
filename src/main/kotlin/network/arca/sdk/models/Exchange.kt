@@ -55,6 +55,13 @@ public data class SimPosition(
     public val cumulativeExchangeFee: String? = null,
     public val cumulativePlatformFee: String? = null,
     public val cumulativeBuilderFee: String? = null,
+    /**
+     * When the current open lot began — the same lot boundary the `cumulative*`
+     * fields use. Survives increases, partial reduces, and leverage / margin
+     * changes; resets on a flip through zero or a reopen after a full close.
+     * Derived from platform fill history, so it means the same thing on every
+     * venue; null when no history exists to derive it from.
+     */
     public val createdAt: String? = null,
     public val updatedAt: String? = null,
 )
