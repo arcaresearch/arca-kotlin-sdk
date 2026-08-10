@@ -233,6 +233,15 @@ public data class ActiveAssetData(
     public val maxSellSize: String,
     public val maxBuyUsd: String,
     public val maxSellUsd: String,
+    /**
+     * Raw available margin in USD: cross equity minus cross **initial** margin.
+     * Direction-agnostic; use for "buying power" display.
+     *
+     * Not the same as `withdrawable` on the exchange state, which is cross
+     * equity minus cross **maintenance** margin. Maintenance is the lower
+     * requirement, so `withdrawable` is normally the larger number, and this
+     * value can go negative while the account is still solvent.
+     */
     public val availableToTrade: String,
     public val markPx: String,
     public val feeRate: String,
@@ -240,6 +249,27 @@ public data class ActiveAssetData(
     public val marginTiers: List<MarginTier>? = null,
     public val bidPx: String? = null,
     public val askPx: String? = null,
+    /**
+     * The part of [maxBuySize] that reduces an open short, in tokens.
+     *
+     * `maxBuySize == maxBuyReduceSize + maxBuyOpenSize`. This leg is the open
+     * position's size when a buy closes it, and `"0"` otherwise. It is always
+     * available: a strictly-reducing order lowers both the initial and the
+     * maintenance requirement, so it is never refused for balance.
+     *
+     * `null` on venues that do not report the split (Hyperliquid) — treat that
+     * as "unknown", not as `"0"`.
+     */
+    public val maxBuyReduceSize: String? = null,
+    /**
+     * The part of [maxBuySize] that opens new long exposure, in tokens. This is
+     * the leg constrained by collateral. See [maxBuyReduceSize].
+     */
+    public val maxBuyOpenSize: String? = null,
+    /** The part of [maxSellSize] that reduces an open long, in tokens. See [maxBuyReduceSize]. */
+    public val maxSellReduceSize: String? = null,
+    /** The part of [maxSellSize] that opens new short exposure, in tokens. See [maxBuyReduceSize]. */
+    public val maxSellOpenSize: String? = null,
 )
 
 /** Per-asset fee rate entry returned by `getAssetFees`. */

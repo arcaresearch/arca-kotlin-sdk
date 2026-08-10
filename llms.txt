@@ -78,7 +78,7 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Position TP/SL | arca.setStopLoss / setTakeProfit / setPositionTpsl / clearPositionTpsl |
 | Open with atomic bracket | arca.openWithBracket(...) -> entry + takeProfit?/stopLoss? handles |
 | Exchange state | arca.getExchangeState(id) |
-| Active asset data | arca.getActiveAssetData(objectId, market, ...) |
+| Active asset data | arca.getActiveAssetData(objectId, market, ...); maxBuySize/maxSellSize include reversing and split as maxBuyReduceSize + maxBuyOpenSize (same for sell) — the reduce leg is never refused for balance, the open leg is what buying power gates. Null on Hyperliquid. |
 | Set leverage / margin | arca.updateLeverage / updateIsolatedMargin / setMarginMode |
 | Order limits | arca.getOrderLimits() -> OrderLimits(minOrderNotionalUsd = 10.0) |
 | Min order size (UI gating) | arca.getMinOrderSize(market|marketId, price, reduceOnly?, isTrigger?, sizeToMax?) -> MinOrderSize(minSize, minNotionalUsd); ceil to szDecimals; reduce-only / unsized-trigger exempt |

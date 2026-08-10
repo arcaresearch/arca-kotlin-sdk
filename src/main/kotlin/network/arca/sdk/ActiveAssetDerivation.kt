@@ -63,8 +63,17 @@ public fun deriveActiveAssetData(
 ): ActiveAssetData? {
     if (!markPx.isFinite() || markPx <= 0 || leverage <= 0) return null
 
-    val equity = parsePositiveDouble(exchangeState.marginSummary.equity)
-    val initialMarginUsed = parsePositiveDouble(exchangeState.marginSummary.initialMarginUsed)
+    // Cross bucket, not the account-wide summary. The server budgets orders from
+    // cross equity alone (PositionService.AvailableBalance) because an isolated
+    // position's collateral and P&L are locked to that position and can neither
+    // fund nor drain another order. Deriving from `marginSummary` instead lets
+    // an isolated position's unrealized profit inflate the previewed max above
+    // what the venue will accept. Falls back to `marginSummary` for older
+    // servers that do not send the cross bucket (identical when nothing is
+    // isolated).
+    val summary = exchangeState.crossMarginSummary ?: exchangeState.marginSummary
+    val equity = parsePositiveDouble(summary.equity)
+    val initialMarginUsed = parsePositiveDouble(summary.initialMarginUsed)
     val hasPositions = exchangeState.positions.isNotEmpty()
     val availableGuard = if (hasPositions) 0.97 else 1.0
     val available = maxOf(0.0, (equity - initialMarginUsed) * availableGuard)
@@ -126,32 +135,53 @@ public fun deriveActiveAssetData(
     }
 
     val currentPosition = exchangeState.positions.firstOrNull { it.market == market }
-    var buyMax = 0.0
-    var sellMax = 0.0
+    // Each side splits into the part that reduces the open position and the part
+    // that opens new exposure. The reduce leg is unconditional — a
+    // strictly-reducing fill lowers both the initial and the maintenance
+    // requirement, so the venue never refuses it for balance.
+    var buyReduce = 0.0
+    var buyOpen = 0.0
+    var sellReduce = 0.0
+    var sellOpen = 0.0
 
     if (currentPosition != null) {
         val posSize = parsePositiveDouble(currentPosition.size)
-        val posMargin = parsePositiveDouble(currentPosition.marginUsed)
+        // Isolated positions carry dedicated collateral that can exceed the
+        // leverage-implied marginUsed after updateIsolatedMargin; closing
+        // releases that full amount. Mirrors the server's lockedCollateral().
+        val isolated = parsePositiveDouble(currentPosition.isolatedMargin)
+        val posMargin = if (isolated > 0) isolated else parsePositiveDouble(currentPosition.marginUsed)
         val closeFees = posSize * markPx * feeRate * SAFETY_MARGIN_FACTOR
         val availableAfterClose = maxOf(0.0, available + posMargin - closeFees)
 
         when (currentPosition.side) {
             PositionSide.LONG -> {
-                buyMax = maxTokensForDir(available, buyPx)
-                sellMax = posSize + maxTokensForDir(availableAfterClose, sellPx)
+                buyOpen = maxTokensForDir(available, buyPx)
+                sellReduce = posSize
+                sellOpen = maxTokensForDir(availableAfterClose, sellPx)
             }
             PositionSide.SHORT -> {
-                sellMax = maxTokensForDir(available, sellPx)
-                buyMax = posSize + maxTokensForDir(availableAfterClose, buyPx)
+                sellOpen = maxTokensForDir(available, sellPx)
+                buyReduce = posSize
+                buyOpen = maxTokensForDir(availableAfterClose, buyPx)
             }
         }
     } else {
-        buyMax = maxTokensForDir(available, buyPx)
-        sellMax = maxTokensForDir(available, sellPx)
+        buyOpen = maxTokensForDir(available, buyPx)
+        sellOpen = maxTokensForDir(available, sellPx)
     }
 
-    buyMax = floorToDecimals(buyMax, szDecimals)
-    sellMax = floorToDecimals(sellMax, szDecimals)
+    // Only the open legs are floored, and only because they are budget-derived:
+    // floorToDecimals deliberately nudges down to avoid advertising a size the
+    // venue would refuse. The reduce legs are the position size itself, already
+    // at the venue's tick precision, and that nudge would shave a tick off them
+    // (0.02 -> 0.01999) — leaving the user unable to fully close from a slider
+    // that reads this. The server floors both with exact decimal math, where the
+    // reduce leg is a no-op.
+    buyOpen = floorToDecimals(buyOpen, szDecimals)
+    sellOpen = floorToDecimals(sellOpen, szDecimals)
+    val buyMax = buyReduce + buyOpen
+    val sellMax = sellReduce + sellOpen
 
     val rawAvailableUsd = maxOf(0.0, equity - initialMarginUsed)
 
@@ -169,5 +199,9 @@ public fun deriveActiveAssetData(
         marginTiers = marginTiers,
         bidPx = toDecimalString(sellPx),
         askPx = toDecimalString(buyPx),
+        maxBuyReduceSize = toDecimalString(buyReduce, szDecimals),
+        maxBuyOpenSize = toDecimalString(buyOpen, szDecimals),
+        maxSellReduceSize = toDecimalString(sellReduce, szDecimals),
+        maxSellOpenSize = toDecimalString(sellOpen, szDecimals),
     )
 }

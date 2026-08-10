@@ -359,4 +359,139 @@ class ActiveAssetDerivationTest {
         assertEquals(80000 * askRatio, atSnapshot!!.askPx!!.toDouble(), 1.0)
         assertEquals(90000 * askRatio, afterMove!!.askPx!!.toDouble(), 1.0)
     }
+
+    // --- Reduce / open split ---
+
+    @Test
+    fun noPositionReportsZeroReduceOnBothSides() {
+        val d = deriveActiveAssetData(makeState(equity = "10000"), "hl:0:BTC", 80000.0, 5, OrderSide.BUY)
+        assertNotNull(d)
+        assertEquals("0", d!!.maxBuyReduceSize)
+        assertEquals("0", d.maxSellReduceSize)
+        assertEquals(d.maxBuySize, d.maxBuyOpenSize)
+        assertEquals(d.maxSellSize, d.maxSellOpenSize)
+    }
+
+    @Test
+    fun longPositionSplitsTheSellSideOnly() {
+        val pos = makePosition("hl:0:BTC", PositionSide.LONG, "0.02", "320")
+        val state = makeState(equity = "10000", initialMarginUsed = "320", positions = listOf(pos))
+        val d = deriveActiveAssetData(state, "hl:0:BTC", 80000.0, 5, OrderSide.SELL)
+        assertNotNull(d)
+        // A sell closes the long, so the whole position is reducible. The tick
+        // must survive: 0.02, not 0.01999 — a user has to be able to fully close.
+        assertEquals(0.02, d!!.maxSellReduceSize!!.toDouble(), 1e-12)
+        assertTrue(d.maxSellOpenSize!!.toDouble() > 0)
+        // A buy adds to the long; there is nothing on that side to reduce.
+        assertEquals("0", d.maxBuyReduceSize)
+        assertEquals(d.maxBuySize, d.maxBuyOpenSize)
+    }
+
+    @Test
+    fun totalEqualsReducePlusOpen() {
+        val pos = makePosition("hl:0:BTC", PositionSide.LONG, "0.02", "320")
+        val state = makeState(equity = "10000", initialMarginUsed = "320", positions = listOf(pos))
+        val d = deriveActiveAssetData(state, "hl:0:BTC", 80000.0, 5, OrderSide.SELL)
+        assertNotNull(d)
+        assertEquals(
+            d!!.maxSellReduceSize!!.toDouble() + d.maxSellOpenSize!!.toDouble(),
+            d.maxSellSize.toDouble(), 1e-10,
+        )
+        assertEquals(
+            d.maxBuyReduceSize!!.toDouble() + d.maxBuyOpenSize!!.toDouble(),
+            d.maxBuySize.toDouble(), 1e-10,
+        )
+    }
+
+    // The reported bug in its client-side form: an account below its
+    // initial-margin requirement can open nothing, but it can always close what
+    // it holds. A slider reading only the total must still offer the trim.
+    @Test
+    fun reduceLegSurvivesWhenNothingCanBeOpened() {
+        val pos = makePosition("hl:0:BTC", PositionSide.LONG, "0.5", "4000")
+        val state = makeState(equity = "100", initialMarginUsed = "5000", positions = listOf(pos))
+        val d = deriveActiveAssetData(state, "hl:0:BTC", 80000.0, 5, OrderSide.SELL)
+        assertNotNull(d)
+        assertEquals(0.5, d!!.maxSellReduceSize!!.toDouble(), 1e-12)
+        assertTrue(d.maxSellSize.toDouble() >= 0.5)
+    }
+
+    // --- Isolated positions ---
+
+    // Isolated collateral and P&L are locked to their own position: the server
+    // budgets orders from cross equity alone (PositionService.AvailableBalance).
+    // Deriving from the account-wide summary let an isolated position's profit
+    // inflate the previewed max above what the venue would accept.
+    @Test
+    fun prefersCrossBucketOverAccountWideSummary() {
+        val state = ExchangeState(
+            account = SimAccount(
+                id = SimAccountId("act_1"),
+                realmId = RealmId("rlm_1"),
+                name = "test",
+                createdAt = "2026-01-01T00:00:00.000000Z",
+                updatedAt = "2026-01-01T00:00:00.000000Z",
+            ),
+            // Account-wide: $9,000 free, most of it locked inside an isolated position.
+            marginSummary = SimMarginSummary(
+                equity = "10000",
+                initialMarginUsed = "1000",
+                maintenanceMarginRequired = "0",
+                availableToWithdraw = "9000",
+                totalNtlPos = "0",
+                totalUnrealizedPnl = "0",
+            ),
+            // Cross bucket: only $500 is actually spendable.
+            crossMarginSummary = SimMarginSummary(
+                equity = "1500",
+                initialMarginUsed = "1000",
+                maintenanceMarginRequired = "0",
+                availableToWithdraw = "500",
+                totalNtlPos = "0",
+                totalUnrealizedPnl = "0",
+            ),
+            feeRates = SimFeeRates(taker = "0.00035", maker = "0.0001", platformFee = "0.0001"),
+        )
+
+        val d = deriveActiveAssetData(state, "hl:0:BTC", 80000.0, 5, OrderSide.BUY)
+        assertNotNull(d)
+        // $500 of cross collateral at 5x is ~$2.5k of notional, not the ~$45k
+        // the account-wide summary would have implied.
+        assertTrue(d!!.maxBuyUsd.toDouble() < 3000, "derived ${d.maxBuyUsd} from the wrong bucket")
+        assertEquals(500.0, d.availableToTrade.toDouble(), 1e-6)
+    }
+
+    @Test
+    fun fallsBackToAccountWideSummaryWhenNoCrossBucket() {
+        // Older servers, and any account with nothing isolated, where the two
+        // are identical by construction.
+        val d = deriveActiveAssetData(makeState(equity = "1000"), "hl:0:BTC", 80000.0, 5, OrderSide.BUY)
+        assertNotNull(d)
+        assertEquals(1000.0, d!!.availableToTrade.toDouble(), 1e-6)
+    }
+
+    // An isolated position can hold more collateral than its leverage implies
+    // after updateIsolatedMargin; closing releases the whole amount. Mirrors the
+    // server's lockedCollateral().
+    @Test
+    fun releasesIsolatedMarginNotMarginUsedIntoTheReversingBudget() {
+        val plainPos = makePosition("hl:0:BTC", PositionSide.LONG, "0.02", "320")
+        val topUpPos = plainPos.copy(isolatedMargin = "2000")
+
+        val topUp = deriveActiveAssetData(
+            makeState(equity = "1000", initialMarginUsed = "320", positions = listOf(topUpPos)),
+            "hl:0:BTC", 80000.0, 5, OrderSide.SELL,
+        )
+        val plain = deriveActiveAssetData(
+            makeState(equity = "1000", initialMarginUsed = "320", positions = listOf(plainPos)),
+            "hl:0:BTC", 80000.0, 5, OrderSide.SELL,
+        )
+        assertNotNull(topUp)
+        assertNotNull(plain)
+        // The extra $1,680 of dedicated collateral is released by the close and
+        // is spendable on the reversing leg, so the open portion grows.
+        assertTrue(topUp!!.maxSellOpenSize!!.toDouble() > plain!!.maxSellOpenSize!!.toDouble())
+        // The reduce leg is the position either way — collateral doesn't change it.
+        assertEquals(topUp.maxSellReduceSize, plain.maxSellReduceSize)
+    }
 }
