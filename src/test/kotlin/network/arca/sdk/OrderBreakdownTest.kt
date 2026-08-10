@@ -45,7 +45,7 @@ class OrderBreakdownTest {
             accountContext = OrderBreakdownAccountContext(equity = "50225", otherMaintenanceMargin = "0"),
         )
         val result = Arca.orderBreakdown(opts)
-        assertEquals(46500.0, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
+        assertEquals(46391.75257732, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
     }
 
     @Test
@@ -57,7 +57,7 @@ class OrderBreakdownTest {
             accountContext = OrderBreakdownAccountContext(equity = "50225", otherMaintenanceMargin = "0"),
         )
         val result = Arca.orderBreakdown(opts)
-        assertEquals(53500.0, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
+        assertEquals(53398.05825243, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
     }
 
     @Test
@@ -69,7 +69,7 @@ class OrderBreakdownTest {
             accountContext = OrderBreakdownAccountContext(equity = "60000", otherMaintenanceMargin = "5000"),
         )
         val result = Arca.orderBreakdown(opts)
-        assertEquals(46022.5, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
+        assertEquals(45899.48453608, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
     }
 
     @Test
@@ -84,7 +84,7 @@ class OrderBreakdownTest {
             ),
         )
         val result = Arca.orderBreakdown(opts)
-        assertEquals(44748.333, result.estimatedLiquidationPrice!!.toDouble(), 1.0)
+        assertEquals(44585.911, result.estimatedLiquidationPrice!!.toDouble(), 1.0)
     }
 
     @Test
@@ -99,7 +99,7 @@ class OrderBreakdownTest {
             ),
         )
         val result = Arca.orderBreakdown(opts)
-        assertEquals(41515.0, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
+        assertEquals(41252.57731959, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
     }
 
     @Test
@@ -129,7 +129,7 @@ class OrderBreakdownTest {
             ),
         )
         val result = Arca.orderBreakdown(opts)
-        assertEquals(58462.5, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
+        assertEquals(58216.01941748, result.estimatedLiquidationPrice!!.toDouble(), 0.5)
     }
 
     @Test

@@ -219,10 +219,20 @@ internal fun computeOrderBreakdown(opts: OrderBreakdownOptions): OrderBreakdown 
             val equityPost = equity - estimatedFee
             val marginAvail = equityPost - (otherMM + mmMerged)
             if (marginAvail > 0) {
-                val perUnit = marginAvail / merged.size
-                val liq = if (merged.side == PositionSide.LONG) price - perUnit else price + perUnit
-                if (liq > 0) {
-                    estimatedLiquidationPrice = fmt(liq)
+                // As the mark moves, equity falls at `size` per unit while this
+                // position's own maintenance requirement falls at `mmr * size`
+                // (MM = mmr * size * mark), so the gap closes at only
+                // `size * (1 -/+ mmr)` per unit. Omitting that term reads
+                // optimistic for shorts. Mirrors `crossMarginLiqPrice` in
+                // sim-exchange's account.go.
+                val mmrEff = if (mergedNotional > 0) mmMerged / mergedNotional else 0.0
+                val sensitivity = if (merged.side == PositionSide.LONG) 1 - mmrEff else 1 + mmrEff
+                if (sensitivity > 0) {
+                    val perUnit = marginAvail / (merged.size * sensitivity)
+                    val liq = if (merged.side == PositionSide.LONG) price - perUnit else price + perUnit
+                    if (liq > 0) {
+                        estimatedLiquidationPrice = fmt(liq)
+                    }
                 }
             }
         }
