@@ -22,6 +22,12 @@ Most calls are extension functions on the `Arca` class (`import network.arca.sdk
 - Errors are a sealed `ArcaException`: Validation, Unauthorized, Forbidden, NotFound(code),
   Conflict(code), Internal, Exchange(code), Network(cause), Decoding(cause),
   NonJsonResponse(statusCode, body), OperationFailed(operation), Unknown(code). Branch with `when`.
+- Order rejections: a venue refusal is `Conflict` (409) with code NO_LIQUIDITY (empty book — retry or
+  use a marketable limit), MARKET_DELISTED, MARKET_NOT_TRADABLE, MARKET_NOT_USDC_COLLATERAL, or
+  ORDER_FAILED (refusal with no narrower code; verbatim venue reason in the message). None are
+  retryable as-is. A bad-input refusal (tick size, price band, leverage cap, min notional, insufficient
+  margin) is `Validation` (400) with the same verbatim reason. `Exchange` (502) means the request never
+  got a verdict (connection reset, timeout, unparseable response) and IS retryable.
 - Client-side only: authenticate with a scoped JWT (never embed an API key in an app).
 - Always call `arca.close()` (e.g. ViewModel.onCleared) to tear down the socket + coroutine scope.
 - Token-provider clients refresh ~30s before expiry, retry once on 401, and retry once on 403

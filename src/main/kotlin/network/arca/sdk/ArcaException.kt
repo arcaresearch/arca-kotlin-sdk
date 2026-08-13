@@ -48,9 +48,14 @@ public sealed class ArcaException(
 
     /**
      * Conflict (HTTP 409). Covers duplicates, idempotency violations, and
-     * order-placement conflicts where [code] carries the specific reason:
-     * `NO_LIQUIDITY` (empty book side, retry or use a marketable limit) or
-     * `MARKET_DELISTED` (market delisted, positions settled by the venue).
+     * venue refusals where [code] carries the specific reason:
+     * `NO_LIQUIDITY` (empty book side, retry or use a marketable limit),
+     * `MARKET_DELISTED` (market delisted, positions settled by the venue),
+     * `MARKET_NOT_TRADABLE` (halted or not yet live),
+     * `MARKET_NOT_USDC_COLLATERAL`, or `ORDER_FAILED` (a refusal with no
+     * narrower code — the message carries the venue's verbatim text).
+     *
+     * None are retryable as-is: the venue evaluated the request and said no.
      */
     public class Conflict(public val code: String, message: String, errorId: String? = null) :
         ArcaException(message, errorId)
@@ -58,7 +63,12 @@ public sealed class ArcaException(
     /** Unexpected server error (HTTP 500). */
     public class Internal(message: String, errorId: String? = null) : ArcaException(message, errorId)
 
-    /** Upstream exchange service error (HTTP 502). */
+    /**
+     * The request couldn't be delivered to the upstream exchange, or its answer
+     * couldn't be read (HTTP 502) — a transport fault, so retryable. A refusal
+     * *by* the venue is [Conflict] or [Validation] instead, carrying the
+     * venue's own reason.
+     */
     public class Exchange(public val code: String, message: String, errorId: String? = null) :
         ArcaException(message, errorId)
 
@@ -103,15 +113,18 @@ public fun mapApiError(code: String, message: String, errorId: String?): ArcaExc
 
     "CONFLICT", "ALREADY_EXISTS", "ALREADY_MEMBER", "ALREADY_DELETED",
     "DUPLICATE_REALM", "ALREADY_REVOKED", "IDEMPOTENCY_VIOLATION",
-    // Order-placement conflicts (409): well-formed request the venue can't fill.
-    // NO_LIQUIDITY = empty book side (retry / marketable limit); MARKET_DELISTED
-    // = market delisted, positions settled by the venue, no new orders accepted.
-    "NO_LIQUIDITY", "MARKET_DELISTED",
+    // Venue refusals (409): the venue evaluated a well-formed request and said
+    // no. NO_LIQUIDITY = empty book side (retry / marketable limit);
+    // MARKET_DELISTED = market delisted, positions settled by the venue;
+    // MARKET_NOT_TRADABLE = halted or not yet live; ORDER_FAILED = a refusal
+    // with no narrower code, verbatim venue text in the message.
+    "NO_LIQUIDITY", "MARKET_DELISTED", "MARKET_NOT_TRADABLE",
+    "MARKET_NOT_USDC_COLLATERAL", "ORDER_FAILED",
     -> ArcaException.Conflict(code, message, errorId)
 
     "INTERNAL_ERROR" -> ArcaException.Internal(message, errorId)
 
-    "EXCHANGE_ERROR", "EXCHANGE_UNAVAILABLE", "ORDER_FAILED", "INVALID_REQUEST",
+    "EXCHANGE_ERROR", "EXCHANGE_UNAVAILABLE", "INVALID_REQUEST",
     -> ArcaException.Exchange(code, message, errorId)
 
     else -> ArcaException.Unknown(code, message, errorId)

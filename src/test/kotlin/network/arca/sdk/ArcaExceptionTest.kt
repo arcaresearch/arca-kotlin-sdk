@@ -46,8 +46,11 @@ class ArcaExceptionTest {
         val variants = listOf(
             "CONFLICT", "ALREADY_EXISTS", "ALREADY_MEMBER", "ALREADY_DELETED",
             "DUPLICATE_REALM", "ALREADY_REVOKED", "IDEMPOTENCY_VIOLATION",
-            // Order-placement conflicts carry their specific code.
-            "NO_LIQUIDITY", "MARKET_DELISTED",
+            // Venue refusals carry their specific code. ORDER_FAILED belongs
+            // here, not in Exchange: every server path returns it as a 409, and
+            // the Exchange class means "transport fault, retry".
+            "NO_LIQUIDITY", "MARKET_DELISTED", "MARKET_NOT_TRADABLE",
+            "MARKET_NOT_USDC_COLLATERAL", "ORDER_FAILED",
         )
         for (code in variants) {
             val error = mapApiError(code, "Conflict", null)
@@ -58,7 +61,7 @@ class ArcaExceptionTest {
 
     @Test
     fun exchangeErrorVariants() {
-        val variants = listOf("EXCHANGE_ERROR", "EXCHANGE_UNAVAILABLE", "ORDER_FAILED", "INVALID_REQUEST")
+        val variants = listOf("EXCHANGE_ERROR", "EXCHANGE_UNAVAILABLE", "INVALID_REQUEST")
         for (code in variants) {
             val error = mapApiError(code, "Exchange error", null)
             val e = assertInstanceOf(ArcaException.Exchange::class.java, error, "Expected Exchange for $code")
