@@ -89,7 +89,7 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Active asset data | arca.getActiveAssetData(objectId, market, ...); maxBuySize/maxSellSize include reversing and split as maxBuyReduceSize + maxBuyOpenSize (same for sell) — the reduce leg is never refused for balance, the open leg is what buying power gates. Null on Hyperliquid. |
 | Set leverage / margin | arca.updateLeverage / updateIsolatedMargin / setMarginMode |
 | Order limits | arca.getOrderLimits() -> OrderLimits(minOrderNotionalUsd = 10.0) |
-| Min order size (UI gating) | arca.getMinOrderSize(market|marketId, price, reduceOnly?, isTrigger?, sizeToMax?) -> MinOrderSize(minSize, minNotionalUsd); ceil to szDecimals; reduce-only / unsized-trigger exempt |
+| Min order size (UI gating) | arca.getMinOrderSize(market|marketId, price, reduceOnly?, isTrigger?, sizeToMax?) -> MinOrderSize(minSize, minNotionalUsd); ceil to szDecimals; treats any reduce-only as exempt — the venue only exempts an *exact* close, so verify a partial trim clears the floor yourself |
 | Validate order size (advisory) | arca.validateOrderSize(market|marketId, price, size, ...) -> OrderSizeValidation(ok, minSize, minNotionalUsd, reason?) |
 | Market meta | arca.getMarketMeta() / market(id) / resolveMarkets(symbol, opts) |
 | Mids/tickers/book | arca.getMarketMids / getMarketTickers / getOrderBook |
