@@ -50,7 +50,7 @@ class ArcaExceptionTest {
             // here, not in Exchange: every server path returns it as a 409, and
             // the Exchange class means "transport fault, retry".
             "NO_LIQUIDITY", "MARKET_DELISTED", "MARKET_NOT_TRADABLE",
-            "MARKET_NOT_USDC_COLLATERAL", "ORDER_FAILED",
+            "MARKET_NOT_USDC_COLLATERAL", "VENUE_RATE_LIMITED", "ORDER_FAILED",
         )
         for (code in variants) {
             val error = mapApiError(code, "Conflict", null)

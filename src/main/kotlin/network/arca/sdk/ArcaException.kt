@@ -52,8 +52,11 @@ public sealed class ArcaException(
      * `NO_LIQUIDITY` (empty book side, retry or use a marketable limit),
      * `MARKET_DELISTED` (market delisted, positions settled by the venue),
      * `MARKET_NOT_TRADABLE` (halted or not yet live),
-     * `MARKET_NOT_USDC_COLLATERAL`, or `ORDER_FAILED` (a refusal with no
-     * narrower code — the message carries the venue's verbatim text).
+     * `MARKET_NOT_USDC_COLLATERAL`, `VENUE_RATE_LIMITED` (the account's venue
+     * request allowance is spent — on Hyperliquid it is earned by cumulative
+     * volume traded rather than elapsed time, so waiting does not restore it),
+     * or `ORDER_FAILED` (a refusal with no narrower code — the message carries
+     * the venue's verbatim text).
      *
      * None are retryable as-is: the venue evaluated the request and said no.
      */
@@ -116,10 +119,12 @@ public fun mapApiError(code: String, message: String, errorId: String?): ArcaExc
     // Venue refusals (409): the venue evaluated a well-formed request and said
     // no. NO_LIQUIDITY = empty book side (retry / marketable limit);
     // MARKET_DELISTED = market delisted, positions settled by the venue;
-    // MARKET_NOT_TRADABLE = halted or not yet live; ORDER_FAILED = a refusal
-    // with no narrower code, verbatim venue text in the message.
+    // MARKET_NOT_TRADABLE = halted or not yet live; VENUE_RATE_LIMITED = the
+    // account's venue request allowance is spent (volume-earned on HL, so
+    // waiting does not help); ORDER_FAILED = a refusal with no narrower code,
+    // verbatim venue text in the message.
     "NO_LIQUIDITY", "MARKET_DELISTED", "MARKET_NOT_TRADABLE",
-    "MARKET_NOT_USDC_COLLATERAL", "ORDER_FAILED",
+    "MARKET_NOT_USDC_COLLATERAL", "VENUE_RATE_LIMITED", "ORDER_FAILED",
     -> ArcaException.Conflict(code, message, errorId)
 
     "INTERNAL_ERROR" -> ArcaException.Internal(message, errorId)
