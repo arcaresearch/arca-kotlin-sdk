@@ -455,8 +455,13 @@ public suspend fun Arca.watchCandleChart(
                 scope.launch { healSeam(latest.t) }
             }
             stream.candlesMut.value = snapshot
-            if (stream.historySnapshotMut.value is InitialHistoryState.Loaded) {
-                yieldSnapshot(snapshot, latest)
+            // Live tape must still paint when CDN / skipBackfill history is
+            // empty (thin HIP-3 names). Gating on Loaded only left those
+            // charts blank until a retry succeeded — or forever.
+            when (stream.historySnapshotMut.value) {
+                is InitialHistoryState.Loaded,
+                is InitialHistoryState.Failed -> yieldSnapshot(snapshot, latest)
+                is InitialHistoryState.Loading -> Unit
             }
         }
     }

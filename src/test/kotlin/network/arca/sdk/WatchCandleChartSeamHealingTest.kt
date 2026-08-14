@@ -73,6 +73,7 @@ class WatchCandleChartSeamHealingTest {
             "deliverySeq gap handler registration" to "ws.onGap",
             "gap handler removal on stop" to "removeGapHandler",
             "failed heal re-arms the seam" to "seamFrom = seamFrom?.let { minOf(it, from) } ?: from",
+            "live candles emit after failed CDN history" to "is InitialHistoryState.Failed -> yieldSnapshot",
         )
         for ((label, marker) in markers) {
             assertTrue(
