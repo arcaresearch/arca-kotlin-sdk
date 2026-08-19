@@ -131,7 +131,33 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> |
 
 Lower-level: `arca.ws` is the WebSocketManager (events flow, typed event flows,
-onGap, onResume, onAuthenticated, ensureConnected, disconnect).
+onGap, onResume, onAuthenticated, onRotated, ensureConnected, disconnect).
+
+**Sockets rotate before they are killed.** Infrastructure in front of the API
+caps how long any WebSocket may stay open, and for a socket that cap is a
+maximum lifetime, not an idle timeout — a perfectly busy connection is severed
+on schedule. Reaching it costs an unplanned reconnect (backoff, TCP, TLS, auth,
+resubscribe), during which a price display holds its last value and looks
+frozen. The SDK therefore replaces the socket before the cap: a second
+connection authenticates and re-issues every subscription while the current one
+keeps streaming, and only takes over once the server confirms the new
+subscriptions are live. Nothing is missed, no status change is emitted, and a
+failure anywhere leaves the original socket serving. `connectionLifetimeMs` on
+`Arca(...)` / `Arca.withTokenProvider(...)` overrides the 50-minute default, and
+the server's reported lifetime is preferred over it when present, so the schedule
+retunes without an SDK release. `0` disables rotation and outranks both,
+including a server-reported cap, so the opt-out still works on the production
+fleet — at the cost of an unplanned reconnect. `ws.rotateConnection()` triggers
+one on demand and returns false when there is no healthy socket to hand off
+from.
+
+`ws.onRotated { }` (and `ws.rotatedStream`) fires when delivery has moved to a
+new socket. This is **not** a reconnect — do not refetch history or run gap
+recovery from it, since rotations are routine and a refetch there becomes
+steady background load across every connected client. It exists for state the
+server holds per-connection and so cannot survive the swap; the SDK re-issues
+mids, candles, OI, path watches, and chart-history watches itself, and uses
+this hook internally to re-create standalone aggregation watches.
 
 `watchCandleChart` self-heals: it refetches recent candles on every WS re-auth
 and app-foreground, and additionally detects seams in the live candle data

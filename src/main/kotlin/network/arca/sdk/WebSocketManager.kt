@@ -17,10 +17,12 @@ import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -55,6 +57,7 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.random.Random
 
 /**
  * Host-app lifecycle bridge. Android consumers supply an implementation backed
@@ -82,11 +85,19 @@ public class WebSocketManager internal constructor(
     baseUrl: String,
     token: String,
     private val realmId: String,
-    private val httpClient: OkHttpClient,
+    httpClient: OkHttpClient,
     private val getToken: (suspend () -> String)? = null,
     private val maxReconnectDelaySeconds: Double = 30.0,
     private val log: ArcaLogger = ArcaLogger.disabled,
     private val lifecycleBridge: AppLifecycleBridge? = null,
+    // Null means "unset", which takes the default. 0 means "never rotate" and is
+    // a deliberate opt-out, so the two cannot share a representation.
+    private val connectionLifetimeMs: Long? = null,
+    // Seams for tests, which need to drive two sockets at once, control the
+    // order frames arrive in across them, and reach the abandon path without
+    // waiting out the real budget.
+    private val handoffTimeoutMs: Long = HANDOFF_TIMEOUT_MS,
+    private val socketFactory: WebSocket.Factory = httpClient,
 ) {
     private val wsUrl = baseUrl.trimEnd('/').toHttpUrl().newBuilder()
         .addPathSegments("api/v1/ws").build()
@@ -97,12 +108,18 @@ public class WebSocketManager internal constructor(
     @Volatile private var token: String = token
     @Volatile private var webSocket: WebSocket? = null
 
+    /** The replacement being warmed up alongside [webSocket] during a rotation. */
+    @Volatile private var handoffWebSocket: WebSocket? = null
+
     private var subscribedMids: Pair<String, List<String>>? = null
     private var subscribedCandles: Pair<List<String>, List<CandleInterval>>? = null
     private var subscribedOI: Pair<List<String>, List<CandleInterval>>? = null
     private var shouldReconnect = false
     private var reconnectAttempt = 0
     private var reconnectJob: Job? = null
+    private var rotationJob: Job? = null
+    private var handoffTimeoutJob: Job? = null
+    private var serverLifetimeMs: Long? = null
 
     private val pathRefs = HashMap<String, Int>()
     private var midsRefs = 0
@@ -124,6 +141,7 @@ public class WebSocketManager internal constructor(
     private val gapHandlers = ConcurrentHashMap<UUID, (Int) -> Unit>()
     private val resumeHandlers = ConcurrentHashMap<UUID, (Double) -> Unit>()
     private val authenticatedHandlers = ConcurrentHashMap<UUID, () -> Unit>()
+    private val rotatedHandlers = ConcurrentHashMap<UUID, () -> Unit>()
 
     private val bus = MutableSharedFlow<RealmEvent>(
         replay = 0,
@@ -133,6 +151,7 @@ public class WebSocketManager internal constructor(
     private val statusFlow = MutableStateFlow(ConnectionStatus.DISCONNECTED)
     private val resumeFlow = MutableSharedFlow<Double>(extraBufferCapacity = 16)
     private val authenticatedFlow = MutableSharedFlow<Unit>(extraBufferCapacity = 16)
+    private val rotatedFlow = MutableSharedFlow<Unit>(extraBufferCapacity = 16)
 
     private data class ChartWatch(val target: String, val kind: String, val objectId: String?)
 
@@ -196,6 +215,8 @@ public class WebSocketManager internal constructor(
             shouldReconnect = false
             reconnectJob?.cancel(); reconnectJob = null
             resumeProbeJob?.cancel(); resumeProbeJob = null
+            cancelRotationLocked()
+            abortHandoffLocked()
             stopHeartbeatLocked()
             cancelIdleTimerLocked()
             unsubJobs.values.forEach { it.cancel() }
@@ -375,10 +396,10 @@ public class WebSocketManager internal constructor(
         }
     }
 
-    private fun syncCandleSubscriptionLocked() {
+    private fun syncCandleSubscriptionLocked(target: WebSocket? = webSocket) {
         if (candleRefCoins.isEmpty()) {
             subscribedCandles = null
-            sendMessage(buildJsonObject { put("action", "unsubscribe_candles") })
+            sendMessage(target, buildJsonObject { put("action", "unsubscribe_candles") })
             return
         }
         val allCoins = candleRefCoins.keys.toList()
@@ -386,7 +407,7 @@ public class WebSocketManager internal constructor(
         candleRefCoins.values.forEach { allIntervals.addAll(it) }
         val intervals = allIntervals.mapNotNull { CandleInterval.fromWire(it) }
         subscribedCandles = allCoins to intervals
-        sendMessage(subscribeCandlesMsg(allCoins, intervals.map { it.wire }))
+        sendMessage(target, subscribeCandlesMsg(allCoins, intervals.map { it.wire }))
     }
 
     public fun acquireOI(coins: List<String>, intervals: List<CandleInterval>) {
@@ -424,10 +445,10 @@ public class WebSocketManager internal constructor(
         }
     }
 
-    private fun syncOISubscriptionLocked() {
+    private fun syncOISubscriptionLocked(target: WebSocket? = webSocket) {
         if (oiRefCoins.isEmpty()) {
             subscribedOI = null
-            sendMessage(buildJsonObject { put("action", "unsubscribe_oi") })
+            sendMessage(target, buildJsonObject { put("action", "unsubscribe_oi") })
             return
         }
         val allCoins = oiRefCoins.keys.toList()
@@ -435,7 +456,7 @@ public class WebSocketManager internal constructor(
         oiRefCoins.values.forEach { allIntervals.addAll(it) }
         val intervals = allIntervals.mapNotNull { CandleInterval.fromWire(it) }
         subscribedOI = allCoins to intervals
-        sendMessage(subscribeOIMsg(allCoins, intervals.map { it.wire }))
+        sendMessage(target, subscribeOIMsg(allCoins, intervals.map { it.wire }))
     }
 
     public fun watchChartHistory(target: String, kind: String = "path", objectId: String? = null): String {
@@ -615,6 +636,10 @@ public class WebSocketManager internal constructor(
     public val authenticatedStream: SharedFlow<Unit>
         get() = authenticatedFlow.asSharedFlow()
 
+    /** A stream that emits whenever delivery moves to a new socket. See [onRotated]. */
+    public val rotatedStream: SharedFlow<Unit>
+        get() = rotatedFlow.asSharedFlow()
+
     private fun <T> filtered(transform: (RealmEvent) -> T?): Flow<T> =
         bus.asSharedFlow().mapNotNull(transform)
 
@@ -687,6 +712,32 @@ public class WebSocketManager internal constructor(
         authenticatedHandlers.remove(id)
     }
 
+    /**
+     * Register a listener for delivery moving to a new socket without an outage
+     * (see [rotateConnection]).
+     *
+     * This is not a reconnect: no status change is emitted, nothing was missed,
+     * and there is no gap to recover. It exists for state the server holds
+     * per-connection and therefore cannot survive the swap — a standalone
+     * aggregation watch has to be re-created against the new socket, because the
+     * old one died with the connection it was registered on. Anything the
+     * manager re-issues itself (mids, candles, OI, path watches, chart-history
+     * watches) is already handled and needs no hook.
+     *
+     * Do NOT use this to refetch history or run gap recovery; [onAuthenticated]
+     * is the hook for that. Rotations are routine, so a refetch here multiplies
+     * into steady background load across every connected client.
+     */
+    public fun onRotated(handler: () -> Unit): UUID {
+        val id = UUID.randomUUID()
+        rotatedHandlers[id] = handler
+        return id
+    }
+
+    public fun removeRotatedHandler(id: UUID) {
+        rotatedHandlers.remove(id)
+    }
+
     // MARK: - App lifecycle
 
     private fun installLifecycleLocked() {
@@ -755,8 +806,7 @@ public class WebSocketManager internal constructor(
             stopHeartbeatLocked()
             webSocket?.cancel()
             webSocket = null
-            setStatusLocked(ConnectionStatus.DISCONNECTED)
-            if (shouldReconnect) scheduleReconnectLocked()
+            dropLiveSocketLocked()
         }
     }
 
@@ -770,6 +820,11 @@ public class WebSocketManager internal constructor(
     }
 
     private fun doConnectLocked() {
+        cancelRotationLocked()
+        // A warming replacement for a socket we are about to replace outright
+        // is moot; the connect below supersedes it.
+        abortHandoffLocked()
+
         val existing = webSocket
         webSocket = null
         existing?.cancel()
@@ -777,24 +832,31 @@ public class WebSocketManager internal constructor(
         setStatusLocked(ConnectionStatus.CONNECTING)
         log.debug("websocket", metadata = mapOf("url" to wsUrl.toString(), "realmId" to realmId)) { "connecting" }
 
-        val request = Request.Builder().url(wsUrl).build()
-        val ws = httpClient.newWebSocket(request, SocketListener())
+        val ws = openSocketLocked()
         webSocket = ws
+        authenticateLocked(ws)
+    }
 
+    private fun openSocketLocked(): WebSocket {
+        val request = Request.Builder().url(wsUrl).build()
+        return socketFactory.newWebSocket(request, SocketListener())
+    }
+
+    private fun authenticateLocked(target: WebSocket) {
         val gt = getToken
         if (gt != null) {
             scope.launch {
                 try {
                     val fresh = gt()
                     lock.withLock { token = fresh }
-                    sendMessage(authMsg(fresh))
+                    sendMessage(target, authMsg(fresh))
                 } catch (e: Throwable) {
                     log.error("websocket", e) { "token refresh failed on reconnect, falling back to cached token" }
-                    sendMessage(authMsg(token))
+                    sendMessage(target, authMsg(token))
                 }
             }
         } else {
-            sendMessage(authMsg(token))
+            sendMessage(target, authMsg(token))
         }
     }
 
@@ -805,7 +867,7 @@ public class WebSocketManager internal constructor(
         if (obj != null) {
             when (obj["type"]?.jsonPrimitive?.contentOrNull ?: "") {
                 "pong" -> return
-                "authenticated" -> { handleAuthenticated(); return }
+                "authenticated" -> { handleAuthenticated(obj); return }
                 "error" -> { handleServerError(obj); return }
                 "mids.snapshot" -> {
                     val midsRaw = obj["mids"]?.jsonObject ?: return
@@ -847,46 +909,50 @@ public class WebSocketManager internal constructor(
         runCatching { arcaJson.decodeFromString(RealmEvent.serializer(), text) }.getOrNull()?.let { emit(it) }
     }
 
-    private fun handleAuthenticated() {
+    private fun handleAuthenticated(obj: JsonObject?) {
         lock.withLock {
             log.info("websocket") { "authenticated" }
             reconnectAttempt = 0
             lastDeliverySeq = 0
+            if (obj != null) readServerLifetimeLocked(obj)
             setStatusLocked(ConnectionStatus.CONNECTED)
             startHeartbeatLocked()
-
-            subscribedMids?.let { sendMessage(authlessSubscribeMids(it.first, it.second)) }
-            subscribedCandles?.let { sendMessage(subscribeCandlesMsg(it.first, it.second.map { iv -> iv.wire })) }
-            subscribedOI?.let { sendMessage(subscribeOIMsg(it.first, it.second.map { iv -> iv.wire })) }
-            if (midsRefs > 0 && subscribedMids == null) {
-                sendMessage(authlessSubscribeMids(midsExchange, emptyList()))
-            }
-            if (candleRefCoins.isNotEmpty() && subscribedCandles == null) {
-                syncCandleSubscriptionLocked()
-            }
-            if (oiRefCoins.isNotEmpty() && subscribedOI == null) {
-                syncOISubscriptionLocked()
-            }
-            pathRefs.keys.forEach { path ->
-                sendMessage(buildJsonObject { put("action", "watch"); put("path", path) })
-            }
-            chartHistoryWatches.forEach { (watchId, req) ->
-                sendMessage(watchChartHistoryMsg(watchId, req.target, req.kind, req.objectId))
-            }
+            resubscribeAllLocked(webSocket)
+            scheduleRotationLocked()
         }
         // Notify subscribers AFTER all subscriptions are re-issued.
         authenticatedHandlers.values.forEach { it() }
         authenticatedFlow.tryEmit(Unit)
     }
 
+    private fun resubscribeAllLocked(target: WebSocket?) {
+        subscribedMids?.let { sendMessage(target, authlessSubscribeMids(it.first, it.second)) }
+        subscribedCandles?.let { sendMessage(target, subscribeCandlesMsg(it.first, it.second.map { iv -> iv.wire })) }
+        subscribedOI?.let { sendMessage(target, subscribeOIMsg(it.first, it.second.map { iv -> iv.wire })) }
+        if (midsRefs > 0 && subscribedMids == null) {
+            sendMessage(target, authlessSubscribeMids(midsExchange, emptyList()))
+        }
+        if (candleRefCoins.isNotEmpty() && subscribedCandles == null) {
+            syncCandleSubscriptionLocked(target)
+        }
+        if (oiRefCoins.isNotEmpty() && subscribedOI == null) {
+            syncOISubscriptionLocked(target)
+        }
+        pathRefs.keys.forEach { path ->
+            sendMessage(target, buildJsonObject { put("action", "watch"); put("path", path) })
+        }
+        chartHistoryWatches.forEach { (watchId, req) ->
+            sendMessage(target, watchChartHistoryMsg(watchId, req.target, req.kind, req.objectId))
+        }
+    }
+
     private fun handleServerError(obj: JsonObject) {
         val message = obj["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown WebSocket error"
         log.error("websocket", metadata = mapOf("message" to message)) { "server error" }
         lock.withLock {
-            setStatusLocked(ConnectionStatus.DISCONNECTED)
             webSocket?.cancel()
             webSocket = null
-            if (shouldReconnect) scheduleReconnectLocked()
+            dropLiveSocketLocked()
         }
     }
 
@@ -963,18 +1029,223 @@ public class WebSocketManager internal constructor(
                 stopHeartbeatLocked()
                 webSocket?.cancel()
                 webSocket = null
-                setStatusLocked(ConnectionStatus.DISCONNECTED)
-                if (shouldReconnect) scheduleReconnectLocked()
+                dropLiveSocketLocked()
                 return
             }
             sendMessage(buildJsonObject { put("action", "ping") })
         }
     }
 
+    // MARK: - Gapless rotation
+
+    /**
+     * Replace the current socket with a fresh one without interrupting delivery.
+     *
+     * The replacement authenticates and re-issues every subscription while the
+     * current socket keeps streaming. Only once the server confirms those
+     * subscriptions are live does it take over, and only then does the old
+     * socket close — so there is no window in which nothing is subscribed. A
+     * failure anywhere along the way leaves the current socket untouched and
+     * serving, which makes the worst case "nothing happened".
+     *
+     * Returns false when there is no healthy socket to hand off from, or when a
+     * handoff is already under way.
+     */
+    public fun rotateConnection(): Boolean = lock.withLock {
+        if (!shouldReconnect) return@withLock false
+        if (handoffWebSocket != null) return@withLock false
+        if (statusFlow.value != ConnectionStatus.CONNECTED) return@withLock false
+        if (webSocket == null) return@withLock false
+
+        log.debug("websocket") { "warming replacement socket" }
+        // Armed before the socket exists so a half-built one can never be left
+        // hanging around unnoticed.
+        armHandoffTimeoutLocked()
+        val ws = openSocketLocked()
+        handoffWebSocket = ws
+        authenticateLocked(ws)
+        true
+    }
+
+    /**
+     * Handle a frame that arrived on a socket still warming up beside the live
+     * one. Only the handshake matters here — see [handleWarmingAuthenticated]
+     * and [promoteHandoff].
+     */
+    private fun handleWarmingMessage(socket: WebSocket, text: String) {
+        val obj = runCatching { arcaJson.parseToJsonElement(text).jsonObject }.getOrNull() ?: return
+        when (obj["type"]?.jsonPrimitive?.contentOrNull ?: "") {
+            "error" -> {
+                val message = obj["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown WebSocket error"
+                log.warning("websocket", metadata = mapOf("message" to message)) { "handoff rejected by server" }
+                lock.withLock {
+                    abortHandoffLocked()
+                    scheduleRotationLocked(HANDOFF_RETRY_MS)
+                }
+            }
+            "authenticated" -> handleWarmingAuthenticated(socket, obj)
+            "pong" -> promoteHandoff(socket)
+            // The live socket is carrying this same stream, so anything arriving
+            // here before the takeover duplicates something consumers already
+            // have. Dropping it avoids a double dispatch and keeps gap detection
+            // on a single sequence space.
+            else -> Unit
+        }
+    }
+
+    private fun handleWarmingAuthenticated(socket: WebSocket, obj: JsonObject) {
+        lock.withLock {
+            if (handoffWebSocket !== socket) return
+            readServerLifetimeLocked(obj)
+            resubscribeAllLocked(socket)
+            // Queued behind the batch above; its reply is the barrier this
+            // socket takes over on.
+            sendMessage(socket, buildJsonObject { put("action", "ping") })
+        }
+    }
+
+    /**
+     * Hand delivery over to the warmed socket and retire the current one.
+     *
+     * The server reads one connection's messages in order, so a reply to the
+     * ping queued behind the resubscribe batch proves every subscription in that
+     * batch is registered — from here on, live broadcasts reach this socket.
+     * That is what makes this the point where it can take over without leaving a
+     * gap.
+     *
+     * Any snapshot those subscriptions trigger is sent asynchronously and may
+     * well arrive after the pong, so it is not part of the barrier — and it is
+     * not needed, because the socket being retired has been delivering the same
+     * stream right up to this moment, leaving consumer state current at the swap.
+     */
+    private fun promoteHandoff(socket: WebSocket) {
+        val retired = lock.withLock {
+            if (handoffWebSocket !== socket) return
+            handoffWebSocket = null
+            cancelHandoffTimeoutLocked()
+
+            val previous = webSocket
+            // Installing the replacement first is what silences the outgoing
+            // socket: the listener routes purely by identity, so from here its
+            // buffered frames, its failure and its close are all ignored — no
+            // second dispatch to consumers, no spurious DISCONNECTED, and no
+            // reconnect competing with the socket that just took over.
+            webSocket = socket
+            // New connection, new sequence space.
+            lastDeliverySeq = 0
+            lastMessageAtMs = System.currentTimeMillis()
+            startHeartbeatLocked()
+            scheduleRotationLocked()
+            previous
+        }
+        if (retired !== socket) retired?.cancel()
+        log.info("websocket") { "rotated onto replacement socket" }
+
+        // Status deliberately does not move. Delivery never stopped, so emitting
+        // DISCONNECTED would put consumers into a reconnecting state and run gap
+        // recovery for a gap that did not happen. State the swap genuinely
+        // cannot carry over is re-established via the rotated handlers instead.
+        rotatedHandlers.values.forEach { it() }
+        rotatedFlow.tryEmit(Unit)
+    }
+
+    /** Abandon a warming socket. The live socket is left exactly as it was. */
+    private fun abortHandoffLocked() {
+        cancelHandoffTimeoutLocked()
+        val ws = handoffWebSocket ?: return
+        handoffWebSocket = null
+        ws.cancel()
+    }
+
+    /**
+     * React to a warming socket dying before it took over. Returns false when
+     * [socket] was not the warming one, leaving the caller to handle it as the
+     * live socket.
+     */
+    private fun handleWarmingSocketLoss(socket: WebSocket): Boolean = lock.withLock {
+        if (handoffWebSocket !== socket) return@withLock false
+        // The live socket never stopped serving, so consumers see nothing; try
+        // again later rather than escalating to the reconnect path.
+        handoffWebSocket = null
+        cancelHandoffTimeoutLocked()
+        scheduleRotationLocked(HANDOFF_RETRY_MS)
+        true
+    }
+
+    private fun armHandoffTimeoutLocked() {
+        cancelHandoffTimeoutLocked()
+        handoffTimeoutJob = scope.launch {
+            delay(handoffTimeoutMs)
+            if (!isActive) return@launch
+            lock.withLock {
+                handoffTimeoutJob = null
+                if (handoffWebSocket == null) return@withLock
+                log.warning("websocket") { "handoff timed out, abandoning replacement socket" }
+                abortHandoffLocked()
+                scheduleRotationLocked(HANDOFF_RETRY_MS)
+            }
+        }
+    }
+
+    private fun cancelHandoffTimeoutLocked() {
+        handoffTimeoutJob?.cancel()
+        handoffTimeoutJob = null
+    }
+
+    /**
+     * Arm the next rotation. [delayMs] overrides the schedule, which is how a
+     * failed handoff retries before the lifetime it is racing runs out.
+     */
+    private fun scheduleRotationLocked(delayMs: Long? = null) {
+        cancelRotationLocked()
+        // A configured 0 is an opt-out and outranks the server's figure. The
+        // server reports a real constraint, so it wins over any other configured
+        // value — but it must not resurrect rotation for a caller who turned it
+        // off, or the documented escape hatch would be inoperative on the one
+        // fleet that advertises a cap.
+        val configured = connectionLifetimeMs ?: DEFAULT_CONNECTION_LIFETIME_MS
+        val lifetime = if (configured == 0L) 0L else serverLifetimeMs ?: configured
+        if (delayMs == null && lifetime <= 0) return
+        val wait = delayMs ?: run {
+            val base = lifetime * ROTATE_AT
+            val spread = base * ROTATE_JITTER
+            (base - spread + Random.nextDouble() * spread * 2).toLong()
+        }
+        rotationJob = scope.launch {
+            delay(wait)
+            if (!isActive) return@launch
+            lock.withLock { rotationJob = null }
+            rotateConnection()
+        }
+    }
+
+    private fun cancelRotationLocked() {
+        rotationJob?.cancel()
+        rotationJob = null
+    }
+
+    /**
+     * Adopt the socket lifetime the server reports at auth.
+     *
+     * The server sits behind the proxy that enforces the cap, so it is the only
+     * party that knows the real figure. Taking it from the wire means retuning
+     * the cap is a server config change rather than an SDK release — otherwise
+     * every deployed client keeps rotating against a number that silently went
+     * stale.
+     */
+    private fun readServerLifetimeLocked(obj: JsonObject) {
+        val sec = (obj["maxConnectionLifetimeSec"] as? JsonPrimitive)?.doubleOrNull ?: return
+        if (sec > 0 && sec.isFinite()) serverLifetimeMs = (sec * 1000).toLong()
+    }
+
     // MARK: - Messaging + status
 
     private fun sendMessage(message: JsonObject) {
-        val ws = webSocket ?: return
+        sendMessage(webSocket, message)
+    }
+
+    private fun sendMessage(target: WebSocket?, message: JsonObject) {
+        val ws = target ?: return
         val sent = ws.send(message.toString())
         if (!sent) {
             log.debug("websocket") { "message not enqueued (socket closing)" }
@@ -1037,33 +1308,63 @@ public class WebSocketManager internal constructor(
 
     // MARK: - OkHttp listener
 
+    /**
+     * Identity, not arrival order, decides what a frame means: the live socket
+     * carries delivery, a socket still warming up carries only its own handshake
+     * (see [handleWarmingMessage]), and a socket that is neither has already been
+     * retired and is ignored outright.
+     */
     private inner class SocketListener : WebSocketListener() {
         override fun onMessage(webSocket: WebSocket, text: String) {
-            if (this@WebSocketManager.webSocket === webSocket) handleMessage(text)
+            route(webSocket, text)
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            if (this@WebSocketManager.webSocket === webSocket) handleMessage(bytes.utf8())
+            route(webSocket, bytes.utf8())
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (handleWarmingSocketLoss(webSocket)) {
+                log.debug("websocket", t) { "replacement socket failed before takeover" }
+                return
+            }
             lock.withLock {
                 if (this@WebSocketManager.webSocket !== webSocket) return
                 log.warning("websocket", t) { "receive loop error" }
                 this@WebSocketManager.webSocket = null
-                setStatusLocked(ConnectionStatus.DISCONNECTED)
-                if (shouldReconnect) scheduleReconnectLocked()
+                dropLiveSocketLocked()
             }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (handleWarmingSocketLoss(webSocket)) {
+                log.debug("websocket") { "replacement socket closed before takeover" }
+                return
+            }
             lock.withLock {
                 if (this@WebSocketManager.webSocket !== webSocket) return
                 this@WebSocketManager.webSocket = null
-                setStatusLocked(ConnectionStatus.DISCONNECTED)
-                if (shouldReconnect) scheduleReconnectLocked()
+                dropLiveSocketLocked()
             }
         }
+
+        private fun route(socket: WebSocket, text: String) {
+            when {
+                this@WebSocketManager.webSocket === socket -> handleMessage(text)
+                handoffWebSocket === socket -> handleWarmingMessage(socket, text)
+            }
+        }
+    }
+
+    /**
+     * Common tail for the live socket going away: a warming replacement for it is
+     * moot, because the reconnect path supersedes it.
+     */
+    private fun dropLiveSocketLocked() {
+        cancelRotationLocked()
+        abortHandoffLocked()
+        setStatusLocked(ConnectionStatus.DISCONNECTED)
+        if (shouldReconnect) scheduleReconnectLocked()
     }
 
     private companion object {
@@ -1073,6 +1374,28 @@ public class WebSocketManager internal constructor(
         const val STALE_THRESHOLD_S = 45.0
         const val RESUME_HIDDEN_THRESHOLD_S = 5.0
         const val RESUME_PING_TIMEOUT_MS = 2_000L
+
+        // Default socket lifetime before a rotation. Sits below the 3600s cap
+        // the production load balancer imposes, leaving room for the retries
+        // below to land before the cap is reached.
+        const val DEFAULT_CONNECTION_LIFETIME_MS = 50 * 60_000L
+
+        // Fraction of the known lifetime at which to rotate.
+        const val ROTATE_AT = 0.85
+
+        // Rotations are spread out by ±this fraction. Every rotation costs a
+        // resubscribe, and a resubscribe costs the server a full mids snapshot —
+        // so a fleet that rotated on a shared schedule would arrive as a
+        // thundering herd. The jitter is what keeps the cost flat instead of
+        // spiky.
+        const val ROTATE_JITTER = 0.1
+
+        // A warming socket that has not taken over within this budget is
+        // abandoned.
+        const val HANDOFF_TIMEOUT_MS = 10_000L
+
+        // Retry delay after a failed handoff.
+        const val HANDOFF_RETRY_MS = 60_000L
     }
 }
 

@@ -330,37 +330,51 @@ public suspend fun Arca.watchAggregation(
 
     stream.aggregationMut.value = watchResponse.aggregation
 
+    // The watch lives on the server side of a specific connection, so whenever
+    // that connection is replaced it has to be re-created against the new one.
+    // Returns false when the caller should leave stream state alone.
+    suspend fun recreateWatch(): Boolean {
+        if (stopped.get() || !refreshing.compareAndSet(false, true)) return false
+        try {
+            val oldWatchId = widBox.value
+            val newWatch = createAggregationWatch(sources, flowsSince)
+            if (stopped.get()) return false
+            widBox.value = newWatch.watchId.value
+            try {
+                destroyAggregationWatch(oldWatchId)
+            } catch (e: Throwable) {
+                log.debug("watch", e, mapOf("watchId" to oldWatchId)) {
+                    "destroyAggregationWatch cleanup failed (best-effort)"
+                }
+            }
+            structural.value = newWatch.aggregation
+            val cur = mids.value
+            stream.push(if (cur.isEmpty()) newWatch.aggregation else newWatch.aggregation.revalued(cur))
+        } catch (_: Throwable) {
+            // Best effort — keep existing data
+        } finally {
+            refreshing.set(false)
+        }
+        return true
+    }
+
     jobs += scope.launch {
         ws.statusStream.collect { s ->
             if (s == ConnectionStatus.DISCONNECTED && stream.state.value != WatchStreamState.LOADING) {
                 stream.setState(WatchStreamState.RECONNECTING)
             } else if (s == ConnectionStatus.CONNECTED && stream.state.value == WatchStreamState.RECONNECTING) {
-                if (stopped.get() || !refreshing.compareAndSet(false, true)) return@collect
-                try {
-                    val oldWatchId = widBox.value
-                    val newWatch = createAggregationWatch(sources, flowsSince)
-                    if (stopped.get()) {
-                        refreshing.set(false)
-                        return@collect
-                    }
-                    widBox.value = newWatch.watchId.value
-                    try {
-                        destroyAggregationWatch(oldWatchId)
-                    } catch (e: Throwable) {
-                        log.debug("watch", e, mapOf("watchId" to oldWatchId)) {
-                            "destroyAggregationWatch cleanup failed (best-effort)"
-                        }
-                    }
-                    structural.value = newWatch.aggregation
-                    val cur = mids.value
-                    stream.push(if (cur.isEmpty()) newWatch.aggregation else newWatch.aggregation.revalued(cur))
-                } catch (_: Throwable) {
-                    // Best effort — keep existing data
-                }
-                refreshing.set(false)
+                if (!recreateWatch()) return@collect
                 stream.setState(WatchStreamState.CONNECTED)
             }
         }
+    }
+
+    // A rotation swaps the socket without an outage, so no status change fires
+    // and the branch above never runs — but the watch still died with the
+    // connection that retired, so without this the stream goes permanently quiet
+    // with no error. State stays CONNECTED: nothing was missed.
+    jobs += scope.launch {
+        ws.rotatedStream.collect { recreateWatch() }
     }
 
     ws.acquireMids(exchange)

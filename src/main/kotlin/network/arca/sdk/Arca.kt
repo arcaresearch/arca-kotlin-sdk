@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicReference
  * val arca = Arca.withTokenProvider { fetchFreshToken() }
  * ```
  */
-public class Arca private constructor(
+public class Arca internal constructor(
     internal val realmId: String,
     public val candleCdnBaseUrl: String?,
     public val client: ArcaClient,
@@ -223,6 +223,7 @@ public class Arca private constructor(
             logHandler: ArcaLogHandler? = null,
             lifecycleBridge: AppLifecycleBridge? = null,
             httpClient: OkHttpClient? = null,
+            connectionLifetimeMs: Long? = null,
         ): Arca {
             val resolved = realmId ?: extractRealmId(token)
             val logger = ArcaLogger(logLevel, logHandler)
@@ -288,6 +289,7 @@ public class Arca private constructor(
                 getToken = wsGetToken,
                 log = logger,
                 lifecycleBridge = lifecycleBridge,
+                connectionLifetimeMs = connectionLifetimeMs,
             )
             wsRef = ws
 
@@ -326,6 +328,7 @@ public class Arca private constructor(
             logHandler: ArcaLogHandler? = null,
             lifecycleBridge: AppLifecycleBridge? = null,
             httpClient: OkHttpClient? = null,
+            connectionLifetimeMs: Long? = null,
         ): Arca {
             val token = tokenProvider()
             return invoke(
@@ -339,6 +342,7 @@ public class Arca private constructor(
                 logHandler = logHandler,
                 lifecycleBridge = lifecycleBridge,
                 httpClient = httpClient,
+                connectionLifetimeMs = connectionLifetimeMs,
             )
         }
 
