@@ -79,6 +79,12 @@ public class ArcaClient(
         body: JsonElement? = null,
     ): T = requestTyped("PATCH", path, query, body, serializer())
 
+    public suspend inline fun <reified T> put(
+        path: String,
+        query: Map<String, String>? = null,
+        body: JsonElement? = null,
+    ): T = requestTyped("PUT", path, query, body, serializer())
+
     public suspend inline fun <reified T> delete(path: String, query: Map<String, String>? = null): T =
         requestTyped("DELETE", path, query, null, serializer())
 

@@ -1,11 +1,14 @@
 package network.arca.sdk
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,6 +44,7 @@ import network.arca.sdk.models.FundingPayment
 import network.arca.sdk.models.ObjectValuation
 import network.arca.sdk.models.Operation
 import network.arca.sdk.models.PathAggregation
+import network.arca.sdk.models.ProjectedValuation
 import network.arca.sdk.models.RealmEvent
 import network.arca.sdk.models.SimFill
 import network.arca.sdk.models.TypedEvent
@@ -127,6 +131,14 @@ public class WebSocketManager internal constructor(
     private val candleRefCoins = HashMap<String, MutableSet<String>>()
     private val oiRefCoins = HashMap<String, MutableSet<String>>()
     private val chartHistoryWatches = HashMap<String, ChartWatch>()
+
+    // Projection watch request/reply state. Replies are matched to callers by
+    // requestId; a request issued while disconnected parks in
+    // [pendingProjectionSends] until the next successful auth flushes it.
+    private val pendingProjectionRequests = HashMap<String, CompletableDeferred<ProjectionWatchCreated>>()
+    private val pendingProjectionSends = HashMap<String, String>()
+    private var nextProjectionRequestId = 0
+
     private val unsubJobs = HashMap<String, Job>()
     private var idleDisconnectJob: Job? = null
 
@@ -459,6 +471,51 @@ public class WebSocketManager internal constructor(
         sendMessage(target, subscribeOIMsg(allCoins, intervals.map { it.wire }))
     }
 
+    // MARK: - Projection watches
+
+    /**
+     * Create a server-side projection watch and suspend until the server
+     * replies with the initial snapshot. The watch is connection-scoped: it
+     * dies with the socket and callers must re-create it on reconnect or
+     * rotation (see [rotatedStream]).
+     */
+    public suspend fun createProjectionWatch(projection: String): ProjectionWatchCreated {
+        val deferred = CompletableDeferred<ProjectionWatchCreated>()
+        val requestId = lock.withLock {
+            cancelIdleTimerLocked()
+            ensureConnectedLocked()
+            nextProjectionRequestId += 1
+            val id = "proj-req-$nextProjectionRequestId"
+            pendingProjectionRequests[id] = deferred
+            if (statusFlow.value == ConnectionStatus.CONNECTED) {
+                sendMessage(watchProjectionMsg(projection, id))
+            } else {
+                pendingProjectionSends[id] = projection
+            }
+            id
+        }
+        try {
+            return withTimeout(PROJECTION_REQUEST_TIMEOUT_MS) { deferred.await() }
+        } catch (e: TimeoutCancellationException) {
+            lock.withLock {
+                pendingProjectionRequests.remove(requestId)
+                pendingProjectionSends.remove(requestId)
+            }
+            throw ArcaException.Unknown(
+                "WS_REQUEST_TIMEOUT",
+                "watch_projection '$projection': timed out waiting for the server reply",
+            )
+        }
+    }
+
+    /** Tear down a server-side projection watch. Best-effort; safe when disconnected. */
+    public fun destroyProjectionWatch(watchId: String) {
+        lock.withLock {
+            sendMessage(buildJsonObject { put("action", "unwatch_projection"); put("watchId", watchId) })
+            maybeStartIdleTimerLocked()
+        }
+    }
+
     public fun watchChartHistory(target: String, kind: String = "path", objectId: String? = null): String {
         val watchId = UUID.randomUUID().toString()
         lock.withLock {
@@ -576,6 +633,24 @@ public class WebSocketManager internal constructor(
     public fun candleClosedEvents(): Flow<CandleEvent> = filtered { event -> decodeCandleEvent(event, closedOnly = true) }
 
     public fun oiEvents(): Flow<OIEvent> = filtered { event -> decodeOIEvent(event) }
+
+    /**
+     * A stream of projection delta frames: `object.valuation` events carrying a
+     * path-keyed map of changed rows (plus optional removed paths) for a
+     * projection watch. Frames for single-object watches (which carry a single
+     * `valuation`) never appear here.
+     */
+    public fun projectionValuationEvents(): Flow<ProjectionValuationEvent> = filtered { event ->
+        val watchId = event.watchId
+        val valuations = event.valuations
+        if (event.type == EventType.OBJECT_VALUATION.wire && watchId != null &&
+            event.projection != null && valuations != null
+        ) {
+            ProjectionValuationEvent(watchId, valuations, event.removed, event)
+        } else {
+            null
+        }
+    }
 
     public fun objectValuationEvents(): Flow<ObjectValuationEvent> = filtered { event ->
         val valuation = event.valuation
@@ -894,6 +969,7 @@ public class WebSocketManager internal constructor(
                     return
                 }
                 "authenticated" -> { handleAuthenticated(obj); return }
+                "projection_watch_created" -> { handleProjectionWatchCreated(obj); return }
                 "error" -> { handleServerError(obj); return }
                 "mids.snapshot" -> {
                     val midsRaw = obj["mids"]?.jsonObject ?: return
@@ -970,16 +1046,65 @@ public class WebSocketManager internal constructor(
         chartHistoryWatches.forEach { (watchId, req) ->
             sendMessage(target, watchChartHistoryMsg(watchId, req.target, req.kind, req.objectId))
         }
+        // Projection watch requests parked while disconnected go out now that
+        // auth completed; the replies resolve the callers' pending requests.
+        if (pendingProjectionSends.isNotEmpty()) {
+            pendingProjectionSends.forEach { (requestId, projection) ->
+                sendMessage(target, watchProjectionMsg(projection, requestId))
+            }
+            pendingProjectionSends.clear()
+        }
     }
 
     private fun handleServerError(obj: JsonObject) {
         val message = obj["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown WebSocket error"
+
+        // An error carrying a requestId is scoped to that request (e.g. a
+        // watch_projection the caller isn't authorized for): reject only the
+        // matching pending request and leave the connection serving.
+        val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull
+        if (requestId != null) {
+            val deferred = lock.withLock {
+                pendingProjectionSends.remove(requestId)
+                pendingProjectionRequests.remove(requestId)
+            }
+            if (deferred != null) {
+                log.warning("websocket", metadata = mapOf("message" to message, "requestId" to requestId)) {
+                    "projection watch request rejected"
+                }
+                deferred.completeExceptionally(ArcaException.Unknown("WS_REQUEST_ERROR", message))
+                return
+            }
+        }
+
         log.error("websocket", metadata = mapOf("message" to message)) { "server error" }
         lock.withLock {
             webSocket?.cancel()
             webSocket = null
             dropLiveSocketLocked()
         }
+    }
+
+    private fun handleProjectionWatchCreated(obj: JsonObject) {
+        val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull ?: return
+        val deferred = lock.withLock { pendingProjectionRequests.remove(requestId) } ?: return
+        val valuations = obj["valuations"]?.let { el ->
+            runCatching {
+                arcaJson.decodeFromJsonElement(
+                    kotlinx.serialization.builtins.ListSerializer(ProjectedValuation.serializer()),
+                    el,
+                )
+            }.getOrNull()
+        } ?: emptyList()
+        deferred.complete(
+            ProjectionWatchCreated(
+                watchId = obj["watchId"]?.jsonPrimitive?.contentOrNull ?: "",
+                projection = obj["projection"]?.jsonPrimitive?.contentOrNull ?: "",
+                fields = obj["fields"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList(),
+                valuations = valuations,
+                cursor = obj["cursor"]?.jsonPrimitive?.contentOrNull,
+            ),
+        )
     }
 
     private fun handleWatchSnapshot(obj: JsonObject) {
@@ -1323,6 +1448,12 @@ public class WebSocketManager internal constructor(
         put("intervals", buildJsonArray { intervals.forEach { add(it) } })
     }
 
+    private fun watchProjectionMsg(projection: String, requestId: String): JsonObject = buildJsonObject {
+        put("action", "watch_projection")
+        put("projection", projection)
+        put("requestId", requestId)
+    }
+
     private fun watchChartHistoryMsg(watchId: String, target: String, kind: String, objectId: String?): JsonObject =
         buildJsonObject {
             put("action", "watch_chart_history")
@@ -1422,8 +1553,33 @@ public class WebSocketManager internal constructor(
 
         // Retry delay after a failed handoff.
         const val HANDOFF_RETRY_MS = 60_000L
+
+        // Budget for the server to answer a watch_projection request.
+        const val PROJECTION_REQUEST_TIMEOUT_MS = 10_000L
     }
 }
+
+/** The server's reply to a `watch_projection` request. */
+public data class ProjectionWatchCreated(
+    public val watchId: String,
+    public val projection: String,
+    /** The projection's registered field set at watch-creation time. */
+    public val fields: List<String>,
+    /** First page of the initial snapshot. */
+    public val valuations: List<ProjectedValuation>,
+    /** Set when the snapshot has more pages; fetch the rest via REST. */
+    public val cursor: String?,
+)
+
+/** Projection delta-frame payload: changed rows, removed paths, and the raw event. */
+public data class ProjectionValuationEvent(
+    public val watchId: String,
+    /** Changed rows keyed by object path — merge into local state by path. */
+    public val valuations: Map<String, ProjectedValuation>,
+    /** Paths deleted since the last frame — drop these rows. */
+    public val removed: List<String>?,
+    public val event: RealmEvent,
+)
 
 /** Object-valuation event payload: a valuation plus its path, watch id, and raw event. */
 public data class ObjectValuationEvent(

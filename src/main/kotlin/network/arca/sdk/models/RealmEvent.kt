@@ -29,6 +29,12 @@ public data class RealmEvent(
     public val valuation: ObjectValuation? = null,
     public val path: String? = null,
     public val watchId: String? = null,
+    /** Projection name, present on projection-watch `object.valuation` frames. */
+    public val projection: String? = null,
+    /** Changed rows keyed by object path (projection delta frames). */
+    public val valuations: Map<String, ProjectedValuation>? = null,
+    /** Paths of objects deleted since the last frame (projection delta frames). */
+    public val removed: List<String>? = null,
     public val aggregation: PathAggregation? = null,
     public val market: String? = null,
     public val interval: String? = null,

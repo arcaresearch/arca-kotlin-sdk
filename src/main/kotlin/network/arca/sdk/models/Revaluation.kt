@@ -75,6 +75,37 @@ public fun ObjectValuation.revalued(mids: Map<String, String>): ObjectValuation 
 }
 
 /**
+ * Returns a copy with price-derived fields recomputed from current mid prices:
+ * each position is re-marked, `unrealizedValue` (when projected) is replaced by
+ * the fresh P&L sum, and `equity` (when projected) is rebuilt as
+ * `realizedValue + newPnl` when the realized component is available, else
+ * shifted by the P&L delta. Rows without positions pass through unchanged.
+ */
+public fun ProjectedValuation.revalued(mids: Map<String, String>): ProjectedValuation {
+    // Server-authoritative pricing: trust the delivered values verbatim.
+    if (pricingMode == PricingMode.SERVER) return this
+    val positions = positions
+    if (positions.isNullOrEmpty()) return this
+
+    val newPositions = positions.map { it.revalued(mids) }
+    val oldPnl = positions.fold(BigDecimal.ZERO) { sum, p -> sum + parseDecimalOrZero(p.unrealizedPnl ?: "0") }
+    val newPnl = newPositions.fold(BigDecimal.ZERO) { sum, p -> sum + parseDecimalOrZero(p.unrealizedPnl ?: "0") }
+
+    val newUnrealized = if (unrealizedValue != null) decToString(newPnl) else null
+    val newEquity = when {
+        equity == null -> null
+        realizedValue != null -> decToString(parseDecimalOrZero(realizedValue) + newPnl)
+        else -> decToString(parseDecimalOrZero(equity) + (newPnl - oldPnl))
+    }
+
+    return copy(
+        equity = newEquity,
+        unrealizedValue = newUnrealized,
+        positions = newPositions,
+    )
+}
+
+/**
  * Returns a copy with totals recomputed from [PathAggregation.breakdown] using
  * mid prices. Spot rows use `amount × mid`; perp rows recompute mark-to-market
  * P&L. Exchange rows keep server `AssetBreakdown.valueUsd`. `departingUsd` and

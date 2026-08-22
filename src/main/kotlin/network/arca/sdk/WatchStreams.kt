@@ -27,6 +27,7 @@ import network.arca.sdk.models.ObjectValuation
 import network.arca.sdk.models.Operation
 import network.arca.sdk.models.OrderSide
 import network.arca.sdk.models.PathAggregation
+import network.arca.sdk.models.ProjectedValuation
 import network.arca.sdk.models.RealmEvent
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -269,6 +270,48 @@ public class AggregationWatchStream internal constructor(public val watchId: Str
         aggregationMut.value = aggregation
         updatesMut.tryEmit(aggregation)
         callbacks.fire(aggregation)
+    }
+}
+
+// MARK: - ProjectionWatchStream
+
+/**
+ * A stream of projection-filtered valuations for every object the projection
+ * covers, keyed by object path.
+ *
+ * The server sends the initial snapshot at watch creation, then per-batch
+ * **delta frames**: only the rows that changed, plus an optional `removed`
+ * list of deleted paths. The stream merges deltas into [valuations] and
+ * re-marks price-derived fields client-side on every mids tick, so each
+ * [updates] emission is a complete, current map.
+ */
+public class ProjectionWatchStream internal constructor(
+    /** The registered projection name this stream reads. */
+    public val projection: String,
+    /** The projection's field set at watch-creation time. */
+    public val fields: List<String>,
+) : BaseWatchStream() {
+    internal val watchIdMut: MutableStateFlow<String> = MutableStateFlow("")
+    internal val valuationsMut: MutableStateFlow<Map<String, ProjectedValuation>> = MutableStateFlow(emptyMap())
+    internal val updatesMut: MutableSharedFlow<Map<String, ProjectedValuation>> = snapshotUpdatesFlow()
+    private val callbacks = CallbackRegistry<Map<String, ProjectedValuation>>()
+
+    /** Server watch ID (changes when the watch is re-created after reconnect/rotation). */
+    public val watchId: StateFlow<String> get() = watchIdMut.asStateFlow()
+
+    /** Latest projected valuations keyed by object path. */
+    public val valuations: StateFlow<Map<String, ProjectedValuation>> get() = valuationsMut.asStateFlow()
+
+    /** A stream of full valuation maps (deltas already merged, prices re-marked). */
+    public val updates: Flow<Map<String, ProjectedValuation>> get() = updatesMut.asSharedFlow()
+
+    /** Register a callback invoked on each snapshot. Returns an unsubscribe function. */
+    public fun onUpdate(handler: (Map<String, ProjectedValuation>) -> Unit): () -> Unit = callbacks.add(handler)
+
+    internal fun push(snapshot: Map<String, ProjectedValuation>) {
+        valuationsMut.value = snapshot
+        updatesMut.tryEmit(snapshot)
+        callbacks.fire(snapshot)
     }
 }
 
