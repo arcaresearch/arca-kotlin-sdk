@@ -285,6 +285,23 @@ public data class Fill(
     public val resultingPosition: FillResultingPosition? = null,
     public val isLiquidation: Boolean? = null,
     public val createdAt: String? = null,
+    /**
+     * Whether the originating order was a trigger (TP/SL) order, decorated
+     * server-side from the order operation. `false` means "known regular
+     * order"; `null` means the fill is unattributable (external trade,
+     * liquidation) — absence and falseness are distinct.
+     */
+    public val isTrigger: Boolean? = null,
+    /** Trigger kind ("tp" | "sl") of the originating order. Present only for trigger orders. */
+    public val tpsl: String? = null,
+    /** Trigger price of the originating order. Present only for trigger orders. */
+    public val triggerPx: String? = null,
+    /**
+     * Classification of an [isLiquidation] fill: "liquidation" (margin call)
+     * or "adl" (backstop / auto-deleverage close). Absent on liquidations
+     * recorded before the venue method was stamped.
+     */
+    public val liquidationKind: String? = null,
 )
 
 @Serializable

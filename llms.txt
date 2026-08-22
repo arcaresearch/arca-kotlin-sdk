@@ -123,6 +123,7 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchOperations(path) | Flow<Pair<Operation, RealmEvent>> |
 | arca.watchExchangeState(id) | StateFlow<ExchangeState?> |
 | arca.watchFills(id) | Flow<Pair<Fill, RealmEvent>> |
+| — Fill trigger context | Fill.isTrigger (false = known regular order; null = unattributable — external trade/liquidation), Fill.tpsl "tp"\|"sl", Fill.triggerPx — decorated server-side, no per-fill order lookup needed. Liquidation fills carry Fill.liquidationKind "liquidation"\|"adl" (null on pre-stamp liquidations). |
 | arca.watchFunding(id) | Flow<Pair<FundingPayment, EventEnvelope>> |
 | arca.watchEquityChart(path, from, to) | StateFlow<List<EquityPoint>> + EquityChartUpdate |
 | arca.watchPnlChart(path, from, to) | StateFlow<List<PnlPoint>> + PnlChartUpdate |
