@@ -133,6 +133,13 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 Lower-level: `arca.ws` is the WebSocketManager (events flow, typed event flows,
 onGap, onResume, onAuthenticated, onRotated, ensureConnected, disconnect).
 
+`ws.onGap { missed -> }` fires on delivery loss, from either source: a hole
+the client observed in the server-assigned deliverySeq (missed is exact), or
+a server-sent `stream.resync` marker announcing that events were dropped
+before they were sequenced — a loss no sequence check can see (missed is a
+floor of 1). Both mean the same thing: refetch. Watch streams already do this
+internally; register onGap only for state you track yourself.
+
 **Sockets rotate before they are killed.** Infrastructure in front of the API
 caps how long any WebSocket may stay open, and for a socket that cap is a
 maximum lifetime, not an idle timeout — a perfectly busy connection is severed

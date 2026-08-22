@@ -682,6 +682,16 @@ public class WebSocketManager internal constructor(
         lastDeliverySeq = seq
     }
 
+    /**
+     * Register a handler that fires when delivery loss is detected. The
+     * handler receives the number of missed events.
+     *
+     * Fires for two kinds of loss: a hole the client observed in the
+     * server-assigned deliverySeq (the count is exact), and a server-sent
+     * `stream.resync` marker announcing that events were dropped before they
+     * were sequenced — a loss no sequence check can see (the count is a floor
+     * of 1). Both mean the same thing for recovery: refetch.
+     */
     public fun onGap(handler: (Int) -> Unit): UUID {
         val id = UUID.randomUUID()
         gapHandlers[id] = handler
@@ -867,6 +877,22 @@ public class WebSocketManager internal constructor(
         if (obj != null) {
             when (obj["type"]?.jsonPrimitive?.contentOrNull ?: "") {
                 "pong" -> return
+                "stream.resync" -> {
+                    // The server announced that events for this connection
+                    // were dropped BEFORE they were sequenced (delivery-queue
+                    // overflow under backpressure), so no deliverySeq gap will
+                    // ever reveal the loss — this marker is the only signal.
+                    // Run the same recovery as a detected gap; the count is a
+                    // floor of 1 (the server knows events were lost, not how
+                    // many). The marker carries its own deliverySeq, so the
+                    // sequence check runs first and stays contiguous for
+                    // subsequent messages. A control message: never emitted to
+                    // event flows.
+                    obj["deliverySeq"]?.jsonPrimitive?.intOrNull?.let { lock.withLock { checkDeliveryGap(it) } }
+                    log.warning("websocket") { "server announced event loss (stream.resync)" }
+                    gapHandlers.values.forEach { it(1) }
+                    return
+                }
                 "authenticated" -> { handleAuthenticated(obj); return }
                 "error" -> { handleServerError(obj); return }
                 "mids.snapshot" -> {
