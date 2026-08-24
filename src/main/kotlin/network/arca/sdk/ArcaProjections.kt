@@ -71,12 +71,16 @@ public suspend fun Arca.deleteProjection(name: String) {
  * Rows carry only the projection's registered fields (plus identity:
  * `objectId`, `path`, `type`). Pass [cursor] from the prior page to continue;
  * [prefix] narrows to paths under a prefix (it can never widen the
- * projection); [path] is the exact-path single-object variant.
+ * projection); [path] is the exact-path single-object variant; [paths] reads a
+ * known set (max 500) in one call, for when you already know which accounts
+ * you want — a leaderboard roster — instead of paging the whole projection to
+ * find them.
  */
 public suspend fun Arca.getProjectionValuations(
     name: String,
     prefix: String? = null,
     path: String? = null,
+    paths: List<String>? = null,
     cursor: String? = null,
     limit: Int? = null,
 ): ProjectionValuationsPage {
@@ -84,6 +88,7 @@ public suspend fun Arca.getProjectionValuations(
         put("realmId", realm)
         prefix?.let { put("prefix", it) }
         path?.let { put("path", it) }
+        paths?.takeIf { it.isNotEmpty() }?.let { put("paths", it.joinToString(",")) }
         cursor?.let { put("cursor", it) }
         limit?.let { put("limit", it.toString()) }
     }

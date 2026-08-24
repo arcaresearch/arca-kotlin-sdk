@@ -237,7 +237,12 @@ public suspend fun Arca.createAggregationWatch(
         CreateWatchRequest.serializer(),
         CreateWatchRequest(realmId = realm, sources = sources, flowsSince = flowsSince),
     )
-    return client.post("/aggregations/watch", body = body)
+    val response: CreateWatchResponse = client.post("/aggregations/watch", body = body)
+    // Delivery is ownership-gated server-side: a socket receives
+    // aggregation.updated only for watches it registered. Without this the
+    // watch would never emit.
+    ws.attachAggregationWatch(response.watchId.value)
+    return response
 }
 
 /** Get the current aggregation for an existing watch. */
@@ -248,6 +253,7 @@ public suspend fun Arca.getWatchAggregation(watchId: String): PathAggregation {
 
 /** Destroy an aggregation watch. */
 public suspend fun Arca.destroyAggregationWatch(watchId: String) {
+    ws.detachAggregationWatch(watchId)
     client.delete<JsonElement>("/aggregations/watch/$watchId")
 }
 

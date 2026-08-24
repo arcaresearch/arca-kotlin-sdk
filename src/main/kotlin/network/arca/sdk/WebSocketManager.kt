@@ -132,6 +132,12 @@ public class WebSocketManager internal constructor(
     private val oiRefCoins = HashMap<String, MutableSet<String>>()
     private val chartHistoryWatches = HashMap<String, ChartWatch>()
 
+    // Watches created out-of-band (REST POST /aggregations/watch) that this
+    // socket registered for delivery. Delivery is ownership-gated
+    // server-side, so these must be re-attached on every reconnect or the
+    // watch goes silent.
+    private val attachedWatches = LinkedHashSet<String>()
+
     // Projection watch request/reply state. Replies are matched to callers by
     // requestId; a request issued while disconnected parks in
     // [pendingProjectionSends] until the next successful auth flushes it.
@@ -535,8 +541,39 @@ public class WebSocketManager internal constructor(
         }
     }
 
+    /**
+     * Register a watch created out-of-band (`POST /aggregations/watch`) for
+     * delivery on this socket.
+     *
+     * Delivery is ownership-gated server-side: a socket receives
+     * `aggregation.updated` only for watches it registered. Without this a
+     * REST-created watch produces no events. The server re-authorizes the
+     * watch's sources against this connection's credential, so attaching can
+     * never widen access.
+     */
+    public fun attachAggregationWatch(watchId: String) {
+        if (watchId.isEmpty()) return
+        lock.withLock {
+            cancelIdleTimerLocked()
+            attachedWatches.add(watchId)
+            ensureConnectedLocked()
+            sendMessage(attachAggregationWatchMsg(watchId))
+        }
+    }
+
+    /** Stop delivery of a watch on this socket without destroying it. */
+    public fun detachAggregationWatch(watchId: String) {
+        if (watchId.isEmpty()) return
+        lock.withLock {
+            attachedWatches.remove(watchId)
+            sendMessage(buildJsonObject { put("action", "detach_aggregation_watch"); put("watchId", watchId) })
+            maybeStartIdleTimerLocked()
+        }
+    }
+
     private fun hasAnyInterestLocked(): Boolean =
-        pathRefs.isNotEmpty() || midsRefs > 0 || candleRefCoins.isNotEmpty() || oiRefCoins.isNotEmpty() || chartHistoryWatches.isNotEmpty()
+        pathRefs.isNotEmpty() || midsRefs > 0 || candleRefCoins.isNotEmpty() || oiRefCoins.isNotEmpty() ||
+            chartHistoryWatches.isNotEmpty() || attachedWatches.isNotEmpty()
 
     private fun maybeStartIdleTimerLocked() {
         if (hasAnyInterestLocked() || idleDisconnectJob != null) return
@@ -1046,6 +1083,12 @@ public class WebSocketManager internal constructor(
         chartHistoryWatches.forEach { (watchId, req) ->
             sendMessage(target, watchChartHistoryMsg(watchId, req.target, req.kind, req.objectId))
         }
+        // Re-register REST-created watches. The registry is per-pod, so a
+        // reconnect landing elsewhere answers "unknown watch" — the watch is
+        // genuinely gone there and the stream recreates it.
+        attachedWatches.forEach { watchId ->
+            sendMessage(target, attachAggregationWatchMsg(watchId))
+        }
         // Projection watch requests parked while disconnected go out now that
         // auth completed; the replies resolve the callers' pending requests.
         if (pendingProjectionSends.isNotEmpty()) {
@@ -1452,6 +1495,11 @@ public class WebSocketManager internal constructor(
         put("action", "watch_projection")
         put("projection", projection)
         put("requestId", requestId)
+    }
+
+    private fun attachAggregationWatchMsg(watchId: String): JsonObject = buildJsonObject {
+        put("action", "attach_aggregation_watch")
+        put("watchId", watchId)
     }
 
     private fun watchChartHistoryMsg(watchId: String, target: String, kind: String, objectId: String?): JsonObject =
