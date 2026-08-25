@@ -134,6 +134,27 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> |
 | arca.watchProjection(name) | StateFlow<Map<String,ProjectedValuation>> valuations keyed by path — one batched watch over every object the projection covers. Loads the full initial snapshot (watch reply + REST pages), merges per-account DELTA frames (only changed rows arrive; a `removed` list drops deleted paths), re-marks rows client-side on every mids tick, and re-creates the server-side watch on reconnect/rotation. Requires arca:ReadProjection. |
 
+Knowing when an exchange arca can trade: creating one returns before its venue
+account exists, and until it does every trading call answers 503
+EXCHANGE_PROVISIONING. Two events replace polling for it.
+`EventType.EXCHANGE_PROVISIONED` ("exchange.provisioned") means the venue
+account exists and its metadata is stamped, so the object stops answering 503.
+`EventType.EXCHANGE_READY` ("exchange.ready") means the trading agent is
+registered on chain and it can actually trade. Both carry
+`RealmEvent.exchange: ExchangeProvisioning?` (objectId, path, cosignRequired,
+tradable, accountAddress, agentWalletId).
+
+They are separate because on a cosign-armed boundary they are separate moments:
+the account is provisioned, but its trading agent needs the user to co-sign a
+grant, so provisioned arrives with `cosignRequired = true` and ready follows
+only once that grant lands — minutes or days later. Treat the gap as waiting on
+the user, not a stall. On an unarmed boundary both arrive together.
+
+`EventType.DEPOSIT_DETECTED` ("deposit.detected") is money seen arriving at a
+watched deposit address before it has been swept and become balance;
+`RealmEvent.deposit: DetectedDeposit?` carries it. It is chain truth, not ledger
+truth — `BALANCE_UPDATED` is still what says the funds landed.
+
 Lower-level: `arca.ws` is the WebSocketManager (events flow, typed event flows,
 onGap, onResume, onAuthenticated, onRotated, ensureConnected, disconnect).
 

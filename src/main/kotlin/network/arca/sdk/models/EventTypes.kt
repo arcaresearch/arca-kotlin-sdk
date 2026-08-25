@@ -10,6 +10,33 @@ public enum class EventType(public val wire: String) {
     OBJECT_DELETED("object.deleted"),
     BALANCE_UPDATED("balance.updated"),
     EXCHANGE_UPDATED("exchange.updated"),
+
+    /**
+     * The exchange arca's venue account exists and its metadata is stamped, so
+     * it stops answering `503 EXCHANGE_PROVISIONING`.
+     *
+     * This does not always mean it can trade: on a cosign-armed boundary the
+     * trading agent still needs the user's co-signature, which
+     * [ExchangeProvisioning.cosignRequired] reports and [EXCHANGE_READY] marks.
+     */
+    EXCHANGE_PROVISIONED("exchange.provisioned"),
+
+    /**
+     * The trading agent is registered on chain and the account can trade.
+     *
+     * On an unarmed boundary this follows [EXCHANGE_PROVISIONED] immediately.
+     * On an armed one it waits for the user's co-signed agent grant, which may
+     * be minutes or days — treat the gap as waiting on the user, not a stall.
+     */
+    EXCHANGE_READY("exchange.ready"),
+
+    /**
+     * Money seen arriving at a watched deposit address, before it has been
+     * swept into the boundary and become balance. [BALANCE_UPDATED] is still
+     * what says the funds landed; this is the honest earlier signal that they
+     * are on their way.
+     */
+    DEPOSIT_DETECTED("deposit.detected"),
     AGGREGATION_UPDATED("aggregation.updated"),
     MIDS_UPDATED("mids.updated"),
     CANDLE_CLOSED("candle.closed"),

@@ -26,6 +26,10 @@ public data class RealmEvent(
     public val `object`: ArcaObject? = null,
     public val mids: Map<String, String>? = null,
     public val exchangeState: ExchangeState? = null,
+    /** Present on `exchange.provisioned` and `exchange.ready`. */
+    public val exchange: ExchangeProvisioning? = null,
+    /** Present on `deposit.detected`. */
+    public val deposit: DetectedDeposit? = null,
     public val valuation: ObjectValuation? = null,
     public val path: String? = null,
     public val watchId: String? = null,
