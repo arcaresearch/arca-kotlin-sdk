@@ -124,13 +124,25 @@ public data class PnlResponse(
 @Serializable
 public data class PnlPoint(
     public val timestamp: String,
+    /**
+     * Flow-adjusted P&L: external inflows/outflows removed, anchored at
+     * the first point. A deposit does not move this.
+     */
     public val pnlUsd: String,
+    /**
+     * Marked account value for this bucket, floored at zero — the same
+     * number `getEquityHistory` returns for the same bucket. Chart this,
+     * not [pnlUsd], when you want "what is the account worth".
+     */
     public val equityUsd: String,
+    /**
+     * True signed value, present only when the zero floor clamped this
+     * point. [pnlUsd] is already derived from it.
+     */
+    public val unflooredEquityUsd: String? = null,
     public val status: ChartPointStatus? = null,
     public val cumInflowsUsd: String? = null,
     public val cumOutflowsUsd: String? = null,
-    public val lastEventOpId: String? = null,
-    public val midSetId: String? = null,
     /** Present when the chart is created with [PnlAnchor.EQUITY]. */
     public var valueUsd: String? = null,
 )
@@ -152,10 +164,10 @@ public data class PnlHistoryResponse(
     public val points: Int,
     public val resolution: String? = null,
     public val resolutionRequested: String? = null,
+    /** Bucket width of [resolution], in seconds. */
+    public val bucketSeconds: Int? = null,
     public val serverNow: String? = null,
     public val startingEquityUsd: String,
-    /** Timestamp of the first non-zero equity point (after leading-zero trimming). */
-    public val effectiveFrom: String? = null,
     public val pnlPoints: List<PnlPoint> = emptyList(),
     public val externalFlows: List<ExternalFlowEntry>? = null,
     public val midPrices: Map<String, String>? = null,
@@ -166,12 +178,25 @@ public data class PnlHistoryResponse(
 @Serializable
 public data class EquityPoint(
     public val timestamp: String,
+    /**
+     * Marked account value for this bucket: cash valued at the bucket's
+     * own mids, plus unrealized P&L on every position open at that
+     * bucket, valued at the same mids. Floored at zero — an exchange
+     * account is the one class permitted to hold a negative balance, and
+     * a balance that renders negative is worse than one that renders as
+     * zero.
+     */
     public val equityUsd: String,
+    /**
+     * True signed value, present ONLY when the zero floor clamped this
+     * point — so its presence is also how you tell a floored point from a
+     * genuinely-zero one. The floor never destroys the number; use this
+     * to reconstruct the real change.
+     */
+    public val unflooredEquityUsd: String? = null,
     public val status: ChartPointStatus? = null,
     public val cumInflowsUsd: String? = null,
     public val cumOutflowsUsd: String? = null,
-    public val lastEventOpId: String? = null,
-    public val midSetId: String? = null,
 )
 
 @Serializable
@@ -180,8 +205,20 @@ public data class EquityHistoryResponse(
     public val from: String,
     public val to: String,
     public val points: Int,
+    /**
+     * Ladder rung actually served. The ladder picks the finest rung whose
+     * bucket count fits the requested `points`, so a 24h window at
+     * `points = 180` is served at `15m` (~96 points). Compare two series
+     * by window and [resolution], never by list size.
+     */
     public val resolution: String? = null,
+    /**
+     * Set only when the requested rung lacked coverage and the server
+     * promoted to a coarser one.
+     */
     public val resolutionRequested: String? = null,
+    /** Bucket width of [resolution], in seconds. */
+    public val bucketSeconds: Int? = null,
     public val serverNow: String? = null,
     public val equityPoints: List<EquityPoint> = emptyList(),
 )

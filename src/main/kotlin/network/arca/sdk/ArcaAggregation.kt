@@ -145,19 +145,18 @@ public suspend fun Arca.getPnlHistory(
         points = result.points?.size ?: 0,
         resolution = result.resolution,
         resolutionRequested = result.resolutionRequested,
+        bucketSeconds = result.bucketSeconds,
         serverNow = result.serverNow,
         startingEquityUsd = result.startEquityUsd ?: result.startingEquityUsd ?: "0",
-        effectiveFrom = result.effectiveFrom,
         pnlPoints = result.points?.map {
             PnlPoint(
                 timestamp = it.ts,
                 pnlUsd = it.pnlUsd,
                 equityUsd = it.equityUsd,
+                unflooredEquityUsd = it.unflooredEquityUsd,
                 status = it.status,
                 cumInflowsUsd = it.cumInflowsUsd,
                 cumOutflowsUsd = it.cumOutflowsUsd,
-                lastEventOpId = it.lastEventOpId,
-                midSetId = it.midSetId,
                 valueUsd = it.valueUsd,
             )
         } ?: emptyList(),
@@ -206,16 +205,16 @@ public suspend fun Arca.getEquityHistory(
         points = result.points?.size ?: 0,
         resolution = result.resolution,
         resolutionRequested = result.resolutionRequested,
+        bucketSeconds = result.bucketSeconds,
         serverNow = result.serverNow,
         equityPoints = result.points?.map {
             EquityPoint(
                 timestamp = it.ts,
                 equityUsd = it.equityUsd,
+                unflooredEquityUsd = it.unflooredEquityUsd,
                 status = it.status,
                 cumInflowsUsd = it.cumInflowsUsd,
                 cumOutflowsUsd = it.cumOutflowsUsd,
-                lastEventOpId = it.lastEventOpId,
-                midSetId = it.midSetId,
             )
         } ?: emptyList(),
     )
@@ -295,17 +294,17 @@ private data class GetWatchAggregationResponse(
 private data class V2HistoryPoint(
     val ts: String,
     val equityUsd: String,
+    val unflooredEquityUsd: String? = null,
     val status: ChartPointStatus? = null,
     val cumInflowsUsd: String? = null,
     val cumOutflowsUsd: String? = null,
-    val lastEventOpId: String? = null,
-    val midSetId: String? = null,
 )
 
 @Serializable
 private data class V2HistoryResponse(
     val resolution: String? = null,
     val resolutionRequested: String? = null,
+    val bucketSeconds: Int? = null,
     val serverNow: String? = null,
     val points: List<V2HistoryPoint>? = null,
 )
@@ -315,11 +314,10 @@ private data class V2PnlHistoryPoint(
     val ts: String,
     val pnlUsd: String,
     val equityUsd: String,
+    val unflooredEquityUsd: String? = null,
     val status: ChartPointStatus? = null,
     val cumInflowsUsd: String? = null,
     val cumOutflowsUsd: String? = null,
-    val lastEventOpId: String? = null,
-    val midSetId: String? = null,
     val valueUsd: String? = null,
 )
 
@@ -327,10 +325,10 @@ private data class V2PnlHistoryPoint(
 private data class V2PnlHistoryResponse(
     val resolution: String? = null,
     val resolutionRequested: String? = null,
+    val bucketSeconds: Int? = null,
     val serverNow: String? = null,
     val startEquityUsd: String? = null,
     val startingEquityUsd: String? = null,
-    val effectiveFrom: String? = null,
     val externalFlows: List<ExternalFlowEntry>? = null,
     val midPrices: Map<String, String>? = null,
     val points: List<V2PnlHistoryPoint>? = null,

@@ -365,7 +365,14 @@ public suspend fun Arca.watchPnlChart(
 
     val history = getPnlHistory(path, from, to, points)
     ws.watchPath(path)
-    val flowsSince = history.effectiveFrom ?: from
+    // `flowsSince` must align with the instant `startingEquityUsd` is
+    // measured at, or the live tick double-counts flows already baked into
+    // the anchor. The server anchors on the first point of the requested
+    // window and does not trim leading zero-equity points, so the window
+    // start IS the anchor instant. (This previously read a server
+    // `effectiveFrom` field for a trimming behaviour the consolidated read
+    // path does not implement and never emitted.)
+    val flowsSince = from
     val aggStream = watchAggregation(
         sources = listOf(AggregationSource(type = AggregationSourceType.PREFIX, value = path)),
         exchange = exchange,

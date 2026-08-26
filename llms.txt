@@ -207,6 +207,39 @@ build charts on `watchCandleChart`.
 4. size is base-asset units, not USD. Min notional is $10.
 5. Always close() the Arca instance (and stop() each watch) to release the socket + scope.
 
+## Chart history is already marked; `points` is a ceiling
+
+getEquityHistory and getPnlHistory are ONE computation — same buckets, same
+marking; P&L history is equity history minus external flows. Every bucket's
+equityUsd is that bucket's cash valued at that bucket's own mids PLUS
+unrealized P&L on every position open at that bucket, valued at the same mids.
+It is not settled equity carried forward and the marking is not limited to the
+live point, so do NOT rebuild the curve from candles: a rebuild that projects
+the CURRENT position backwards has no term for a closed position, a realized
+loss, or a liquidation, and silently flat-lines the days before the newest
+position. status describes the CASH side's provenance, not whether the point
+was marked — CARRIED means no ledger event landed in that bucket, and such a
+point still changes value as the market moves. INCOMPLETE is the degradation
+signal (a mid was missing, or the position overlay could not run). Deposits
+move equityUsd and never move pnlUsd, so chart equityUsd (present on PnlPoint
+too) for "what is this account worth".
+
+equityUsd is FLOORED at zero and the floor never destroys the number. Exchange
+accounts are the one class permitted to hold a negative balance, and a negative
+balance is worse to render than a zero. When the floor clamps a point the true
+signed value comes back as unflooredEquityUsd; when it does not, that field is
+null — so its presence is also the only way to tell a floored point from a
+genuinely-zero one. pnlUsd is derived from the UNFLOORED value: a signed
+performance delta must not be flattened by a balance clamp.
+
+`points` is a CEILING: the ladder picks the finest rung whose bucket count fits
+inside it, so a 24h window at points=180 is served at 15m (~96 points). The
+response describes its own grid via resolution + bucketSeconds, with
+resolutionRequested set only when coverage forced a promotion. Reconcile two
+sources for the same series by window and resolution — never by "whichever has
+more points", which a client-side reconstruction wins every time regardless of
+correctness.
+
 ## TP/SL is an OCO bracket; openWithBracket is a linked normalTpsl bracket
 
 setPositionTpsl stamps one auto-generated ocoGroupId on both legs; when either fills
