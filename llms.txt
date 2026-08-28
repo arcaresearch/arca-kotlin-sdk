@@ -134,6 +134,41 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> |
 | arca.watchProjection(name) | StateFlow<Map<String,ProjectedValuation>> valuations keyed by path — one batched watch over every object the projection covers. Loads the full initial snapshot (watch reply + REST pages), merges per-account DELTA frames (only changed rows arrive; a `removed` list drops deleted paths), re-marks rows client-side on every mids tick, and re-creates the server-side watch on reconnect/rotation. Requires arca:ReadProjection. |
 
+Buying power is TWO numbers on a venue with a cross-dex reservation (the live
+`hl` venue), not one. The venue-native dex (`hl:0:*`) keeps
+`equity - totalMargin`; every HIP-3 dex shares a smaller pool,
+`totalCollateral - reserved`, where
+`reserved = max(marginNative, rate * notionalNative) + margin on other dexes`.
+The `rate` floor applies to the **native dex only** — a HIP-3 position
+contributes just its own margin, uniformly, on every dex. So only a *native*
+position above `1/rate` (10x) separates the two numbers: the shared pool is
+charged as if the native book had been opened at 10x. Below that they converge.
+
+`ActiveAssetData.availability` carries both on every market
+(`crossDexAvailableUsd`, `nativeAvailableUsd`, `reservationEnforced`,
+`reservationRate`), so a ticket reading `$0` on `hl:1:NVDA` can also show the
+larger native number instead of leaving a user to conclude their money vanished.
+Not driving a live slider? `marketAvailability(exchangeState, market)` is a pure
+helper (no network call) returning the same breakdown from a one-shot
+`getExchangeState` — for a market list, a portfolio header, a static ticket.
+
+```kotlin
+val state = arca.getExchangeState(objectId)
+val a = marketAvailability(state, "hl:1:NVDA")
+```
+
+The venue states the rule on `ExchangeState.collateralModel`
+(`crossDexReservationEnforced`, `crossDexReservationRate`, `totalCollateralUsd`);
+**absent means no reservation**. The `hl-sim` paper venue has a single pool and
+declares nothing, even though it publishes the same `hl:<dex>:<symbol>` ids — so
+one code path renders correctly on both venues, and turning it on for a venue is
+a server config change that already-shipped clients follow. Don't show a single
+account-wide "available" figure next to a market; the two numbers legitimately
+disagree. A zero is never a "try smaller" — the venue refuses at any size, so
+the remedy is a deposit (relief is exactly 1:1) or a smaller native position.
+The reservation tracks *current* native notional, so it drifts as the native
+market moves — don't cache it.
+
 Knowing when an exchange arca can trade: creating one returns before its venue
 account exists, and until it does every trading call answers 503
 EXCHANGE_PROVISIONING. Two events replace polling for it.

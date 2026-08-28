@@ -209,6 +209,93 @@ public data class ExchangeState(
      * and the SDK does not recompute them from mids. Absent ⇒ [PricingMode.CLIENT].
      */
     public val pricingMode: PricingMode? = null,
+    /**
+     * The venue's collateral rule for this account. Absent on venues that have
+     * not declared a model, which clients read as "no reservation".
+     */
+    public val collateralModel: CollateralModel? = null,
+)
+
+/**
+ * How a venue decides whether an account's free collateral can back an order on
+ * a perp dex other than the venue-native one.
+ *
+ * This is a venue rule, not a market property, and the two venues answer it
+ * differently over *identical* market ids: the live `hl` venue reserves
+ * `max(marginNative, rate * notionalNative)` behind the open positions before
+ * collateral can move to another dex, while the `hl-sim` paper venue has a
+ * single pool and no transfer to gate. Both publish `hl:<dexIndex>:<symbol>`,
+ * so a client inspecting the market id cannot tell them apart.
+ *
+ * Absent means no reservation — read it that way rather than guessing.
+ */
+@Serializable
+public data class CollateralModel(
+    /**
+     * Whether collateral already backing open positions is held back from a
+     * perp dex other than the venue-native one.
+     *
+     * When true the account has exactly **two** buying-power numbers, and
+     * [ActiveAssetData.availability] reports both:
+     *
+     * ```
+     * native   = equity - totalMargin              (the venue-native dex)
+     * crossDex = totalCollateral - reserved        (EVERY other dex, shared)
+     * reserved = max(marginNative, rate * notionalNative) + marginOnOtherDexes
+     * ```
+     *
+     * The notional floor applies to the **native dex only**; a position on any
+     * other dex contributes just its own margin, uniformly, everywhere. So only
+     * a native position above `1/rate` leverage separates the two numbers — the
+     * shared pool is charged as if it had been opened at exactly `1/rate`.
+     */
+    public val crossDexReservationEnforced: Boolean,
+    /**
+     * The notional fraction in that formula (`"0.1"` on Hyperliquid). Also the
+     * leverage threshold: below `1/rate` on the native dex the margin term wins
+     * and there is no gap between the two numbers at all.
+     */
+    public val crossDexReservationRate: String? = null,
+    /**
+     * The account's whole settlement-asset pool (spot USDC on Hyperliquid),
+     * before any of it is committed to a perp dex.
+     *
+     * Sent because it is **price-invariant** — it is cash — so a client can
+     * recompute the reservation exactly against live marks between state reads.
+     * Do not substitute equity: equity carries unrealized P&L and moves with
+     * the mark.
+     */
+    public val totalCollateralUsd: String? = null,
+)
+
+/**
+ * Both buying-power numbers for an account, and which one this market uses.
+ * See [CollateralModel].
+ */
+@Serializable
+public data class AvailabilityBreakdown(
+    /**
+     * Whether *this* market draws on the shared cross-dex pool rather than the
+     * native dex's own budget — true for a market on any non-native perp dex
+     * when the venue declares a reservation.
+     *
+     * This is the flag to gate reservation-aware UI on: it is both the
+     * capability signal (absent on older SDKs) and the per-market state.
+     */
+    public val reservationEnforced: Boolean,
+    /**
+     * Buying power on every non-native perp dex. One number, shared by all of
+     * them — a position on one costs its margin on all the others equally.
+     */
+    public val crossDexAvailableUsd: String,
+    /**
+     * Buying power on the venue-native dex (`equity - totalMargin`). Equal to
+     * [crossDexAvailableUsd] unless a native position is levered above
+     * `1/reservationRate`; that is the only thing that separates them.
+     */
+    public val nativeAvailableUsd: String,
+    /** The venue's notional fraction (`"0.1"`), or `"0"` when nothing applies. */
+    public val reservationRate: String,
 )
 
 @Serializable
@@ -234,8 +321,14 @@ public data class ActiveAssetData(
     public val maxBuyUsd: String,
     public val maxSellUsd: String,
     /**
-     * Raw available margin in USD: cross equity minus cross **initial** margin.
-     * Direction-agnostic; use for "buying power" display.
+     * Raw available margin in USD **for this market**. Direction-agnostic; use
+     * for "buying power" display.
+     *
+     * Normally cross equity minus cross **initial** margin. On a venue that
+     * declares a cross-dex reservation ([CollateralModel]), a market on a
+     * non-native perp dex instead draws on the shared cross-dex pool, which is
+     * smaller whenever a native position is levered above `1/rate` — see
+     * [availability] for both numbers side by side.
      *
      * Not the same as `withdrawable` on the exchange state, which is cross
      * equity minus cross **maintenance** margin. Maintenance is the lower
@@ -270,6 +363,13 @@ public data class ActiveAssetData(
     public val maxSellReduceSize: String? = null,
     /** The part of [maxSellSize] that opens new short exposure, in tokens. See [maxBuyReduceSize]. */
     public val maxSellOpenSize: String? = null,
+    /**
+     * Both of the account's buying-power numbers and which one this market
+     * uses. Present whenever the client derived the figure
+     * ([Arca.watchMaxOrderSize]); absent on older SDKs. See
+     * [AvailabilityBreakdown].
+     */
+    public val availability: AvailabilityBreakdown? = null,
 )
 
 /** Per-asset fee rate entry returned by `getAssetFees`. */

@@ -1,5 +1,7 @@
 package network.arca.sdk
 
+import network.arca.sdk.models.AvailabilityBreakdown
+import network.arca.sdk.models.CollateralModel
 import network.arca.sdk.models.ExchangeState
 import network.arca.sdk.models.LeverageType
 import network.arca.sdk.models.OrderBreakdownAmountType
@@ -56,6 +58,184 @@ class ActiveAssetDerivationTest {
             leverage = 10,
             marginUsed = marginUsed,
         )
+
+    // --- cross-dex reservation -------------------------------------------
+    //
+    // An account on a venue with a cross-dex reservation has exactly TWO buying
+    // power numbers: the native dex's own budget, and one pool shared by every
+    // other perp dex. Every case below is a reading taken from Hyperliquid
+    // mainnet on 2026-08-28 — three live accounts plus states driven
+    // deliberately on a test account.
+
+    private fun dexPosition(market: String, marginUsed: String, positionValue: String): SimPosition =
+        SimPosition(
+            id = SimPositionId("pos_$market"),
+            accountId = SimAccountId("act_1"),
+            realmId = RealmId("rlm_1"),
+            market = market,
+            side = PositionSide.LONG,
+            size = "1",
+            entryPrice = "1",
+            leverage = 20,
+            marginUsed = marginUsed,
+            positionValue = positionValue,
+        )
+
+    private fun crossDexState(
+        totalCollateral: String,
+        equity: String,
+        initialMarginUsed: String,
+        positions: List<SimPosition>,
+        declaresModel: Boolean = true,
+    ): ExchangeState = makeState(
+        equity = equity,
+        initialMarginUsed = initialMarginUsed,
+        positions = positions,
+    ).copy(
+        collateralModel = if (declaresModel) {
+            CollateralModel(
+                crossDexReservationEnforced = true,
+                crossDexReservationRate = "0.1",
+                totalCollateralUsd = totalCollateral,
+            )
+        } else {
+            null
+        },
+    )
+
+    /** The venue's own answer for each state, on a non-native (HIP-3) market. */
+    @Test
+    fun `cross-dex available matches mainnet`() {
+        val cases: List<Triple<String, ExchangeState, Double>> = listOf(
+            // The Gobi letter tester: 40x native swallows the entire balance.
+            Triple(
+                "letter tester 40x",
+                crossDexState("21.647938", "21.647938", "9.931551",
+                    listOf(dexPosition("hl:0:BTC", "9.931551", "397.262040"))),
+                0.0,
+            ),
+            Triple(
+                "lab, headroom",
+                crossDexState("9.749047", "9.749047", "3.087293",
+                    listOf(dexPosition("hl:0:BTC", "3.087293", "73.436720"))),
+                2.405375,
+            ),
+            // Two dexes — the account that falsified the previous formula.
+            Triple(
+                "tester2 native+xyz",
+                crossDexState("8.696417", "8.668287", "4.072284",
+                    listOf(dexPosition("hl:0:BTC", "2.397960", "23.979600"),
+                           dexPosition("hl:1:NVDA", "1.674324", "33.486480"))),
+                4.624133,
+            ),
+            Triple(
+                "native 20x",
+                crossDexState("14.753099", "14.753099", "4.994187",
+                    listOf(dexPosition("hl:0:BTC", "4.994187", "99.883750"))),
+                4.764724,
+            ),
+            // Below 1/rate the margin term wins — the branch that proves the max().
+            Triple(
+                "native 8x",
+                crossDexState("14.700599", "14.700599", "12.479531",
+                    listOf(dexPosition("hl:0:BTC", "12.479531", "99.836250"))),
+                2.221068,
+            ),
+            // A HIP-3 position is never charged the notional floor.
+            Triple(
+                "HIP-3 only",
+                crossDexState("14.563936", "14.563936", "0.679900",
+                    listOf(dexPosition("hl:1:NVDA", "0.679900", "13.597800"))),
+                13.884036,
+            ),
+            Triple(
+                "two HIP-3 dexes",
+                crossDexState("14.4957", "14.4957", "1.3362",
+                    listOf(dexPosition("hl:1:NVDA", "0.6807", "13.6140"),
+                           dexPosition("hl:9:US500", "0.6555", "13.1109"))),
+                13.1595,
+            ),
+            Triple(
+                "all three dexes",
+                crossDexState("14.4519", "14.4519", "6.3333",
+                    listOf(dexPosition("hl:0:BTC", "4.9971", "99.9425"),
+                           dexPosition("hl:1:NVDA", "0.6807", "13.6134"),
+                           dexPosition("hl:9:US500", "0.6555", "13.1109"))),
+                3.12145,
+            ),
+        )
+        for ((name, state, want) in cases) {
+            val d = deriveActiveAssetData(state, "hl:1:NVDA", 226.59, 20, OrderSide.BUY)
+            assertNotNull(d, name)
+            assertEquals(want, d!!.availableToTrade.toDouble(), 0.001, name)
+            assertEquals(want, d.availability!!.crossDexAvailableUsd.toDouble(), 0.001, name)
+        }
+    }
+
+    /** Every non-native dex reads the SAME number, including one never touched. */
+    @Test
+    fun `every non-native dex shares one number`() {
+        val st = crossDexState("14.4519", "14.4519", "6.3333",
+            listOf(dexPosition("hl:0:BTC", "4.9971", "99.9425"),
+                   dexPosition("hl:1:NVDA", "0.6807", "13.6134"),
+                   dexPosition("hl:9:US500", "0.6555", "13.1109")))
+        val nvda = deriveActiveAssetData(st, "hl:1:NVDA", 226.59, 20, OrderSide.BUY)!!
+        val us500 = deriveActiveAssetData(st, "hl:9:US500", 771.22, 20, OrderSide.BUY)!!
+        val gold = deriveActiveAssetData(st, "hl:2:GOLD", 4153.2, 20, OrderSide.BUY)!!
+        assertEquals(nvda.availableToTrade, us500.availableToTrade)
+        assertEquals(nvda.availableToTrade, gold.availableToTrade)
+    }
+
+    /** The native dex keeps its own, larger budget (measured 8.115 vs 3.120). */
+    @Test
+    fun `native dex keeps its own budget`() {
+        val st = crossDexState("14.4519", "14.4519", "6.3333",
+            listOf(dexPosition("hl:0:BTC", "4.9971", "99.9425"),
+                   dexPosition("hl:1:NVDA", "0.6807", "13.6134"),
+                   dexPosition("hl:9:US500", "0.6555", "13.1109")))
+        val btc = deriveActiveAssetData(st, "hl:0:BTC", 79954.0, 20, OrderSide.BUY)!!
+        assertEquals(8.1186, btc.availableToTrade.toDouble(), 0.001)
+        assertEquals(false, btc.availability!!.reservationEnforced)
+        assertEquals(3.12145, btc.availability!!.crossDexAvailableUsd.toDouble(), 0.001)
+    }
+
+    /** The REST path: both numbers from a one-shot state, no stream needed. */
+    @Test
+    fun `market availability from a plain state`() {
+        val st = crossDexState("14.4519", "14.4519", "6.3333",
+            listOf(dexPosition("hl:0:BTC", "4.9971", "99.9425"),
+                   dexPosition("hl:1:NVDA", "0.6807", "13.6134"),
+                   dexPosition("hl:9:US500", "0.6555", "13.1109")))
+
+        val nvda = marketAvailability(st, "hl:1:NVDA")
+        assertTrue(nvda.reservationEnforced)
+        assertEquals(3.12145, nvda.crossDexAvailableUsd.toDouble(), 0.001)
+        assertEquals(8.1186, nvda.nativeAvailableUsd.toDouble(), 0.001)
+
+        // Same two numbers from the native market — only the flag differs.
+        val btc = marketAvailability(st, "hl:0:BTC")
+        assertEquals(false, btc.reservationEnforced)
+        assertEquals(nvda.crossDexAvailableUsd, btc.crossDexAvailableUsd)
+        assertEquals(nvda.nativeAvailableUsd, btc.nativeAvailableUsd)
+
+        // ...and it agrees with what the stream reports for the same state.
+        val streamed = deriveActiveAssetData(st, "hl:1:NVDA", 226.59, 20, OrderSide.BUY)!!
+        assertEquals(nvda, streamed.availability)
+    }
+
+    /** A single-pool venue declares no model and must be left entirely alone. */
+    @Test
+    fun `no model means no reservation`() {
+        val sim = crossDexState("14.4519", "14.4519", "6.3333",
+            listOf(dexPosition("hl:0:BTC", "4.9971", "99.9425"),
+                   dexPosition("hl:1:NVDA", "0.6807", "13.6134")),
+            declaresModel = false)
+        val d = deriveActiveAssetData(sim, "hl:1:NVDA", 226.59, 20, OrderSide.BUY)!!
+        assertEquals(8.1186, d.availableToTrade.toDouble(), 0.001)
+        assertEquals(false, d.availability!!.reservationEnforced)
+        val a = marketAvailability(sim, "hl:1:NVDA")
+        assertEquals(a.crossDexAvailableUsd, a.nativeAvailableUsd)
+    }
 
     @Test
     fun usesEquityMinusInitialMargin_NotAvailableToWithdraw() {
