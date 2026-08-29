@@ -1,5 +1,7 @@
 package network.arca.sdk
 
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import network.arca.sdk.models.Operation
 
 /**
@@ -96,13 +98,76 @@ public sealed class ArcaException(
         "Operation ${operation.id} ${operation.state.wire}: ${operation.outcome ?: operation.state.wire}",
     )
 
+    /**
+     * The operation would move value out of a co-sign-armed boundary without
+     * the owner's signature (HTTP 412 `COSIGN_REQUIRED`).
+     *
+     * The SDK cannot transparently retry this the way it could a browser
+     * confirmation: a co-signature comes from a key the platform does not
+     * hold. Route [challenge] to whatever holds the boundary's co-sign key.
+     *
+     * For venue hops, `hopVenues(..., sign = ...)` handles this end to end.
+     */
+    public class CosignRequired(
+        message: String,
+        public val challenge: CosignRequiredChallenge,
+        errorId: String? = null,
+    ) : ArcaException(message, errorId)
+
     /** Unknown API error code. */
     public class Unknown(public val code: String, message: String, errorId: String? = null) :
         ArcaException("$code: $message", errorId)
 }
 
+/**
+ * The structured payload accompanying a 412 `COSIGN_REQUIRED` response.
+ *
+ * [surface] is the discriminator worth branching on: `transfer.venue_hop`,
+ * `transfer.venue_deposit`, `transfer.cross_boundary`,
+ * `deposit.venue_deposit`, `withdrawal.plain`.
+ */
+public data class CosignRequiredChallenge(
+    public val surface: String,
+    public val boundaryId: String,
+    /** Set on single-object surfaces (deposit, withdrawal). */
+    public val arcaPath: String? = null,
+    /** Set on the two-ended surfaces (transfer, hop). */
+    public val sourceArcaPath: String? = null,
+    public val targetArcaPath: String? = null,
+    /** Endpoints that collect the signature, when the surface has a pair. */
+    public val propose: String? = null,
+    public val submit: String? = null,
+)
+
+/**
+ * Extracts a co-sign challenge from the server's `error.details`.
+ *
+ * Only `boundaryId` is required: the surfaces differ in which path fields they
+ * carry, and a challenge naming the boundary is still actionable even if a
+ * future surface adds fields this version does not know.
+ */
+internal fun parseCosignChallenge(details: JsonObject?): CosignRequiredChallenge? {
+    if (details == null) return null
+    fun str(key: String): String? = (details[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+    val boundaryId = str("boundaryId") ?: return null
+    return CosignRequiredChallenge(
+        surface = str("surface") ?: "",
+        boundaryId = boundaryId,
+        arcaPath = str("arcaPath"),
+        sourceArcaPath = str("sourceArcaPath"),
+        targetArcaPath = str("targetArcaPath"),
+        propose = str("propose"),
+        submit = str("submit"),
+    )
+}
+
 /** Maps an API error response code to the appropriate [ArcaException] subtype. */
-public fun mapApiError(code: String, message: String, errorId: String?): ArcaException = when (code) {
+public fun mapApiError(
+    code: String,
+    message: String,
+    errorId: String?,
+    details: JsonObject? = null,
+): ArcaException = when (code) {
     "VALIDATION_ERROR" -> ArcaException.Validation(message, errorId)
 
     "UNAUTHORIZED", "UNAUTHENTICATED" -> ArcaException.Unauthorized(message, errorId)
@@ -131,6 +196,10 @@ public fun mapApiError(code: String, message: String, errorId: String?): ArcaExc
 
     "EXCHANGE_ERROR", "EXCHANGE_UNAVAILABLE", "INVALID_REQUEST",
     -> ArcaException.Exchange(code, message, errorId)
+
+    "COSIGN_REQUIRED" -> parseCosignChallenge(details)
+        ?.let { ArcaException.CosignRequired(message, it, errorId) }
+        ?: ArcaException.Unknown(code, message, errorId)
 
     else -> ArcaException.Unknown(code, message, errorId)
 }

@@ -70,8 +70,11 @@ public class ArcaClient(
     public suspend inline fun <reified T> get(path: String, query: Map<String, String>? = null): T =
         requestTyped("GET", path, query, null, serializer())
 
-    public suspend inline fun <reified T> post(path: String, body: JsonElement? = null): T =
-        requestTyped("POST", path, null, body, serializer())
+    public suspend inline fun <reified T> post(
+        path: String,
+        query: Map<String, String>? = null,
+        body: JsonElement? = null,
+    ): T = requestTyped("POST", path, query, body, serializer())
 
     public suspend inline fun <reified T> patch(
         path: String,
@@ -251,7 +254,7 @@ public class ArcaClient(
             }
             val error = envelope.error
             if (error != null) {
-                val mapped = mapApiError(error.code, error.message, error.errorId)
+                val mapped = mapApiError(error.code, error.message, error.errorId, error.details)
                 logger.warning(
                     "network",
                     mapped,

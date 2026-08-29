@@ -79,7 +79,7 @@ public suspend fun Arca.nonce(path: String, separator: String? = null): NonceRes
         put("prefix", path)
         if (separator != null) put("separator", separator)
     }
-    return client.post("/nonce", body)
+    return client.post("/nonce", body = body)
 }
 
 /** Get aggregate counts for the realm. */

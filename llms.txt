@@ -72,6 +72,7 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Get object | arca.getObject(path) |
 | Balances | arca.getBalances(id) / getBalancesByPath(path) |
 | Transfer | arca.transfer(path, from, to, amount) |
+| Move capital between two venues | arca.hopVenues(path, from, to, amount, sign) |
 | Fund (dev) | arca.fundAccount(arcaRef, amount) |
 | Withdraw (dev) | arca.defundAccount(arcaPath, amount) |
 | Payment link | arca.createPaymentLink(type, arcaRef, amount) -> resp.paymentLink.url |
@@ -98,6 +99,18 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Candles | arca.getCandles(market, interval, options) |
 | OI history | arca.getOIHistory(market, interval, options) -> OHLC open interest + 24h ntlVlm + mark; intervals 1m/5m/1h/1d |
 | Funding history | arca.getFundingHistory(market, startTime?, endTime?) -> SETTLED funding observations {t, fundingRate, premium?, s?}; no interval (event series); default 7d, max 30d; HIP-3 supported; not predicted (use ticker funding/nextFundingTime) |
+
+## Venue-to-venue hops
+
+A transfer whose `from` AND `to` are both exchange objects is a **venue hop**: value goes venue-to-venue in one on-chain frame and never rests at a boundary, so no intermediate denominated arca is needed. Plain `transfer` performs it. Hops carry **no fee** (a non-zero one is refused, not ignored) and work across isolation boundaries. Destinations are limited to Hyperliquid and the paper venue; a GLL-paper target is refused because its account is faucet-credited rather than credited by value landing at the venue contract.
+
+`hopVenues` is `transfer` **plus the co-sign fallback**, and is what to reach for when the source boundary might be armed. On an unarmed boundary it is exactly a transfer and `sign` is never invoked; on an armed one the plain call is refused (the kernel will not move value out unsigned) so it proposes, calls `sign(digest, proposal)`, and submits. `sign` is `suspend (String, VenueHopProposal) -> String` — a device prompt, a hardware wallet, a remote signer; the SDK never holds this key. Omit it and an armed boundary throws `ArcaException.CosignRequired`, whose `challenge` names `surface` / `boundaryId` / `propose` / `submit`.
+
+`proposeVenueHop` (suspend) / `submitVenueHop` (handle) expose the halves when you want to drive it yourself. `path` is required at propose and must match at submit — the signed `ref` derives from it.
+
+**`hopVenues` verifies the proposal before it calls `sign`, and so should you if you drive the halves yourself.** A digest is 32 opaque bytes: a key asked to sign one cannot tell a hop to your own paper account from a hop to a stranger's, and neither can a user staring at a device prompt. `proposal.verify()` re-derives the `paramsHash` and the EIP-712 digest from the proposal's own readable fields and throws unless both match what the server sent — so a propose response that quietly changed the destination sub-account or raised the amount is refused locally rather than discovered on chain. It also pins the EIP-712 domain to this SDK's own `ArcaCustodyKernel` / version `"2"` constants rather than trusting the response, so a signature cannot be moved onto a kernel whose semantics this SDK has never seen.
+
+The pieces are exported for callers who want them directly: `Cosign.transferBetweenVenuesParamsHash`, `Cosign.operatorActionDigest`, `Cosign.domainSeparator`. Encode `amountRaw`, never the decimal `amount`. Keccak-256 is implemented in-package (`java.security.MessageDigest`'s SHA3-256 is NIST-padded and produces a different hash), so there is no crypto dependency to add. This SDK deliberately does **not** sign: `sign` stays yours, so the key can live in a keystore, a passkey-fronted enclave, or a remote signer. All derivations are pinned byte-for-byte against the Solidity implementation by the shared cross-SDK golden vectors.
 
 ## Watch streams (real-time)
 
