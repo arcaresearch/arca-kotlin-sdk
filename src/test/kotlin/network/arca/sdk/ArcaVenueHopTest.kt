@@ -42,13 +42,25 @@ class ArcaVenueHopTest {
     /** When true, propose returns a destination its own paramsHash disowns. */
     private var tampered = false
 
+    /** When true, the submit answers 412 COSIGN_NONCE_USED. */
+    private var nonceUsedOnSubmit = false
+
+    /** When true, the nonce-state read answers as a pre-v7 counter kernel. */
+    private var counterKernel = false
+
+    /** GET paths, kept separately so the POST-ordering assertions stay exact. */
+    private val getPaths = mutableListOf<String>()
+
     @BeforeEach
     fun setUp() {
         paths.clear()
         bodies.clear()
+        getPaths.clear()
         armed = false
         plainRefusal = null
         tampered = false
+        nonceUsedOnSubmit = false
+        counterKernel = false
         server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -57,11 +69,16 @@ class ArcaVenueHopTest {
                     paths.add(path)
                     val raw = request.body.readUtf8()
                     if (raw.isNotEmpty()) bodies.add(arcaJson.parseToJsonElement(raw).jsonObject)
+                } else {
+                    getPaths.add(path)
                 }
                 return when {
+                    path.contains("/cosign-nonces/") ->
+                        json(if (counterKernel) NONCE_STATE_COUNTER else NONCE_STATE_CONSUMED)
                     path.contains("/custody/venue-hops/propose") ->
                         json(if (tampered) TAMPERED_PROPOSAL else PROPOSAL)
-                    path.contains("/custody/venue-hops") -> json(SUBMITTED)
+                    path.contains("/custody/venue-hops") ->
+                        if (nonceUsedOnSubmit) json(NONCE_USED_REFUSAL, code = 412) else json(SUBMITTED)
                     path.contains("/transfer") -> when {
                         armed -> json(COSIGN_REFUSAL, code = 412)
                         plainRefusal != null -> json(
@@ -205,6 +222,71 @@ class ArcaVenueHopTest {
         assertFalse(signed, "the signer ran for a refusal a signature cannot fix")
     }
 
+    /**
+     * A spent nonce is an ordinary lifecycle outcome — a retry racing the
+     * original, or a user who cancelled — not a signing failure. Before the
+     * dedicated code existed, the only signal separating the two was message
+     * text, so integrators reported "that approval didn't match this request"
+     * for signatures that were perfectly valid.
+     */
+    @Test
+    fun `a spent nonce surfaces as its own typed error, not a validation failure`() {
+        plainRefusal = null
+        armed = true
+        // Propose succeeds; the submit is what finds the slot gone.
+        nonceUsedOnSubmit = true
+
+        val err = assertThrows(ArcaException.CosignNonceUsed::class.java) {
+            runBlocking {
+                makeArca().hopVenues(
+                    path = "/op/transfer/hop-6",
+                    from = "/a/exchange",
+                    to = "/b/exchange",
+                    amount = "5",
+                    sign = { _, _ -> "0xsignature" },
+                ).submitted()
+            }
+        }
+        assertEquals("bnd_src", err.details.boundaryId)
+        assertEquals("nonce_consumed", err.details.reason)
+        assertEquals(Vectors.NONCE, err.details.nonce)
+        assertTrue(
+            err.details.resolution?.contains("re-propose") == true,
+            "the refusal must name the remedy: ${err.details.resolution}",
+        )
+    }
+
+    @Test
+    fun `getCosignNonceState reads the burn set on an unordered kernel`() = runBlocking {
+        val state = makeArca().getCosignNonceState("bnd_v7", "9223372036854775807")
+
+        assertFalse(state.spendable)
+        assertTrue(state.consumed)
+        assertTrue(state.unordered)
+        // A 63-bit nonce exceeds what a JSON number carries losslessly in
+        // every consumer, so it must round-trip as a string.
+        assertEquals("9223372036854775807", state.nonce)
+        assertNull(state.counterNonce, "surfacing the frozen slot invites signing against it")
+        assertTrue(getPaths[0].contains("realmId="), "the read carried no realmId: ${getPaths[0]}")
+        assertTrue(getPaths[0].contains("/cosign-nonces/9223372036854775807"))
+    }
+
+    /**
+     * The trap: a frozen-counter kernel has no burn set, so `consumed` is
+     * structurally false even for a nonce it will refuse. Callers must be able
+     * to trust `spendable` alone.
+     */
+    @Test
+    fun `getCosignNonceState reports not-spendable on a counter kernel despite consumed false`() = runBlocking {
+        counterKernel = true
+        val state = makeArca().getCosignNonceState("bnd_k5", "8")
+
+        assertFalse(state.consumed, "consumed is structural on a kernel with no burn set")
+        assertFalse(state.spendable)
+        assertFalse(state.unordered)
+        assertEquals("9", state.counterNonce)
+    }
+
     @Test
     fun `submitVenueHop omits an unset ref so the server derives it`() = runBlocking {
         makeArca().submitVenueHop(
@@ -284,5 +366,19 @@ class ArcaVenueHopTest {
             "details":{"surface":"transfer.venue_hop","boundaryId":"bnd_src",
                 "sourceArcaPath":"/users/a/exchange/hl","targetArcaPath":"/users/b/exchange/paper",
                 "propose":"/api/v1/custody/venue-hops/propose","submit":"/api/v1/custody/venue-hops"}}}"""
+
+        val NONCE_USED_REFUSAL = """{"success":false,"error":{
+            "code":"COSIGN_NONCE_USED",
+            "message":"co-sign nonce has already been used; re-propose the action",
+            "details":{"boundaryId":"bnd_src","nonce":"${Vectors.NONCE}","reason":"nonce_consumed",
+                "resolution":"re-propose the action to obtain a fresh nonce, re-sign, and resubmit"}}}"""
+
+        const val NONCE_STATE_CONSUMED = """{"success":true,"data":{
+            "boundaryId":"bnd_v7","nonce":"9223372036854775807",
+            "spendable":false,"consumed":true,"unordered":true}}"""
+
+        const val NONCE_STATE_COUNTER = """{"success":true,"data":{
+            "boundaryId":"bnd_k5","nonce":"8",
+            "spendable":false,"consumed":false,"unordered":false,"counterNonce":"9"}}"""
     }
 }

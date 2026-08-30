@@ -224,6 +224,72 @@ public fun Arca.hopVenues(
     }
 
 /**
+ * Whether one co-signature nonce can still be spent on a boundary.
+ *
+ * Returned by [getCosignNonceState]. Read [spendable] — it is the only field
+ * correct on both kernel generations.
+ */
+@Serializable
+public data class CosignNonceState(
+    public val boundaryId: String = "",
+    /** The nonce that was checked, echoed as a decimal string. */
+    public val nonce: String = "",
+    /**
+     * The single answer most callers want: can this envelope still be
+     * submitted? Correct on both kernel generations.
+     */
+    public val spendable: Boolean = false,
+    /**
+     * Burn-set read: `true` means this slot is spent.
+     *
+     * Meaningful **only when [unordered] is true**. A frozen-counter kernel
+     * has no burn set, so this is always `false` there — including for nonces
+     * the counter will refuse. Prefer [spendable].
+     */
+    public val consumed: Boolean = false,
+    /**
+     * `true` on a burn-set kernel (marker 7+) that accepts caller-chosen
+     * nonces; `false` on a frozen-counter kernel (marker 3-6), where
+     * [counterNonce] is the only value it will accept.
+     */
+    public val unordered: Boolean = false,
+    /**
+     * The boundary's live counter, present only when [unordered] is false. On
+     * such a kernel an envelope is live iff it was signed over exactly this.
+     */
+    public val counterNonce: String? = null,
+)
+
+/**
+ * Check whether a co-signature's nonce can still be spent.
+ *
+ * Use this before submitting an envelope that has been outstanding long enough
+ * to have been overtaken — a retry that raced the original, a second device,
+ * or a user who cancelled the approval. Submitting a spent nonce throws
+ * [ArcaException.CosignNonceUsed]; this read tells you first, so you can
+ * re-propose without asking for a signature that cannot land.
+ *
+ * ```kotlin
+ * val state = arca.getCosignNonceState("bnd_abc", proposal.nonce)
+ * if (!state.spendable) {
+ *     // re-propose rather than signing a dead slot
+ * }
+ * ```
+ *
+ * Read [CosignNonceState.spendable], not `consumed`: on a frozen-counter
+ * kernel (marker 3-6) there is no burn set, so `consumed` is always `false`
+ * even for a nonce the kernel will refuse.
+ *
+ * This answers about the nonce, not the signature over it. A spendable nonce
+ * means submitting is not futile — not that the envelope will verify.
+ */
+public suspend fun Arca.getCosignNonceState(boundaryId: String, nonce: String): CosignNonceState =
+    client.get(
+        "/custody/boundaries/$boundaryId/cosign-nonces/$nonce",
+        query = mapOf("realmId" to realm),
+    )
+
+/**
  * Signable fields for a co-signed venue hop. Nothing is persisted and no funds
  * move.
  *

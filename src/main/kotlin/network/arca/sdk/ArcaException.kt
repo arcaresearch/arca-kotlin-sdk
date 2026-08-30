@@ -114,6 +114,29 @@ public sealed class ArcaException(
         errorId: String? = null,
     ) : ArcaException(message, errorId)
 
+    /**
+     * A co-signed submission named a nonce that can no longer be spent
+     * (HTTP 412 `COSIGN_NONCE_USED`).
+     *
+     * **This is not a signature failure.** The signature was very likely
+     * fine; the slot it committed to is gone — a retry racing the original
+     * already spent it, or the user cancelled the approval. The remedy is
+     * always the same: propose again, have the device sign the fresh digest,
+     * resubmit. Reporting it as "that approval didn't match this request"
+     * tells the user their wallet misbehaved when it did not.
+     *
+     * Treat it as blocked-pending-user rather than retryable: replaying the
+     * same envelope can never succeed, so a reconciler must re-propose.
+     *
+     * `getCosignNonceState` checks the slot before submitting, which avoids
+     * the round trip for an envelope that has been outstanding a while.
+     */
+    public class CosignNonceUsed(
+        message: String,
+        public val details: CosignNonceUsedDetails,
+        errorId: String? = null,
+    ) : ArcaException(message, errorId)
+
     /** Unknown API error code. */
     public class Unknown(public val code: String, message: String, errorId: String? = null) :
         ArcaException("$code: $message", errorId)
@@ -138,6 +161,42 @@ public data class CosignRequiredChallenge(
     public val propose: String? = null,
     public val submit: String? = null,
 )
+
+/**
+ * The structured payload accompanying a 412 `COSIGN_NONCE_USED` response.
+ *
+ * [reason] is either `nonce_consumed` (the burn-set kernel, marker 7+, says
+ * this exact slot is spent: the action executed, or the owner revoked it with
+ * `invalidateCosignNonce`) or `counter_stale` (a frozen-counter kernel, marker
+ * 3-6, moved its counter while the device was signing). Both resolve
+ * identically, so branch on the exception type; [reason] is for logs.
+ */
+public data class CosignNonceUsedDetails(
+    public val boundaryId: String,
+    /** The nonce that was refused, as a decimal string. */
+    public val nonce: String? = null,
+    public val reason: String? = null,
+    /** Human-readable remedy, always "re-propose … re-sign … resubmit". */
+    public val resolution: String? = null,
+)
+
+/**
+ * Extracts the spent-nonce payload from the server's `error.details`.
+ *
+ * Only `boundaryId` is required, matching [parseCosignChallenge]: an error
+ * naming the boundary is actionable even if a future field is unrecognized.
+ */
+internal fun parseCosignNonceUsed(details: JsonObject?): CosignNonceUsedDetails? {
+    if (details == null) return null
+    fun str(key: String): String? = (details[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+    val boundaryId = str("boundaryId") ?: return null
+    return CosignNonceUsedDetails(
+        boundaryId = boundaryId,
+        nonce = str("nonce"),
+        reason = str("reason"),
+        resolution = str("resolution"),
+    )
+}
 
 /**
  * Extracts a co-sign challenge from the server's `error.details`.
@@ -199,6 +258,10 @@ public fun mapApiError(
 
     "COSIGN_REQUIRED" -> parseCosignChallenge(details)
         ?.let { ArcaException.CosignRequired(message, it, errorId) }
+        ?: ArcaException.Unknown(code, message, errorId)
+
+    "COSIGN_NONCE_USED" -> parseCosignNonceUsed(details)
+        ?.let { ArcaException.CosignNonceUsed(message, it, errorId) }
         ?: ArcaException.Unknown(code, message, errorId)
 
     else -> ArcaException.Unknown(code, message, errorId)
