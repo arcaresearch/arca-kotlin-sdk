@@ -1,5 +1,7 @@
 package network.arca.sdk
 
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import network.arca.sdk.internal.ApiResponse
 import network.arca.sdk.internal.arcaJson
 import network.arca.sdk.models.ExplorerSummary
@@ -90,6 +92,68 @@ class ArcaExceptionTest {
         val error = mapApiError("FORBIDDEN", "Access denied", null)
         val f = assertInstanceOf(ArcaException.Forbidden::class.java, error)
         assertEquals("Access denied", f.message)
+    }
+
+    // `reason` names which nonce lane refused; `disposition` names the cause,
+    // and the two causes are opposite facts about whether the customer's money
+    // left. These pin the field an integrator branches on before re-sending.
+
+    private fun details(json: String): JsonObject =
+        arcaJson.parseToJsonElement(json).jsonObject
+
+    @Test
+    fun cosignNonceUsedCarriesDispositionAndOperation() {
+        val error = mapApiError(
+            "COSIGN_NONCE_USED", "already used", null,
+            details(
+                """{"boundaryId":"bnd_a","nonce":"42","reason":"nonce_consumed",
+                   "disposition":"executed","txHash":"0xabc","operationId":"op_01k"}""",
+            ),
+        )
+        val e = assertInstanceOf(ArcaException.CosignNonceUsed::class.java, error)
+        assertEquals(COSIGN_NONCE_EXECUTED, e.details.disposition)
+        assertEquals("op_01k", e.details.operationId)
+        assertEquals("0xabc", e.details.txHash)
+    }
+
+    @Test
+    fun cosignNonceRevokedCarriesNoOperation() {
+        val error = mapApiError(
+            "COSIGN_NONCE_USED", "already used", null,
+            details("""{"boundaryId":"bnd_a","disposition":"revoked","txHash":"0xdead"}"""),
+        )
+        val e = assertInstanceOf(ArcaException.CosignNonceUsed::class.java, error)
+        assertEquals(COSIGN_NONCE_REVOKED, e.details.disposition)
+        // The owner acted directly on the kernel, so there is no send of ours
+        // to name; inventing one would misattribute the burn.
+        assertNull(e.details.operationId)
+    }
+
+    // The safety-critical narrowing. A disposition this SDK does not recognize
+    // must land on unknown rather than reaching a caller's `else` arm as an
+    // opaque string — that arm gets written as "not executed, so nothing
+    // moved" far more often than as "unrecognized, go reconcile".
+    @Test
+    fun cosignNonceUnrecognizedDispositionNarrowsToUnknown() {
+        val error = mapApiError(
+            "COSIGN_NONCE_USED", "refused", null,
+            details("""{"boundaryId":"bnd_future","disposition":"superseded_by_something_new"}"""),
+        )
+        val e = assertInstanceOf(ArcaException.CosignNonceUsed::class.java, error)
+        assertEquals(COSIGN_NONCE_UNKNOWN, e.details.disposition)
+    }
+
+    // An older server sends no disposition. Null must stay null so "this
+    // deployment doesn't report it" stays distinguishable from "we looked and
+    // couldn't tell".
+    @Test
+    fun cosignNonceOmittedDispositionStaysNull() {
+        val error = mapApiError(
+            "COSIGN_NONCE_USED", "refused", null,
+            details("""{"boundaryId":"bnd_old","reason":"nonce_consumed"}"""),
+        )
+        val e = assertInstanceOf(ArcaException.CosignNonceUsed::class.java, error)
+        assertNull(e.details.disposition)
     }
 
     @Test

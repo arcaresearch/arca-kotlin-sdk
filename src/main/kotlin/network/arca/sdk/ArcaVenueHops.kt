@@ -258,6 +258,24 @@ public data class CosignNonceState(
      * such a kernel an envelope is live iff it was signed over exactly this.
      */
     public val counterNonce: String? = null,
+    /**
+     * Why an unspendable slot is gone: [COSIGN_NONCE_EXECUTED],
+     * [COSIGN_NONCE_REVOKED], or [COSIGN_NONCE_UNKNOWN].
+     *
+     * `null` when [spendable] is true — an unburned slot has no burn to
+     * explain. Executed and revoked are opposite answers to "did the value
+     * move?", so do not collapse them, and do not read unknown as either one:
+     * only revoked licenses asserting that nothing moved.
+     */
+    public val disposition: String? = null,
+    /** The transaction that burned the slot, when one was found. */
+    public val txHash: String? = null,
+    /**
+     * The platform operation the burn belongs to. Present only for an executed
+     * burn the platform submitted — a revocation is the owner acting directly
+     * on the kernel, so it has no operation.
+     */
+    public val operationId: String? = null,
 )
 
 /**

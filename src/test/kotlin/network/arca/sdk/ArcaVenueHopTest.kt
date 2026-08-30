@@ -48,6 +48,9 @@ class ArcaVenueHopTest {
     /** When true, the nonce-state read answers as a pre-v7 counter kernel. */
     private var counterKernel = false
 
+    /** When set, the nonce-state read answers with this body verbatim. */
+    private var nonceStateBody: String? = null
+
     /** GET paths, kept separately so the POST-ordering assertions stay exact. */
     private val getPaths = mutableListOf<String>()
 
@@ -61,6 +64,7 @@ class ArcaVenueHopTest {
         tampered = false
         nonceUsedOnSubmit = false
         counterKernel = false
+        nonceStateBody = null
         server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
@@ -73,8 +77,10 @@ class ArcaVenueHopTest {
                     getPaths.add(path)
                 }
                 return when {
-                    path.contains("/cosign-nonces/") ->
-                        json(if (counterKernel) NONCE_STATE_COUNTER else NONCE_STATE_CONSUMED)
+                    path.contains("/cosign-nonces/") -> json(
+                        nonceStateBody
+                            ?: if (counterKernel) NONCE_STATE_COUNTER else NONCE_STATE_CONSUMED,
+                    )
                     path.contains("/custody/venue-hops/propose") ->
                         json(if (tampered) TAMPERED_PROPOSAL else PROPOSAL)
                     path.contains("/custody/venue-hops") ->
@@ -288,6 +294,30 @@ class ArcaVenueHopTest {
     }
 
     @Test
+    fun `getCosignNonceState attributes a burned slot to its execution`() = runBlocking {
+        nonceStateBody = NONCE_STATE_EXECUTED
+        val state = makeArca().getCosignNonceState("bnd_v7", "42")
+
+        // The point of the read: "spent" alone leaves the caller unable to say
+        // whether the customer's money moved. These three fields do.
+        assertEquals(COSIGN_NONCE_EXECUTED, state.disposition)
+        assertEquals("op_01k", state.operationId)
+        assertEquals("0xabc", state.txHash)
+    }
+
+    @Test
+    fun `getCosignNonceState leaves a spendable slot unattributed`() = runBlocking {
+        nonceStateBody = NONCE_STATE_SPENDABLE
+        val state = makeArca().getCosignNonceState("bnd_v7", "42")
+
+        assertTrue(state.spendable)
+        // Nothing burned it, so there is nothing to attribute. Reporting
+        // "unknown" here would read as "we couldn't tell", which is wrong.
+        assertNull(state.disposition)
+        assertNull(state.txHash)
+    }
+
+    @Test
     fun `submitVenueHop omits an unset ref so the server derives it`() = runBlocking {
         makeArca().submitVenueHop(
             path = "/op/transfer/hop-5",
@@ -380,5 +410,14 @@ class ArcaVenueHopTest {
         const val NONCE_STATE_COUNTER = """{"success":true,"data":{
             "boundaryId":"bnd_k5","nonce":"8",
             "spendable":false,"consumed":false,"unordered":false,"counterNonce":"9"}}"""
+
+        const val NONCE_STATE_EXECUTED = """{"success":true,"data":{
+            "boundaryId":"bnd_v7","nonce":"42",
+            "spendable":false,"consumed":true,"unordered":true,
+            "disposition":"executed","txHash":"0xabc","operationId":"op_01k"}}"""
+
+        const val NONCE_STATE_SPENDABLE = """{"success":true,"data":{
+            "boundaryId":"bnd_v7","nonce":"42",
+            "spendable":true,"consumed":false,"unordered":true}}"""
     }
 }

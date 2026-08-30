@@ -178,7 +178,55 @@ public data class CosignNonceUsedDetails(
     public val reason: String? = null,
     /** Human-readable remedy, always "re-propose … re-sign … resubmit". */
     public val resolution: String? = null,
+    /**
+     * Why the slot is gone — the field that tells you whether the value moved.
+     *
+     * [reason] names which nonce lane refused; this names the CAUSE, and the
+     * two causes are opposite facts about your customer's money. Branch on it
+     * before deciding whether to re-send:
+     *
+     * - [COSIGN_NONCE_EXECUTED] — the action already ran. Reconcile against
+     *   [operationId]; do **not** re-send.
+     * - [COSIGN_NONCE_REVOKED] — the owner cancelled it and nothing moved.
+     *   Safe to fail the attempt, or re-propose for a fresh approval.
+     * - [COSIGN_NONCE_UNKNOWN] — could not be established. Reconcile before
+     *   re-sending; this is not evidence that nothing happened.
+     *
+     * Always present on a current server. Treat `null` as unknown.
+     */
+    public val disposition: String? = null,
+    /** The transaction that burned the slot, when one was found. */
+    public val txHash: String? = null,
+    /**
+     * The platform operation that spent the nonce. Present only when
+     * [disposition] is [COSIGN_NONCE_EXECUTED] and the platform submitted it.
+     */
+    public val operationId: String? = null,
 )
+
+/** A sovereign signature over the slot verified and the action ran. */
+public const val COSIGN_NONCE_EXECUTED: String = "executed"
+
+/** The boundary owner retired the slot; it never ran and no value moved. */
+public const val COSIGN_NONCE_REVOKED: String = "revoked"
+
+/** The slot is spent but the attributing log was not found. */
+public const val COSIGN_NONCE_UNKNOWN: String = "unknown"
+
+/**
+ * Narrows an unrecognized disposition to [COSIGN_NONCE_UNKNOWN] rather than
+ * passing it through.
+ *
+ * A caller switches on this to decide whether to re-send money, and an `else`
+ * arm is far more likely to be written as "not executed, so nothing moved"
+ * than as "unrecognized, go reconcile". Collapsing here makes the unsafe
+ * reading unreachable. `null` stays `null`, so "this server doesn't report
+ * disposition" remains distinguishable from "we looked and couldn't tell".
+ */
+internal fun normalizeCosignDisposition(d: String?): String? = when (d) {
+    null, COSIGN_NONCE_EXECUTED, COSIGN_NONCE_REVOKED, COSIGN_NONCE_UNKNOWN -> d
+    else -> COSIGN_NONCE_UNKNOWN
+}
 
 /**
  * Extracts the spent-nonce payload from the server's `error.details`.
@@ -195,6 +243,9 @@ internal fun parseCosignNonceUsed(details: JsonObject?): CosignNonceUsedDetails?
         nonce = str("nonce"),
         reason = str("reason"),
         resolution = str("resolution"),
+        disposition = normalizeCosignDisposition(str("disposition")),
+        txHash = str("txHash"),
+        operationId = str("operationId"),
     )
 }
 
