@@ -189,6 +189,17 @@ the remedy is a deposit (relief is exactly 1:1) or a smaller native position.
 The reservation tracks *current* native notional, so it drifts as the native
 market moves — don't cache it.
 
+Which number is the ticket's authority: the streamed `availability` is.
+`watchMaxOrderSize` re-marks the book against live mids on every tick before
+deriving, so its figure tracks the native price between structural events —
+which matters because a HIP-3 market's buying power is a function of a price
+that is not its own. `getActiveAssetData` is a one-shot REST convenience that
+must agree with it, not a competing source. The venue also publishes its own
+evaluation on `collateralModel.nativeAvailableUsd` / `crossDexAvailableUsd`;
+treat those as an anchor (correct at the marks of that read, stale as soon as
+the price moves), keep deriving, and remember they are absent on older servers
+— absent is not zero.
+
 Knowing when an exchange arca can trade: creating one returns before its venue
 account exists, and until it does every trading call answers 503
 EXCHANGE_PROVISIONING. Two events replace polling for it.

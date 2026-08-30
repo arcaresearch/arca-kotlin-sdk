@@ -12,6 +12,7 @@ import network.arca.sdk.models.SimAccount
 import network.arca.sdk.models.SimFeeRates
 import network.arca.sdk.models.SimMarginSummary
 import network.arca.sdk.models.SimPosition
+import network.arca.sdk.models.revalued
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
@@ -673,5 +674,126 @@ class ActiveAssetDerivationTest {
         assertTrue(topUp!!.maxSellOpenSize!!.toDouble() > plain!!.maxSellOpenSize!!.toDouble())
         // The reduce leg is the position either way — collateral doesn't change it.
         assertEquals(topUp.maxSellReduceSize, plain.maxSellReduceSize)
+    }
+
+    // MARK: - Published availability anchor
+
+    /**
+     * The live gobi-live-beta account on 2026-08-30: a 0.00081 BTC short entered
+     * at 78850 and marked at 78798 (63.82638 notional, 1.595659 margin) against
+     * 9.98464 of spot USDC.
+     */
+    private fun anchoredState(
+        rate: String? = "0.1",
+        total: String? = "9.98464",
+        nativeAvailable: String? = null,
+        crossDexAvailable: String? = null,
+    ): ExchangeState = makeState(
+        equity = "10.030972",
+        initialMarginUsed = "1.595659",
+        positions = listOf(
+            SimPosition(
+                id = SimPositionId("pos_btc"),
+                accountId = SimAccountId("act_1"),
+                realmId = RealmId("rlm_1"),
+                market = "hl:0:BTC",
+                side = PositionSide.SHORT,
+                size = "0.00081",
+                entryPrice = "78850",
+                leverage = 40,
+                marginUsed = "1.595659",
+                positionValue = "63.82638",
+            ),
+        ),
+    ).copy(
+        collateralModel = CollateralModel(
+            crossDexReservationEnforced = true,
+            crossDexReservationRate = rate,
+            totalCollateralUsd = total,
+            nativeAvailableUsd = nativeAvailable,
+            crossDexAvailableUsd = crossDexAvailable,
+        ),
+    )
+
+    /**
+     * With every term present the client derives, so an older server that
+     * publishes no pair is fully served and a newer one changes nothing.
+     */
+    @Test
+    fun `prefers deriving whenever it can`() {
+        // 9.98464 - max(1.595659, 0.1 * 63.82638) = 3.602002, which is what HL
+        // itself answered for xyz:NVDA on this account.
+        val a = marketAvailability(anchoredState(), "hl:1:NVDA")
+        assertEquals(3.602002, a.crossDexAvailableUsd.toDouble(), 1e-4)
+    }
+
+    /**
+     * The rule is enforced but the pool is missing, so the client cannot run the
+     * arithmetic. Falling back to the NATIVE budget would hand a HIP-3 market
+     * the larger number — the one it may not spend.
+     */
+    @Test
+    fun `falls back to the published figure when a term is missing`() {
+        val a = marketAvailability(
+            anchoredState(total = null, nativeAvailable = "8.435313", crossDexAvailable = "3.602002"),
+            "hl:1:NVDA",
+        )
+        assertTrue(a.reservationEnforced)
+        assertEquals(3.602002, a.crossDexAvailableUsd.toDouble(), 1e-6)
+        assertEquals(8.435313, a.nativeAvailableUsd.toDouble(), 1e-6)
+    }
+
+    /**
+     * A published "0" is an answer, not an absence. Reading it as missing is how
+     * a market the venue will refuse at any size gets advertised as fundable.
+     */
+    @Test
+    fun `treats a published zero as a real zero`() {
+        val a = marketAvailability(
+            anchoredState(total = null, nativeAvailable = "8.435313", crossDexAvailable = "0"),
+            "hl:1:NVDA",
+        )
+        assertEquals(0.0, a.crossDexAvailableUsd.toDouble(), 1e-9)
+        // Not the native number, which is what a truthiness check would give.
+        assertEquals(8.435313, a.nativeAvailableUsd.toDouble(), 1e-6)
+    }
+
+    /**
+     * Re-marking the book is what keeps a HIP-3 market's buying power tracking
+     * the native price between structural pushes. This account is SHORT BTC, so
+     * a falling BTC price shrinks the notional, shrinks the reservation, and
+     * releases buying power to every HIP-3 dex.
+     */
+    @Test
+    fun `re-marking the book moves HIP-3 buying power`() {
+        val st = anchoredState()
+        val atMark = marketAvailability(st, "hl:1:NVDA")
+        assertEquals(3.602002, atMark.crossDexAvailableUsd.toDouble(), 1e-4)
+
+        // BTC falls: 0.00081 * 70000 = 56.7 notional, 5.67 reserved.
+        val marked = st.revalued(mapOf("hl:0:BTC" to "70000"))
+        val after = marketAvailability(marked, "hl:1:NVDA")
+        assertEquals(4.31464, after.crossDexAvailableUsd.toDouble(), 1e-4)
+        assertTrue(after.crossDexAvailableUsd.toDouble() > atMark.crossDexAvailableUsd.toDouble())
+    }
+
+    /**
+     * Re-marking must not throw away the venue's collateral rule. The Swift port
+     * rebuilt the state field by field and dropped it, which degraded every
+     * non-native market to "no reservation" — reporting the LARGER native budget
+     * as spendable on a HIP-3 dex that may not spend it. Kotlin's `copy()`
+     * carries it by construction; this pins that it stays that way.
+     */
+    @Test
+    fun `re-marking preserves the collateral model`() {
+        val marked = anchoredState(nativeAvailable = "8.435313", crossDexAvailable = "3.602002")
+            .revalued(mapOf("hl:0:BTC" to "70000"))
+        val model = marked.collateralModel
+        assertNotNull(model)
+        assertTrue(model!!.crossDexReservationEnforced)
+        assertEquals("0.1", model.crossDexReservationRate)
+        assertEquals("9.98464", model.totalCollateralUsd)
+        assertEquals("3.602002", model.crossDexAvailableUsd)
+        assertEquals("8.435313", model.nativeAvailableUsd)
     }
 }

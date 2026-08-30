@@ -92,9 +92,32 @@ internal fun resolveAvailability(
     val rate = parsePositiveDouble(model?.crossDexReservationRate)
     val total = parsePositiveDouble(model?.totalCollateralUsd)
 
-    // No declared rule (a single-pool venue), or a term the venue did not send:
-    // there is one budget and it is the ordinary one. Never guess a reservation.
-    if (model == null || !model.crossDexReservationEnforced || rate <= 0 || total <= 0) {
+    // No declared rule (a single-pool venue): one budget, and it is the
+    // ordinary one. Never guess a reservation.
+    if (model == null || !model.crossDexReservationEnforced) {
+        return ResolvedAvailability(native, native, native, false, rate)
+    }
+
+    // The rule is enforced but a term needed to evaluate it is missing. Falling
+    // through to `native` here would hand a HIP-3 market the LARGER number —
+    // the one it may not spend — so prefer the venue's own evaluation when it
+    // sent one. Read with an explicit null check, not a truthiness test: a
+    // published "0" is a real answer ("this market can open nothing"), and
+    // treating it as absent is how a $0 market gets advertised as fundable.
+    if (rate <= 0 || total <= 0) {
+        val publishedCross = model.crossDexAvailableUsd?.toDoubleOrNull()
+        if (publishedCross != null) {
+            val onNative = perpDexIndexOf(market) == 0
+            val crossDex = maxOf(0.0, publishedCross)
+            val nativeUsd = model.nativeAvailableUsd?.toDoubleOrNull()?.let { maxOf(0.0, it) } ?: native
+            return ResolvedAvailability(
+                available = if (onNative) nativeUsd else crossDex,
+                crossDex = crossDex,
+                native = nativeUsd,
+                enforced = !onNative,
+                rate = rate,
+            )
+        }
         return ResolvedAvailability(native, native, native, false, rate)
     }
 

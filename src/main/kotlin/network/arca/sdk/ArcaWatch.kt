@@ -893,9 +893,23 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
 
     fun recompute(): ActiveAssetData? {
         val exState = exchangeStateBox.value ?: return null
-        val markPx = priceStream.prices.value[options.market]?.toDoubleOrNull() ?: 0.0
+        val mids = priceStream.prices.value
+        val markPx = mids[options.market]?.toDoubleOrNull() ?: 0.0
+        // Re-mark the book against current mids before deriving.
+        //
+        // Load-bearing for HIP-3 markets, not merely a freshness nicety: the
+        // cross-dex reservation is `max(margin, rate * NOTIONAL)` of the
+        // venue-native position, and notional is read off `positionValue`. A
+        // book left at the marks of the last structural push holds the shared
+        // pool still while the price it depends on moves, so a HIP-3 market's
+        // buying power would sit at a stale number until the next fill or
+        // funding event — hours, on a quiet account.
+        //
+        // `totalCollateralUsd` is spot cash and price-invariant by
+        // construction, so re-marking positions is the whole of what moves.
+        val marked = if (mids.isEmpty()) exState else exState.revalued(mids)
         return deriveActiveAssetData(
-            exchangeState = exState,
+            exchangeState = marked,
             market = options.market,
             markPx = markPx,
             leverage = options.leverage,

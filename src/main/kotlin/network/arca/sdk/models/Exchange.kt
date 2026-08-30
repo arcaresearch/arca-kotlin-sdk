@@ -266,6 +266,21 @@ public data class CollateralModel(
      * the mark.
      */
     public val totalCollateralUsd: String? = null,
+    /**
+     * The venue's own evaluation of its rule, at the marks of this read.
+     *
+     * An **anchor**, not a substitute for deriving: [crossDexAvailableUsd] is a
+     * fraction of live native notional, so it goes stale as soon as the mark
+     * moves. A client driving a slider keeps recomputing from
+     * [totalCollateralUsd] (cash, which does not move) plus re-marked positions
+     * — see [marketAvailability] — and treats these as what that recomputation
+     * should equal at the instant of the read.
+     *
+     * Absent on venues that declare no rule, and on servers older than
+     * 2026-08-30. Absent is not zero.
+     */
+    public val nativeAvailableUsd: String? = null,
+    public val crossDexAvailableUsd: String? = null,
 )
 
 /**
