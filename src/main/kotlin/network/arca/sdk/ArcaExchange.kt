@@ -67,7 +67,22 @@ import kotlin.math.roundToLong
  *
  * @param ref Full Arca path (e.g. `/exchanges/hl1`).
  * @param venue Venue the exchange object trades against — `"hl-sim"` (default)
- *   provisions a simulated Hyperliquid account; `"hl"` provisions a live one.
+ *   provisions a simulated Hyperliquid account; `"hl"` provisions a live one;
+ *   `"gll-testnet"` provisions an account on LayerZero's ATLAS testnet CLOB
+ *   (development realms only, gated by the platform's GLL feature flag). A
+ *   bare `"gll"` is NOT accepted — that token is reserved for a future GLL
+ *   mainnet.
+ *
+ *   ATLAS notes: markets carry the `gllt` prefix and NUMERIC canonical ids
+ *   (`gllt:3`) with no human meaning, so resolve rather than build —
+ *   `resolveMarkets("BTC", exchange = "gllt")`, then use `market.name`. The
+ *   symbol is the base asset (`"BTC"`), not the venue symbol
+ *   (`"BTC-USD-PERP"`, which is `market.venueSymbol` and display text only).
+ *   Leverage is fixed per market (10x on the crypto perps) and `setLeverage`
+ *   refuses; there is no TP/SL or TWAP in v1. The book is SHARED and PUBLIC
+ *   and the venue is a testnet its operator can reset without notice — both
+ *   belong in user-facing copy. A one-time ~1 USDT activation fee is charged
+ *   on first activity.
  * @param operationPath Optional idempotency key.
  */
 public fun Arca.ensurePerpsExchange(
