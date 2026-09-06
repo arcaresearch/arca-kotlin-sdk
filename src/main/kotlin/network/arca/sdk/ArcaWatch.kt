@@ -1,6 +1,8 @@
 package network.arca.sdk
 
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -493,6 +495,19 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         }
     }
 
+    // Capability changes have no fill event on a quiet account.
+    jobs += scope.launch {
+        while (true) {
+            delay((structural.value?.stateRefreshIntervalMs ?: 30000L).coerceIn(5000L, 60000L))
+            if ((structural.value?.stateRefreshIntervalMs ?: 0L) <= 0L) continue
+            val fresh = runCatching { getExchangeState(objectId) }.getOrNull()
+            coroutineContext.ensureActive()
+            if (fresh == null) continue
+            structural.value = fresh
+            stream.push(fresh.revalued(mids.value))
+        }
+    }
+
     stream.stopAction = {
         jobs.forEach { it.cancel() }
         ws.unwatchPath(objectPath)
@@ -981,6 +996,21 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     }
 
     if (stream.activeAssetData.value != null) stream.setState(WatchStreamState.CONNECTED)
+
+    // Capability changes have no fill event on a quiet account.
+    jobs += scope.launch {
+        while (true) {
+            delay((exchangeStateBox.value?.stateRefreshIntervalMs ?: 30000L).coerceIn(5000L, 60000L))
+            if ((exchangeStateBox.value?.stateRefreshIntervalMs ?: 0L) <= 0L) continue
+            val fresh = runCatching { getExchangeState(options.objectId) }.getOrNull()
+            coroutineContext.ensureActive()
+            if (fresh == null) continue
+            exchangeStateBox.value = fresh
+            val data = if (fresh.pricingMode == network.arca.sdk.models.PricingMode.SERVER) fetchServerActiveAssetData() else recompute()
+            coroutineContext.ensureActive()
+            data?.let { stream.push(it) }
+        }
+    }
 
     stream.stopAction = {
         jobs.forEach { it.cancel() }

@@ -173,8 +173,8 @@ public fun SimPosition.revalued(mids: Map<String, String>): SimPosition {
  */
 internal fun SimMarginSummary.revalued(positions: List<SimPosition>): SimMarginSummary {
     val totalPnl = positions.fold(BigDecimal.ZERO) { sum, pos -> sum + parseDecimalOrZero(pos.unrealizedPnl ?: "0") }
-    val rawUsd = parseDecimalOrZero(totalRawUsd)
-    val eq = if (rawUsd.signum() > 0) rawUsd + totalPnl else parseDecimalOrZero(equity)
+    val rawUsd = totalRawUsd?.toBigDecimalOrNull()
+    val eq = if (rawUsd != null) rawUsd + totalPnl else parseDecimalOrZero(equity)
     val maintenance = parseDecimalOrZero(maintenanceMarginRequired)
     val withdrawable = (eq - maintenance).max(BigDecimal.ZERO)
     return copy(
@@ -193,7 +193,7 @@ public fun ExchangeState.revalued(mids: Map<String, String>): ExchangeState {
     if (pricingMode == PricingMode.SERVER) return this
     val newPositions = positions.map { it.revalued(mids) }
     val newSummary = marginSummary.revalued(newPositions)
-    val newCross = crossMarginSummary?.revalued(newPositions)
+    val newCross = crossMarginSummary?.revalued(newPositions.filter { it.marginMode == MarginMode.CROSS })
     return copy(
         marginSummary = newSummary,
         crossMarginSummary = newCross,
