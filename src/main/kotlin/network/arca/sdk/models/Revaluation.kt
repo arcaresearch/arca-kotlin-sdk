@@ -190,7 +190,7 @@ internal fun SimMarginSummary.revalued(positions: List<SimPosition>): SimMarginS
  * (orders, account, margins, intents) is preserved unchanged.
  */
 public fun ExchangeState.revalued(mids: Map<String, String>): ExchangeState {
-    if (pricingMode == PricingMode.SERVER) return this
+    if (pricingMode == PricingMode.SERVER || tradingAllocation != null) return this
     val newPositions = positions.map { it.revalued(mids) }
     val newSummary = marginSummary.revalued(newPositions)
     val newCross = crossMarginSummary?.revalued(newPositions)

@@ -214,6 +214,8 @@ public data class ExchangeState(
      * not declared a model, which clients read as "no reservation".
      */
     public val collateralModel: CollateralModel? = null,
+    /** Platform mirror allocation; absent until the capability is enabled. */
+    public val tradingAllocation: TradingAllocationState? = null,
 )
 
 /**
