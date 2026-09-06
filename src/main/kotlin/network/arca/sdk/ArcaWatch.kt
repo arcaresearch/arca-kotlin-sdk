@@ -17,6 +17,8 @@ import network.arca.sdk.models.MarginTier
 import network.arca.sdk.models.ObjectValuation
 import network.arca.sdk.models.RealmEvent
 import network.arca.sdk.models.revalued
+import java.time.Instant
+import java.time.Duration
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -434,11 +436,46 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     val structural = MutableStateFlow<ExchangeState?>(null)
     val mids = MutableStateFlow<Map<String, String>>(emptyMap())
     val jobs = mutableListOf<Job>()
+    val observationLock = Any()
+    var observationEpoch = 0L
+    var expiryJob: Job? = null
+    fun armExpiry(state: ExchangeState, epoch: Long): Boolean {
+        expiryJob?.cancel()
+        expiryJob = null
+        val allocation = state.tradingAllocation ?: return true
+        val rawDeadline = allocation.validUntil ?: return true
+        val remaining = runCatching {
+            val deadline = Instant.parse(rawDeadline)
+            val asOf = allocation.asOf?.let(Instant::parse) ?: Instant.now()
+            minOf(Duration.between(Instant.now(), deadline).toMillis(), Duration.between(asOf, deadline).toMillis())
+        }.getOrDefault(0)
+        if (remaining <= 0) {
+            structural.value = null
+            stream.exchangeStateMut.value = null
+            stream.setState(WatchStreamState.RECONNECTING)
+            return false
+        }
+        expiryJob = scope.launch {
+            delay(minOf(remaining, 86_400_000))
+            synchronized(observationLock) {
+                if (observationEpoch == epoch) {
+                    observationEpoch++
+                    structural.value = null
+                    stream.exchangeStateMut.value = null
+                    stream.setState(WatchStreamState.RECONNECTING)
+                }
+            }
+        }
+        return true
+    }
+
 
     val initial = getExchangeState(objectId)
-    structural.value = initial
-    stream.exchangeStateMut.value = initial
-    stream.setState(WatchStreamState.CONNECTED)
+    if (armExpiry(initial, 0)) {
+        structural.value = initial
+        stream.exchangeStateMut.value = initial
+        stream.setState(WatchStreamState.CONNECTED)
+    }
 
     jobs += scope.launch {
         ws.statusStream.collect { s ->
@@ -446,16 +483,21 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
                 stream.setState(WatchStreamState.RECONNECTING)
             } else if (s == ConnectionStatus.CONNECTED && stream.state.value == WatchStreamState.RECONNECTING) {
                 try {
+                    val epoch = synchronized(observationLock) { observationEpoch }
                     val refreshed = getExchangeState(objectId)
-                    structural.value = refreshed
-                    val cur = mids.value
-                    stream.exchangeStateMut.value = if (cur.isEmpty()) refreshed else refreshed.revalued(cur)
+                    synchronized(observationLock) {
+                        if (epoch == observationEpoch && armExpiry(refreshed, ++observationEpoch)) {
+                            structural.value = refreshed
+                            val cur = mids.value
+                            stream.exchangeStateMut.value = if (cur.isEmpty()) refreshed else refreshed.revalued(cur)
+                            stream.setState(WatchStreamState.CONNECTED)
+                        }
+                    }
                 } catch (e: Throwable) {
                     log.warning("watch", e, mapOf("objectId" to objectId)) {
                         "exchange state refresh on reconnect failed"
                     }
                 }
-                stream.setState(WatchStreamState.CONNECTED)
             }
         }
     }
@@ -466,6 +508,16 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     jobs += scope.launch {
         ws.exchangeNotifications().collect { event ->
             if (event.entityId != objectId && event.entityPath != objectPath) return@collect
+            val epoch = synchronized(observationLock) { ++observationEpoch }
+            if (event.exchangeStateUnavailable == true) {
+                synchronized(observationLock) {
+                    expiryJob?.cancel()
+                    structural.value = null
+                    stream.exchangeStateMut.value = null
+                    stream.setState(WatchStreamState.RECONNECTING)
+                }
+                return@collect
+            }
             val structuralState: ExchangeState = run {
                 val inline = event.exchangeState
                 if (inline != null && hasInlineStructuralExchangeState(inline)) {
@@ -479,21 +531,29 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
                     }
                 }
             }
-            structural.value = structuralState
-            val cur = mids.value
-            stream.push(if (cur.isEmpty()) structuralState else structuralState.revalued(cur))
+            synchronized(observationLock) {
+                if (epoch == observationEpoch && armExpiry(structuralState, ++observationEpoch)) {
+                    structural.value = structuralState
+                    val cur = mids.value
+                    stream.setState(WatchStreamState.CONNECTED)
+                    stream.push(if (cur.isEmpty()) structuralState else structuralState.revalued(cur))
+                }
+            }
         }
     }
 
     jobs += scope.launch {
         ws.midsEvents().collect { m ->
             mids.update { it + m }
-            val base = structural.value ?: return@collect
-            stream.push(base.revalued(mids.value))
+            synchronized(observationLock) {
+                val base = structural.value
+                if (base != null) stream.push(base.revalued(mids.value))
+            }
         }
     }
 
     stream.stopAction = {
+        synchronized(observationLock) { expiryJob?.cancel(); observationEpoch++ }
         jobs.forEach { it.cancel() }
         ws.unwatchPath(objectPath)
         ws.releaseMids()

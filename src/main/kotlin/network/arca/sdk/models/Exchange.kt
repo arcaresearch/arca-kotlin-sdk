@@ -216,6 +216,8 @@ public data class ExchangeState(
     public val collateralModel: CollateralModel? = null,
     /** Platform mirror allocation; absent until the capability is enabled. */
     public val tradingAllocation: TradingAllocationState? = null,
+    public val financialInputId: String? = null,
+    public val mirrorUnsettledFunding: String? = null,
 )
 
 /**
@@ -459,15 +461,24 @@ public data class OrderBreakdown(
 public data class UpdateLeverageResponse(
     public val accountId: String,
     public val market: String,
-    public val leverage: Int,
-    public val previousLeverage: Int,
+    /** Null when GLL applicable risk is unavailable; never zero. */
+    public val leverage: Int?,
+    public val previousLeverage: Int?,
+    public val mode: LeveragePreferenceMode? = null,
+    public val intendedLeverage: Int? = null,
+    public val revision: String? = null,
+    public val projectionUnavailable: Boolean? = null,
+    public val commandId: String? = null,
 )
 
 @Serializable
 public data class LeverageSetting(
     public val market: String,
-    public val leverage: Int,
+    public val leverage: Int?,
     public val marginMode: MarginMode,
+    public val mode: LeveragePreferenceMode? = null,
+    public val intendedLeverage: Int? = null,
+    public val inputId: String? = null,
 )
 
 @Serializable

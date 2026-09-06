@@ -44,10 +44,59 @@ public data class TradingAllocationProjection(
 
 @Serializable
 public data class TradingAllocationState(
+    public val asOf: String? = null,
+    public val validUntil: String? = null,
     public val revision: String,
     /** Includes preferences for flat markets. */
     public val preferences: Map<String, TradingLeveragePreference>,
     public val projection: TradingAllocationProjection? = null,
     /** A missing projection means unavailable facts, not zero collateral. */
     public val projectionUnavailable: Boolean,
+)
+
+@Serializable
+public data class TradingLeverageSelection(
+    public val mode: LeveragePreferenceMode? = null,
+    public val leverage: Int? = null,
+)
+
+@Serializable
+public data class TradingAllocationRead(
+    public val enabled: Boolean,
+    public val inputId: String,
+    public val allocation: TradingAllocationState,
+    public val unavailableReason: String? = null,
+)
+
+/** Estimate only. orderType is lowercase "market" or "limit". */
+@Serializable
+public data class TradingAllocationQuoteRequest(
+    public val market: String,
+    public val side: OrderSide,
+    public val orderType: String,
+    public val price: String? = null,
+    public val size: String? = null,
+    public val slippageBps: Int? = null,
+    public val reduceOnly: Boolean = false,
+    public val selection: TradingLeverageSelection = TradingLeverageSelection(),
+)
+
+@Serializable
+public data class TradingAllocationMaximum(
+    public val revision: String,
+    public val maxSize: String,
+    public val maxNotional: String,
+    public val projection: TradingAllocationProjection? = null,
+)
+
+@Serializable
+public data class TradingAllocationQuote(
+    public val inputId: String,
+    public val market: String,
+    public val referencePrice: String,
+    public val limitPrice: String,
+    public val allocation: TradingAllocationState,
+    public val maximum: TradingAllocationMaximum,
+    public val affordable: Boolean? = null,
+    public val orderProjection: TradingAllocationProjection? = null,
 )

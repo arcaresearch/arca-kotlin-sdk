@@ -4,6 +4,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -12,8 +13,10 @@ import okhttp3.mockwebserver.RecordedRequest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.time.Instant
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -57,6 +60,39 @@ class ExchangeStateWatchTest {
         assertEquals(1, state!!.pendingIntents?.size)
         assertEquals(1, dispatcher.stateRequestCount, "inline state must not trigger a refetch")
 
+        stream.stop()
+        arca.close()
+    }
+
+    @Test
+    fun unavailableStateClearsMoneyWithoutRefetchAndRecoversOnPush() = runBlocking {
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        delay(150) // The notification collector is registered by the launched watch task.
+        arca.ws.injectMessage("""{"type":"exchange.updated","entityId":"obj_1","exchangeStateUnavailable":true}""")
+        withTimeout(2_000) { stream.exchangeState.first { it == null } }
+        assertNull(stream.exchangeState.value)
+        assertEquals(1, dispatcher.stateRequestCount)
+        arca.ws.injectMessage(EXCHANGE_UPDATED_INLINE)
+        withTimeout(2_000) { stream.exchangeState.first { it?.marginSummary?.equity == "1200" } }
+        assertEquals(WatchStreamState.CONNECTED, stream.state.value)
+        assertEquals(1, dispatcher.stateRequestCount)
+        stream.stop()
+        arca.close()
+    }
+
+    @Test
+    fun quietMirrorObservationExpiresWithoutRefetch() = runBlocking {
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        delay(150)
+        val now = Instant.now()
+        val allocation = """"tradingAllocation":{"revision":"1","preferences":{},"projectionUnavailable":false,"asOf":"$now","validUntil":"${now.plusMillis(250)}"},"""
+        arca.ws.injectMessage(EXCHANGE_UPDATED_INLINE.replace("\"exchangeState\": {", "\"exchangeState\": {$allocation"))
+        withTimeout(2_000) { stream.exchangeState.first { it?.tradingAllocation != null } }
+        withTimeout(2_000) { stream.exchangeState.first { it == null } }
+        assertNull(stream.exchangeState.value)
+        assertEquals(1, dispatcher.stateRequestCount)
         stream.stop()
         arca.close()
     }

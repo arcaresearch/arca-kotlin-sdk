@@ -21,6 +21,7 @@ import network.arca.sdk.models.CreateArcaObjectResponse
 import network.arca.sdk.models.ExchangeState
 import network.arca.sdk.models.FeeTarget
 import network.arca.sdk.models.FillListResponse
+import network.arca.sdk.models.LeveragePreferenceMode
 import network.arca.sdk.models.LeverageSetting
 import network.arca.sdk.models.MarginMode
 import network.arca.sdk.models.Market
@@ -155,11 +156,14 @@ public suspend fun Arca.getAssetFees(
 public suspend fun Arca.updateLeverage(
     objectId: String,
     market: String,
-    leverage: Int,
+    leverage: Int? = null,
+    mode: LeveragePreferenceMode? = null,
+    commandId: String? = null,
 ): UpdateLeverageResponse {
+    val command = commandId ?: if (market.startsWith("gllt:")) UUID.randomUUID().toString() else null
     val body = arcaJson.encodeToJsonElement(
         UpdateLeverageRequest.serializer(),
-        UpdateLeverageRequest(market = market, leverage = leverage),
+        UpdateLeverageRequest(market = market, leverage = if (mode == LeveragePreferenceMode.VENUE_DEFAULT) null else leverage, mode = mode, commandId = command),
     )
     return client.post("/objects/$objectId/exchange/leverage", body = body)
 }
@@ -269,6 +273,8 @@ public fun Arca.placeOrder(
     maxSizeTolerance: Double? = null,
     isolated: Boolean? = null,
     ocoGroupId: String? = null,
+    leverageMode: LeveragePreferenceMode? = null,
+    slippageBps: Int? = null,
 ): OrderHandle {
     val effectiveTolerance = sizeTolerance ?: maxSizeTolerance
     val inner = operationHandle<OrderOperationResponse> {
@@ -296,6 +302,7 @@ public fun Arca.placeOrder(
                 sizeTolerance = effectiveTolerance,
                 isolated = if (isolated == true) true else null,
                 ocoGroupId = ocoGroupId,
+                leverageMode = leverageMode, slippageBps = slippageBps,
             ),
         )
         client.post<OrderOperationResponse>("/objects/$objectId/exchange/orders", body = body)
@@ -1429,7 +1436,9 @@ private data class CreateExchangeRequest(
 @Serializable
 private data class UpdateLeverageRequest(
     val market: String,
-    val leverage: Int,
+    val leverage: Int?,
+    val mode: LeveragePreferenceMode?,
+    val commandId: String?,
 )
 
 @Serializable
@@ -1467,6 +1476,8 @@ private data class PlaceOrderRequest(
     val sizeTolerance: Double? = null,
     val isolated: Boolean? = null,
     val ocoGroupId: String? = null,
+    val leverageMode: LeveragePreferenceMode? = null,
+    val slippageBps: Int? = null,
 )
 
 @Serializable

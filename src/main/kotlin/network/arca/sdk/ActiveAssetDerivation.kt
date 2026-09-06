@@ -214,6 +214,8 @@ public fun deriveActiveAssetData(
     askRatio: Double = 1.0,
     bidRatio: Double = 1.0,
 ): ActiveAssetData? {
+    // Allocation sizing must use the exact mirror quote, including pending commitments.
+    if (exchangeState.tradingAllocation != null) return null
     if (!markPx.isFinite() || markPx <= 0 || leverage <= 0) return null
 
     // Cross bucket, not the account-wide summary. The server budgets orders from
