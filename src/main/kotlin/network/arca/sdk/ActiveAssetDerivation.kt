@@ -5,6 +5,7 @@ import network.arca.sdk.models.AvailabilityBreakdown
 import network.arca.sdk.models.ExchangeState
 import network.arca.sdk.models.LeverageInfo
 import network.arca.sdk.models.LeverageType
+import network.arca.sdk.models.MarginMode
 import network.arca.sdk.models.MarginTier
 import network.arca.sdk.models.OrderSide
 import network.arca.sdk.models.PositionSide
@@ -86,11 +87,14 @@ internal fun resolveAvailability(
     market: String,
     equity: Double,
     initialMarginUsed: Double,
+    excludingMarket: String? = null,
+    collateralDelta: Double = 0.0,
 ): ResolvedAvailability {
     val native = maxOf(0.0, equity - initialMarginUsed)
     val model = exchangeState.collateralModel
     val rate = parsePositiveDouble(model?.crossDexReservationRate)
-    val total = parsePositiveDouble(model?.totalCollateralUsd)
+    val totalInput = model?.totalCollateralUsd?.toDoubleOrNull()
+    val total = (totalInput ?: 0.0) + collateralDelta
 
     // No declared rule (a single-pool venue): one budget, and it is the
     // ordinary one. Never guess a reservation.
@@ -104,7 +108,11 @@ internal fun resolveAvailability(
     // sent one. Read with an explicit null check, not a truthiness test: a
     // published "0" is a real answer ("this market can open nothing"), and
     // treating it as absent is how a $0 market gets advertised as fundable.
-    if (rate <= 0 || total <= 0) {
+    if (rate <= 0 || totalInput == null || !totalInput.isFinite()) {
+        if (excludingMarket != null) {
+            val onNative = perpDexIndexOf(market) == 0
+            return ResolvedAvailability(if (onNative) native else 0.0, 0.0, native, !onNative, rate)
+        }
         val publishedCross = model.crossDexAvailableUsd?.toDoubleOrNull()
         if (publishedCross != null) {
             val onNative = perpDexIndexOf(market) == 0
@@ -125,8 +133,9 @@ internal fun resolveAvailability(
     var notionalNative = 0.0
     var marginOtherDexes = 0.0
     for (p in exchangeState.positions) {
+        if (p.market == excludingMarket) continue
         val d = perpDexIndexOf(p.market) ?: continue
-        val mu = parsePositiveDouble(p.marginUsed)
+        val mu = if (p.marginMode == MarginMode.ISOLATED) p.isolatedMargin?.toDoubleOrNull() ?: parsePositiveDouble(p.marginUsed) else parsePositiveDouble(p.marginUsed)
         if (d == 0) {
             marginNative += mu
             notionalNative += parsePositiveDouble(p.positionValue)
@@ -174,7 +183,7 @@ public fun marketAvailability(exchangeState: ExchangeState, market: String): Ava
     val a = resolveAvailability(
         exchangeState,
         market,
-        parsePositiveDouble(summary.equity),
+        (summary.equity.toDoubleOrNull()?.takeIf { it.isFinite() } ?: 0.0),
         parsePositiveDouble(summary.initialMarginUsed),
     )
     return AvailabilityBreakdown(
@@ -227,7 +236,7 @@ public fun deriveActiveAssetData(
     // servers that do not send the cross bucket (identical when nothing is
     // isolated).
     val summary = exchangeState.crossMarginSummary ?: exchangeState.marginSummary
-    val equity = parsePositiveDouble(summary.equity)
+    val equity = (summary.equity.toDoubleOrNull()?.takeIf { it.isFinite() } ?: 0.0)
     val initialMarginUsed = parsePositiveDouble(summary.initialMarginUsed)
     val hasPositions = exchangeState.positions.isNotEmpty()
     val availableGuard = if (hasPositions) 0.97 else 1.0
@@ -307,8 +316,14 @@ public fun deriveActiveAssetData(
         // releases that full amount. Mirrors the server's lockedCollateral().
         val isolated = parsePositiveDouble(currentPosition.isolatedMargin)
         val posMargin = if (isolated > 0) isolated else parsePositiveDouble(currentPosition.marginUsed)
-        val closeFees = posSize * markPx * feeRate * SAFETY_MARGIN_FACTOR
-        val availableAfterClose = maxOf(0.0, available + posMargin - closeFees)
+        val closePx = if (currentPosition.side == PositionSide.LONG) sellPx else buyPx
+        val closePnl = (closePx - (currentPosition.entryPrice?.toDoubleOrNull() ?: closePx)) * posSize * (if (currentPosition.side == PositionSide.LONG) 1 else -1)
+        val oldCrossPnl = if (currentPosition.marginMode == MarginMode.CROSS) currentPosition.unrealizedPnl?.toDoubleOrNull() ?: 0.0 else 0.0
+        val isolatedFunding = if (currentPosition.marginMode == MarginMode.ISOLATED) currentPosition.unsettledFundingUsd?.toDoubleOrNull() ?: 0.0 else 0.0
+        val closeFees = posSize * closePx * feeRate * SAFETY_MARGIN_FACTOR
+        val afterClose = resolveAvailability(exchangeState, market,
+            equity + posMargin + closePnl - oldCrossPnl + isolatedFunding, initialMarginUsed, market, closePnl + isolatedFunding)
+        val availableAfterClose = maxOf(0.0, (afterClose.available - closeFees) * availableGuard)
 
         when (currentPosition.side) {
             PositionSide.LONG -> {

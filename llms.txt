@@ -179,13 +179,12 @@ val a = marketAvailability(state, "hl:1:NVDA")
 
 The venue states the rule on `ExchangeState.collateralModel`
 (`crossDexReservationEnforced`, `crossDexReservationRate`, `totalCollateralUsd`);
-**absent means no reservation**. The `hl-sim` paper venue has a single pool and
-declares nothing, even though it publishes the same `hl:<dex>:<symbol>` ids — so
-one code path renders correctly on both venues, and turning it on for a venue is
-a server config change that already-shipped clients follow. Don't show a single
-account-wide "available" figure next to a market; the two numbers legitimately
-disagree. A zero is never a "try smaller" — the venue refuses at any size, so
-the remedy is a deposit (relief is exactly 1:1) or a smaller native position.
+**absent means no reservation**. The `hl-sim` paper venue defaults to one pool;
+its account/realm policy can opt into the same two-budget contract. Check the
+capability, never infer it from `hl:<dex>:<symbol>` identifiers. Opening zero
+still permits valid reducing trades. Reducing native notional releases the
+reservation; lowering leverage at fixed notional does not. Additional collateral
+only helps where the product actually supports adding it.
 The reservation tracks *current* native notional, so it drifts as the native
 market moves — don't cache it.
 
@@ -199,6 +198,16 @@ evaluation on `collateralModel.nativeAvailableUsd` / `crossDexAvailableUsd`;
 treat those as an anchor (correct at the marks of that read, stale as soon as
 the price moves), keep deriving, and remember they are absent on older servers
 — absent is not zero.
+
+Venues can advertise `stateRefreshIntervalMs`; account and max-size watches
+then refresh even without trades or ticks (clamped to 5–60 seconds, canceled on
+stop). Paper advertises 15000 with the reservation on or off. Failed reads retry
+without erasing the last state; newer events supersede in-flight refreshes.
+Allocation expiry and explicit unavailability still invalidate financial inputs.
+This is a refresh attempt interval, not a network
+freshness guarantee. Revaluation excludes isolated P&L from the cross bucket;
+reversals recompute the remaining book, and `unsettledFundingUsd` is settled once
+when an isolated position closes. Complete zero/negative collateral is valid.
 
 Knowing when an exchange arca can trade: creating one returns before its venue
 account exists, and until it does every trading call answers 503

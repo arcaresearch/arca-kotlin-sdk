@@ -97,6 +97,36 @@ class ExchangeStateWatchTest {
         arca.close()
     }
 
+    @Test
+    fun quietPaperRefreshLearnsPolicyAndStopsAtTeardown() = runBlocking {
+        dispatcher.refreshScenario = "quiet"
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        assertNull(stream.exchangeState.value?.collateralModel)
+        withTimeout(7_000) { stream.exchangeState.first { it?.collateralModel?.crossDexReservationEnforced == true } }
+        assertEquals("0", stream.exchangeState.value?.collateralModel?.crossDexAvailableUsd)
+        stream.stop()
+        val count = dispatcher.stateRequestCount
+        delay(5_200)
+        assertEquals(count, dispatcher.stateRequestCount)
+        arca.close()
+    }
+
+    @Test
+    fun delayedQuietRefreshCannotReplaceNewerExchangeEvent() = runBlocking {
+        dispatcher.refreshScenario = "delayed"
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        withTimeout(7_000) { while (dispatcher.stateRequestCount < 2) delay(20) }
+        arca.ws.injectMessage(EXCHANGE_UPDATED_INLINE)
+        withTimeout(1_000) { stream.exchangeState.first { it?.marginSummary?.equity == "1200" } }
+        delay(1_300)
+        assertEquals("1200", stream.exchangeState.value?.marginSummary?.equity)
+        assertNull(stream.exchangeState.value?.collateralModel, "stale refresh must be discarded")
+        stream.stop()
+        arca.close()
+    }
+
     // MARK: - Helpers
 
     private fun makeArca(): Arca = Arca(token = fakeJwt(), baseUrl = server.url("/").toString().trimEnd('/'))
@@ -129,6 +159,7 @@ class ExchangeStateWatchTest {
 }
 
 private class StateDispatcher : Dispatcher() {
+    @Volatile var refreshScenario = "normal"
     private val stateCount = AtomicInteger(0)
     val stateRequestCount: Int get() = stateCount.get()
 
@@ -136,8 +167,18 @@ private class StateDispatcher : Dispatcher() {
         val path = (request.path ?: "").substringBefore("?")
         return when {
             path.endsWith("/exchange/state") -> {
-                stateCount.incrementAndGet()
-                json(STATE_BODY)
+                val count = stateCount.incrementAndGet()
+                var body = STATE_BODY
+                if (refreshScenario != "normal") {
+                    body = body.replace("\"account\":", "\"stateRefreshIntervalMs\":5000,\"account\":")
+                    if (count > 1) {
+                        val model = """"collateralModel":{"crossDexReservationEnforced":true,"crossDexReservationRate":"0.1","totalCollateralUsd":"1000","nativeAvailableUsd":"500","crossDexAvailableUsd":"0"},"""
+                        body = body.replace("\"account\":", model + "\"account\":")
+                    }
+                }
+                json(body).apply {
+                    if (refreshScenario == "delayed" && count > 1) setBodyDelay(1, java.util.concurrent.TimeUnit.SECONDS)
+                }
             }
             path.endsWith("/objects/obj_1") -> json(OBJECT_DETAIL)
             else -> MockResponse().setResponseCode(404)

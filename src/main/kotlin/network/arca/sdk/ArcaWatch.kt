@@ -1,6 +1,8 @@
 package network.arca.sdk
 
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -552,6 +554,25 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         }
     }
 
+    // Capability changes have no fill event on a quiet account.
+    jobs += scope.launch {
+        while (true) {
+            delay((structural.value?.stateRefreshIntervalMs ?: 30000L).coerceIn(5000L, 60000L))
+            if ((structural.value?.stateRefreshIntervalMs ?: 0L) <= 0L) continue
+            val epoch = synchronized(observationLock) { observationEpoch }
+            val fresh = runCatching { getExchangeState(objectId) }.getOrNull()
+            coroutineContext.ensureActive()
+            if (fresh == null) continue
+            synchronized(observationLock) {
+                if (epoch == observationEpoch && armExpiry(fresh, ++observationEpoch)) {
+                    structural.value = fresh
+                    stream.setState(WatchStreamState.CONNECTED)
+                    stream.push(fresh.revalued(mids.value))
+                }
+            }
+        }
+    }
+
     stream.stopAction = {
         synchronized(observationLock) { expiryJob?.cancel(); observationEpoch++ }
         jobs.forEach { it.cancel() }
@@ -949,6 +970,8 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     }
 
     val exchangeStateBox = MutableStateFlow<ExchangeState?>(initialExchangeState)
+    val observationLock = Any()
+    var observationEpoch = 0L
     val jobs = mutableListOf<Job>()
 
     fun recompute(): ActiveAssetData? {
@@ -1014,18 +1037,29 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     jobs += scope.launch {
         ws.exchangeNotifications().collect { event ->
             if (event.entityId != options.objectId && event.entityPath != objectPath) return@collect
+            val epoch = synchronized(observationLock) { ++observationEpoch }
             val nextState = event.exchangeState ?: run {
                 runCatching { getExchangeState(options.objectId) }.getOrNull() ?: return@collect
             }
-            exchangeStateBox.value = nextState
+            coroutineContext.ensureActive()
+            val accepted = synchronized(observationLock) {
+                if (epoch != observationEpoch) false else {
+                    exchangeStateBox.value = nextState
+                    true
+                }
+            }
+            if (!accepted) return@collect
             val data = if (nextState.pricingMode == network.arca.sdk.models.PricingMode.SERVER) {
                 fetchServerActiveAssetData()
             } else {
                 recompute()
             }
-            if (data != null) {
-                stream.push(data)
-                stream.setState(WatchStreamState.CONNECTED)
+            coroutineContext.ensureActive()
+            synchronized(observationLock) {
+                if (epoch == observationEpoch && data != null) {
+                    stream.push(data)
+                    stream.setState(WatchStreamState.CONNECTED)
+                }
             }
         }
     }
@@ -1041,6 +1075,34 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     }
 
     if (stream.activeAssetData.value != null) stream.setState(WatchStreamState.CONNECTED)
+
+    // Capability changes have no fill event on a quiet account.
+    jobs += scope.launch {
+        while (true) {
+            delay((exchangeStateBox.value?.stateRefreshIntervalMs ?: 30000L).coerceIn(5000L, 60000L))
+            if ((exchangeStateBox.value?.stateRefreshIntervalMs ?: 0L) <= 0L) continue
+            // A delayed REST refresh must not replace a newer exchange event.
+            val epoch = synchronized(observationLock) { observationEpoch }
+            val fresh = runCatching { getExchangeState(options.objectId) }.getOrNull()
+            coroutineContext.ensureActive()
+            if (fresh == null) continue
+            val accepted = synchronized(observationLock) {
+                if (epoch != observationEpoch) false else {
+                    exchangeStateBox.value = fresh
+                    true
+                }
+            }
+            if (!accepted) continue
+            val data = if (fresh.pricingMode == network.arca.sdk.models.PricingMode.SERVER) fetchServerActiveAssetData() else recompute()
+            coroutineContext.ensureActive()
+            synchronized(observationLock) {
+                if (epoch == observationEpoch && data != null) {
+                    stream.push(data)
+                    stream.setState(WatchStreamState.CONNECTED)
+                }
+            }
+        }
+    }
 
     stream.stopAction = {
         jobs.forEach { it.cancel() }

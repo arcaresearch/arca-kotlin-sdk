@@ -45,6 +45,7 @@ public data class SimPosition(
     public val marginMode: MarginMode = MarginMode.CROSS,
     /** Locked collateral for an isolated position; null for cross positions. */
     public val isolatedMargin: String? = null,
+    public val unsettledFundingUsd: String? = null,
     public val liquidationPrice: String? = null,
     public val unrealizedPnl: String? = null,
     public val returnOnEquity: String? = null,
@@ -195,6 +196,7 @@ public data class ExchangeIntent(
 
 @Serializable
 public data class ExchangeState(
+    public val stateRefreshIntervalMs: Long? = null,
     public val account: SimAccount,
     public val marginSummary: SimMarginSummary,
     public val crossMarginSummary: SimMarginSummary? = null,
@@ -227,8 +229,8 @@ public data class ExchangeState(
  * This is a venue rule, not a market property, and the two venues answer it
  * differently over *identical* market ids: the live `hl` venue reserves
  * `max(marginNative, rate * notionalNative)` behind the open positions before
- * collateral can move to another dex, while the `hl-sim` paper venue has a
- * single pool and no transfer to gate. Both publish `hl:<dexIndex>:<symbol>`,
+ * collateral can move to another dex. The `hl-sim` paper venue defaults to
+ * one pool and can opt in per account or realm. Both publish `hl:<dexIndex>:<symbol>`,
  * so a client inspecting the market id cannot tell them apart.
  *
  * Absent means no reservation — read it that way rather than guessing.

@@ -114,6 +114,21 @@ class MaxOrderSizeWatchTest {
         arca.close()
     }
 
+    @Test
+    fun quietServerPricedMaxSizeRefreshesWithoutMarketTicks() = runBlocking {
+        dispatcher.exchangePricingMode = "server"
+        dispatcher.refreshIntervalMs = 5000L
+        val arca = makeArca()
+        val stream = launchWatch(arca, mmr = null)
+        assertEquals("0.01", stream.activeAssetData.value?.maintenanceMarginRate)
+        dispatcher.maintenanceMarginRate = "0.025"
+        withTimeout(7_000) { stream.activeAssetData.first { it?.maintenanceMarginRate == "0.025" } }
+        assertEquals("0", stream.activeAssetData.value?.maxBuySize)
+        assertEquals(3, dispatcher.activeAssetDataRequestCount)
+        stream.stop()
+        arca.close()
+    }
+
     // MARK: - Helpers
 
     /**
@@ -157,6 +172,7 @@ class MaxOrderSizeWatchTest {
 private class MaxOrderSizeDispatcher : Dispatcher() {
     @Volatile var maintenanceMarginRate = "0.01"
     @Volatile var exchangePricingMode: String? = null
+    @Volatile var refreshIntervalMs: Long? = null
     private val aadCount = AtomicInteger(0)
     val activeAssetDataRequestCount: Int get() = aadCount.get()
 
@@ -174,7 +190,8 @@ private class MaxOrderSizeDispatcher : Dispatcher() {
     }
 
     private fun stateBody(): String {
-        val pm = exchangePricingMode?.let { "\"pricingMode\":\"$it\"," } ?: ""
+        val pm = (exchangePricingMode?.let { "\"pricingMode\":\"$it\"," } ?: "") +
+            (refreshIntervalMs?.let { "\"stateRefreshIntervalMs\":$it," } ?: "")
         return """
             {"success":true,"data":{
               $pm"account":{"id":"act_1","realmId":"rlm_test","name":"main","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"},
