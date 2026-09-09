@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class FillWatchRecoveryTest {
     private fun row(id: String) = """{"id":"$id","fillId":"$id","operationId":"fill-$id","orderOperationId":"original","orderId":"order","market":"gll:test:1","size":"1","price":"100","side":"buy"}"""
-    private fun event(id: String, account: String = "account") = """{"type":"fill.recorded","entityId":"$account","fill":${row(id)}}"""
+    private fun event(id: String, account: String = "account") = """{"type":"fill.recorded","entityId":"$id","entityPath":"/$account","fill":${row(id)}}"""
     private inner class Harness : AutoCloseable {
         val server = MockWebServer()
         val reads = AtomicInteger()

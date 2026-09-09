@@ -35,6 +35,10 @@ A complete result sets `averagePriceFinal`, `fillsComplete`, and
 `averagePriceSource = "ledger_vwap"`; its VWAP is rounded to 18 fractional digits,
 half-even. Original execution and remainder fields never change.
 
+Fill events use the exact account `entityPath` when present; `entityId` may be a
+fill ID. Object-ID matching is a fallback only for events without a path. Use
+v2.3.1 or later for this account-scope correction.
+
 `watchFills` installs listeners before subscribing, merges by stable `fillId`
 (falling back to row `id`), and traverses history cursors up to 1,000 pages.
 Its `limit` is the page size. Startup and actual gap/reconnect recovery use a fresh

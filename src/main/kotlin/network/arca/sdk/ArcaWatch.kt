@@ -658,7 +658,7 @@ public suspend fun Arca.watchFills(
     // UNDISPATCHED registers the shared-flow collector before watch/REST can emit.
     jobs += scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
         ws.events.collect { event ->
-            if (stopped.get() || !(event.entityId == objectId || (event.entityId == null && event.entityPath == path))) return@collect
+            if (stopped.get() || !(event.entityPath == path || (event.entityPath == null && event.entityId == objectId))) return@collect
             val fill = if (event.type == "fill.recorded") event.recordedFill
                 else if (event.type == "fill.previewed") event.fill?.let { preview ->
                     Fill(id = preview.id.value, fillId = preview.id.value, orderId = preview.orderId.value,
