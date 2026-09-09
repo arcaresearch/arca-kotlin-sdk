@@ -3,7 +3,10 @@ package network.arca.sdk
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -276,6 +279,7 @@ public fun Arca.placeOrder(
     leverageMode: LeveragePreferenceMode? = null,
     slippageBps: Int? = null,
 ): OrderHandle {
+    val capture = OrderEventCapture(scope, ws)
     val effectiveTolerance = sizeTolerance ?: maxSizeTolerance
     val inner = operationHandle<OrderOperationResponse> {
         val body = arcaJson.encodeToJsonElement(
@@ -305,14 +309,16 @@ public fun Arca.placeOrder(
                 leverageMode = leverageMode, slippageBps = slippageBps,
             ),
         )
-        client.post<OrderOperationResponse>("/objects/$objectId/exchange/orders", body = body)
+        try {
+            client.post<OrderOperationResponse>("/objects/$objectId/exchange/orders", body = body).also { capture.submitted(it.operation, objectId) }
+        } catch (error: Exception) { capture.stop(); throw error }
     }
     return OrderHandle(
         scope = scope,
         inner = inner,
         objectId = objectId,
         placementPath = path,
-        deps = makeOrderHandleDeps(),
+        deps = makeOrderHandleDeps(capture),
     )
 }
 
@@ -394,7 +400,9 @@ public fun Arca.closePosition(
     leverage: Int? = null,
 ): OrderHandle {
     val self = this
+    val capture = OrderEventCapture(scope, ws)
     val inner = operationHandle<OrderOperationResponse> {
+        capture.submit(objectId) {
         val positions = self.listPositions(objectId)
         val position = positions.firstOrNull { it.market == market }
             ?: throw ArcaException.NotFound("POSITION_NOT_FOUND", "No open position for $market", null)
@@ -434,13 +442,14 @@ public fun Arca.closePosition(
             ),
         )
         client.post<OrderOperationResponse>("/objects/$objectId/exchange/orders", body = body)
+        }
     }
     return OrderHandle(
         scope = scope,
         inner = inner,
         objectId = objectId,
         placementPath = path,
-        deps = makeOrderHandleDeps(),
+        deps = makeOrderHandleDeps(capture),
     )
 }
 
@@ -539,7 +548,9 @@ private fun Arca.setPositionTrigger(
     feeTargets: List<FeeTarget>?,
     ocoGroupId: String?,
 ): OrderHandle {
+    val capture = OrderEventCapture(scope, ws)
     val inner = operationHandle<OrderOperationResponse> {
+        capture.submit(objectId) {
         val isMarketOrder = isMarket ?: true
         if (!isMarketOrder && (limitPrice ?: "").isEmpty()) {
             throw ArcaException.Validation(
@@ -593,13 +604,14 @@ private fun Arca.setPositionTrigger(
             ),
         )
         client.post<OrderOperationResponse>("/objects/$objectId/exchange/orders", body = body)
+        }
     }
     return OrderHandle(
         scope = scope,
         inner = inner,
         objectId = objectId,
         placementPath = path,
-        deps = makeOrderHandleDeps(),
+        deps = makeOrderHandleDeps(capture),
     )
 }
 
@@ -771,28 +783,37 @@ public fun Arca.openWithBracket(
         PlaceOrderBatchBody(realmId = realm, path = path, grouping = grouping, orders = orders),
     )
 
-    // One shared batch call: all handles derive from this single Deferred, so the
-    // HTTP request fires exactly once.
+    val legTypes = listOf("") + (if (takeProfitPx.isNullOrEmpty()) emptyList() else listOf("tp")) +
+        (if (stopLossPx.isNullOrEmpty()) emptyList() else listOf("sl"))
+    val captures = legTypes.associateWith { leg ->
+        OrderEventCapture(scope, ws) { selectLegOperation(it, leg.takeIf { it.isNotEmpty() }) }
+    }
+    // Every capture installs its collector synchronously before this one POST.
     val batchCall: Deferred<OrderOperationResponse> = scope.async {
-        val resp: OrderOperationResponse = client.post("/objects/$objectId/exchange/orders/batch", body = body)
-        throwIfOperationFailed(resp.operation)
-        resp
+        try {
+            val resp: OrderOperationResponse = client.post("/objects/$objectId/exchange/orders/batch", body = body)
+            throwIfOperationFailed(resp.operation)
+            captures.values.forEach { it.submitted(resp.operation, objectId) }
+            resp
+        } catch (error: Throwable) {
+            captures.values.forEach { it.stop() }
+            throw error
+        }
     }
 
-    val deps = makeOrderHandleDeps()
     // Each leg gets its own OrderHandle backed by the SAME batch operation. We
     // rewrite the operation's outcome to the leg's own order summary (which
     // carries `orderId`) so `.filled()` / `.cancel()` target the right order.
     // `tpsl == null` selects the entry (orders[0]).
     fun legHandle(tpsl: String?): OrderHandle {
+        val deps = makeOrderHandleDeps(captures.getValue(tpsl ?: "")) { selectLegOperation(it, tpsl) }
         val inner = OperationHandle(
             scope = scope,
             submit = {
                 val resp = batchCall.await()
-                val outcome = selectLegOutcome(resp.operation.outcome, tpsl)
-                resp.withOperation(resp.operation.withOutcome(outcome))
+                resp.withOperation(selectLegOperation(resp.operation, tpsl))
             },
-            waitForSettlement = { operationId -> waitForSettlement(operationId) },
+            waitForSettlement = { operationId -> selectLegOperation(waitForSettlement(operationId), tpsl) },
         )
         return OrderHandle(scope = scope, inner = inner, objectId = objectId, placementPath = path, deps = deps)
     }
@@ -869,15 +890,26 @@ private suspend fun Arca.findPositionTpslOrders(
     }
 }
 
-private fun Arca.makeOrderHandleDeps(): OrderHandleDeps {
+private fun Arca.makeOrderHandleDeps(capture: OrderEventCapture? = null,
+    projection: (Operation) -> Operation = { it }): OrderHandleDeps {
     val self = this
     return OrderHandleDeps(
         getOrder = { objId, orderId -> self.getOrder(objId, orderId) },
-        fillEvents = { self.ws.fillEvents() },
+        fillEvents = { capture?.fillEvents() ?: self.ws.fillEvents() },
         cancelOrder = { cancelPath, objId, orderId -> self.cancelOrder(cancelPath, objId, orderId) },
         modifyOrder = { modifyPath, objId, orderId, newSize -> self.modifyOrder(modifyPath, objId, orderId, newSize) },
         waitForSettlement = { operationId -> self.waitForSettlement(operationId) },
         listFills = { objId -> self.listFills(objId) },
+        executionEvents = { capture?.events ?: self.ws.orderExecutionEvents() },
+        releaseExecution = capture?.let { { it.stop() } },
+        awaitExecutionReady = capture?.let { { it.awaitReady() } },
+        getExecutionOperation = { id -> projection(self.getOperation(id).operation) },
+        executionGaps = { callbackFlow {
+            val gap = self.ws.onGap { trySend(Unit) }
+            val auth = self.ws.onAuthenticated { trySend(Unit) }
+            awaitClose { self.ws.removeGapHandler(gap); self.ws.removeAuthenticatedHandler(auth) }
+        } },
+        recoverExecutionReady = { self.ws.recoverPathReady("/") },
     )
 }
 
@@ -1397,6 +1429,19 @@ private fun selectLegOutcome(outcome: String?, tpsl: String?): String? {
  * account's live order set, so a random UUID is sufficient.
  */
 internal fun generateOcoGroupId(): String = "oco_${UUID.randomUUID()}"
+
+private fun selectLegOperation(operation: Operation, tpsl: String?): Operation {
+    val input = runCatching {
+        val original = operation.input ?: return@runCatching null
+        val parsed = arcaJson.parseToJsonElement(original).jsonObject
+        val legs = parsed["orders"]?.jsonArray ?: return@runCatching original
+        val leg = (if (tpsl == null) legs.firstOrNull() else legs.firstOrNull {
+            it.jsonObject["tpsl"]?.jsonPrimitive?.contentOrNull == tpsl
+        })?.jsonObject ?: return@runCatching original
+        JsonObject((parsed - "orders") + leg).toString()
+    }.getOrDefault(operation.input)
+    return operation.copy(input = input, outcome = selectLegOutcome(operation.outcome, tpsl))
+}
 
 private fun Operation.withOutcome(newOutcome: String?): Operation = copy(outcome = newOutcome)
 

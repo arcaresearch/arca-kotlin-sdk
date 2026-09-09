@@ -61,6 +61,15 @@ class OperationHandleTest {
     }
 
     @Test
+    fun knownTerminalResultRemainsReadableAfterScopeCloses() = runBlocking {
+        val response = TestResponse(makeOperation(), "known")
+        val handle = OperationHandle(scope, submit = { response }, waitForSettlement = { error("No terminal waiter needed") })
+        assertEquals(response, handle.submitted())
+        scope.cancel()
+        assertEquals(response, handle.settled())
+    }
+
+    @Test
     fun settledResolvesImmediatelyForNonPendingOperation() = runBlocking {
         val op = makeOperation(state = OperationState.COMPLETED)
         val response = TestResponse(op, "hello")

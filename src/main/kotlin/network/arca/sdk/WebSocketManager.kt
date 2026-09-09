@@ -32,6 +32,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import network.arca.sdk.internal.arcaJson
+import network.arca.sdk.models.executionFill
 import network.arca.sdk.models.Candle
 import network.arca.sdk.models.CandleEvent
 import network.arca.sdk.models.CandleInterval
@@ -292,6 +293,43 @@ public class WebSocketManager internal constructor(
 
     // MARK: - Path watch management (ref-counted)
 
+    private val acknowledgedPaths = HashMap<String, WebSocket?>()
+    private val pathWatchRequests = HashMap<WebSocket?, MutableMap<String, String>>()
+    private val pathReadyWaiters = HashMap<UUID, Pair<String, CompletableDeferred<Unit>>>()
+
+    internal suspend fun awaitPathReady(path: String) {
+        val id = UUID.randomUUID()
+        val ready = CompletableDeferred<Unit>()
+        lock.withLock {
+            if (statusFlow.value == ConnectionStatus.CONNECTED && (pathRefs[path] ?: 0) > 0 && acknowledgedPaths.containsKey(path) && acknowledgedPaths[path] === webSocket) ready.complete(Unit)
+            else pathReadyWaiters[id] = path to ready
+        }
+        try { ready.await() }
+        finally { lock.withLock { pathReadyWaiters.remove(id) }; ready.cancel() }
+    }
+
+    internal suspend fun recoverPathReady(path: String) {
+        watchPath(path)
+        try {
+            lock.withLock { sendPathWatchLocked(webSocket, path) }
+            awaitPathReady(path)
+        } finally { unwatchPath(path) }
+    }
+
+    private fun sendPathWatchLocked(target: WebSocket?, path: String) {
+        val requestId = "path-${UUID.randomUUID()}"
+        pathWatchRequests.getOrPut(target) { HashMap() }[path] = requestId
+        if (target === webSocket) acknowledgedPaths.remove(path)
+        sendMessage(target, buildJsonObject { put("action", "watch"); put("path", path); put("requestId", requestId) })
+    }
+
+    private fun acknowledgePathLocked(path: String) {
+        if (statusFlow.value != ConnectionStatus.CONNECTED || (pathRefs[path] ?: 0) <= 0) return
+        acknowledgedPaths[path] = webSocket
+        val matching = pathReadyWaiters.filterValues { it.first == path }
+        matching.forEach { (id, value) -> pathReadyWaiters.remove(id); value.second.complete(Unit) }
+    }
+
     public fun watchPath(path: String) {
         lock.withLock {
             cancelIdleTimerLocked()
@@ -304,7 +342,7 @@ public class WebSocketManager internal constructor(
                     pending.cancel()
                 } else {
                     ensureConnectedLocked()
-                    sendMessage(buildJsonObject { put("action", "watch"); put("path", path) })
+                    sendPathWatchLocked(webSocket, path)
                 }
             }
         }
@@ -331,6 +369,8 @@ public class WebSocketManager internal constructor(
         lock.withLock {
             unsubJobs.remove(timerKey)
             if (!pathRefs.containsKey(path)) {
+                acknowledgedPaths.remove(path)
+                pathWatchRequests[webSocket]?.remove(path)
                 sendMessage(buildJsonObject { put("action", "unwatch"); put("path", path) })
             }
             maybeStartIdleTimerLocked()
@@ -611,6 +651,10 @@ public class WebSocketManager internal constructor(
     public val statusStream: StateFlow<ConnectionStatus>
         get() = statusFlow.asStateFlow()
 
+    public fun orderExecutionEvents(): Flow<RealmEvent> = filtered { event ->
+        event.takeIf { it.type in setOf("order.updated", "operation.updated", "fill.previewed", "fill.recorded") }
+    }
+
     public fun operationEvents(): Flow<Pair<Operation, RealmEvent>> = filtered { event ->
         val op = event.operation
         if ((event.type == EventType.OPERATION_CREATED.wire || event.type == EventType.OPERATION_UPDATED.wire) && op != null) {
@@ -701,8 +745,8 @@ public class WebSocketManager internal constructor(
     }
 
     public fun fillEvents(): Flow<Pair<SimFill, RealmEvent>> = filtered { event ->
-        val fill = event.fill
-        if (event.type == EventType.FILL_PREVIEWED.wire && fill != null) fill to event else null
+        val fill = event.executionFill
+        if (event.type in setOf(EventType.FILL_PREVIEWED.wire, EventType.FILL_RECORDED.wire) && fill != null) fill to event else null
     }
 
     public fun fillRecordedEvents(): Flow<Pair<Fill, RealmEvent>> = filtered { event ->
@@ -1050,6 +1094,8 @@ public class WebSocketManager internal constructor(
 
     private fun handleAuthenticated(obj: JsonObject?) {
         lock.withLock {
+            acknowledgedPaths.clear()
+            pathWatchRequests.clear()
             log.info("websocket") { "authenticated" }
             reconnectAttempt = 0
             lastDeliverySeq = 0
@@ -1078,7 +1124,7 @@ public class WebSocketManager internal constructor(
             syncOISubscriptionLocked(target)
         }
         pathRefs.keys.forEach { path ->
-            sendMessage(target, buildJsonObject { put("action", "watch"); put("path", path) })
+            sendPathWatchLocked(target, path)
         }
         chartHistoryWatches.forEach { (watchId, req) ->
             sendMessage(target, watchChartHistoryMsg(watchId, req.target, req.kind, req.objectId))
@@ -1151,6 +1197,10 @@ public class WebSocketManager internal constructor(
     }
 
     private fun handleWatchSnapshot(obj: JsonObject) {
+        obj["path"]?.jsonPrimitive?.contentOrNull?.let { path -> lock.withLock {
+            val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull
+            if (requestId != null && pathWatchRequests[webSocket]?.get(path) == requestId) acknowledgePathLocked(path)
+        } }
         val watchId = obj["watchId"]?.jsonPrimitive?.contentOrNull ?: return
         obj["valuation"]?.let { valEl ->
             val path = obj["path"]?.jsonPrimitive?.contentOrNull
@@ -1325,6 +1375,11 @@ public class WebSocketManager internal constructor(
             // second dispatch to consumers, no spurious DISCONNECTED, and no
             // reconnect competing with the socket that just took over.
             webSocket = socket
+            pathRefs.keys.forEach { path ->
+                if (pathWatchRequests[socket]?.containsKey(path) == true) acknowledgePathLocked(path)
+                else sendPathWatchLocked(socket, path)
+            }
+            pathWatchRequests.keys.retainAll(setOf(socket))
             // New connection, new sequence space.
             lastDeliverySeq = 0
             lastMessageAtMs = System.currentTimeMillis()

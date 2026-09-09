@@ -112,14 +112,14 @@ public data class SimOrder(
     /** True when the order reached a terminal status and has at least one fill. */
     public val isTerminalWithFills: Boolean
         get() = when (status) {
-            OrderStatus.FILLED -> true
-            OrderStatus.CANCELLED -> filledSize != "0" && filledSize.isNotEmpty()
+            OrderStatus.FILLED -> (filledSize.toBigDecimalOrNull()?.signum() == 1)
+            OrderStatus.CANCELLED -> (filledSize.toBigDecimalOrNull()?.signum() == 1)
             else -> false
         }
 
     /** True when partially filled and the remainder cancelled (IOC semantics). */
     public val isPartiallyFilled: Boolean
-        get() = status == OrderStatus.CANCELLED && filledSize != "0" && filledSize.isNotEmpty() && filledSize != size
+        get() = status == OrderStatus.CANCELLED && (filledSize.toBigDecimalOrNull()?.signum() == 1) && filledSize != size
 
     /** True when this is a trigger (TP/SL) order. */
     public val isTriggerOrder: Boolean
@@ -148,6 +148,8 @@ public data class SimFill(
     public val realizedPnl: String? = null,
     public val isLiquidation: Boolean,
     public val createdAt: String? = null,
+    public val fillId: String? = null,
+    public val isOptimistic: Boolean = false,
 )
 
 @Serializable
@@ -323,6 +325,7 @@ public data class AvailabilityBreakdown(
 public data class SimOrderWithFills(
     public val order: SimOrder,
     public val fills: List<SimFill>,
+    public val fillsComplete: Boolean? = null,
 )
 
 // MARK: - Active asset data

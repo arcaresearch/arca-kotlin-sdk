@@ -16,6 +16,7 @@ import network.arca.sdk.internal.arcaJson
  */
 @Serializable
 public data class RealmEvent(
+    public val order: OrderExecutionUpdate? = null,
     public val realmId: String? = null,
     public val type: String,
     public val entityId: String? = null,
@@ -78,3 +79,19 @@ public data class RealmEvent(
             return runCatching { arcaJson.decodeFromJsonElement(Fill.serializer(), el) }.getOrNull()
         }
 }
+
+/** Stable venue identity joins previews and recorded ledger rows. */
+internal val RealmEvent.executionFill: SimFill?
+    get() {
+        fill?.let { return it.takeUnless { value -> value.isOptimistic } }
+        val recorded = recordedFill ?: return null
+        val venueId = recorded.fillId?.takeIf { it.isNotEmpty() } ?: return null
+        return SimFill(id = network.arca.sdk.SimFillId(venueId), fillId = venueId,
+            orderId = network.arca.sdk.SimOrderId(recorded.orderId ?: return null),
+            realmId = realmId?.let { network.arca.sdk.RealmId(it) }, market = recorded.market,
+            side = recorded.side ?: return null, size = recorded.size ?: return null,
+            price = recorded.price ?: return null, fee = recorded.fee ?: return null,
+            builderFee = recorded.builderFee, platformFee = recorded.platformFee,
+            realizedPnl = recorded.realizedPnl, isLiquidation = recorded.isLiquidation ?: return null,
+            createdAt = recorded.createdAt)
+    }

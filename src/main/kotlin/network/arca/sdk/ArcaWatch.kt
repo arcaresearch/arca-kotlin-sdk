@@ -629,10 +629,11 @@ public suspend fun Arca.watchFunding(objectId: String): FundingWatchStream {
 
 /**
  * Watch fills (trade history) for an exchange Arca object. Two-phase delivery:
- * `fill.previewed` (instant preview, matched by `correlationId`) is replaced by
+ * `fill.previewed` (instant preview, matched by stable `fillId`) is replaced by
  * the authoritative `fill.recorded`. A convergence timeout fires if a preview
  * does not receive its authoritative update within the window. On reconnect or
- * gap, re-fetches from REST to reconcile. Call [FillWatchStream.stop] when done.
+ * gap, performs bounded fresh-watch and paginated REST recovery (limit is page
+ * size, at most 1,000 pages). Healthy watches do not poll. Call [FillWatchStream.stop] when done.
  *
  * Read [FillWatchStream.fills] for the merged activity-feed view (one row per
  * fill); read [FillWatchStream.updates] only when you need the
@@ -644,148 +645,98 @@ public suspend fun Arca.watchFills(
     limit: Int? = null,
 ): FillWatchStream {
     ws.ensureConnected()
-
+    val detail = getObjectDetail(objectId)
+    val path = detail.`object`.path
     val stream = FillWatchStream()
     val lock = ReentrantLock()
-    val fillIdSet = HashSet<String>()
-    val previewCorrelations = HashMap<String, Job>()
-    val resolvedCorrelations = HashSet<String>()
-    val fetchInFlight = AtomicBoolean(false)
+    val stopped = AtomicBoolean(false)
+    val timers = HashMap<String, Job>()
+    val revision = java.util.concurrent.atomic.AtomicLong(0)
+    val requests = kotlinx.coroutines.channels.Channel<Long>(kotlinx.coroutines.channels.Channel.CONFLATED)
     val jobs = mutableListOf<Job>()
-
-    val detail = getObjectDetail(objectId)
-    val objectPath = detail.`object`.path
-
-    fun matchesObject(event: RealmEvent): Boolean =
-        event.entityId == objectId || event.entityPath == objectPath
-
-    fun clearAllTimers() {
-        lock.withLock {
-            previewCorrelations.values.forEach { it.cancel() }
-            previewCorrelations.clear()
-        }
-    }
-
-    suspend fun fetchFills() {
-        if (!fetchInFlight.compareAndSet(false, true)) return
-        try {
-            val resp = try {
-                listFills(objectId = objectId, market = market, limit = limit)
-            } catch (e: Throwable) {
-                log.warning("watch", e, mapOf("objectId" to objectId, "market" to (market ?: ""))) {
-                    "fills snapshot refetch failed"
-                }
-                return
-            }
+    fun requestRecovery() { if (!stopped.get()) requests.trySend(revision.incrementAndGet()) }
+    // UNDISPATCHED registers the shared-flow collector before watch/REST can emit.
+    jobs += scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+        ws.events.collect { event ->
+            if (stopped.get() || !(event.entityId == objectId || (event.entityId == null && event.entityPath == path))) return@collect
+            val fill = if (event.type == "fill.recorded") event.recordedFill
+                else if (event.type == "fill.previewed") event.fill?.let { preview ->
+                    Fill(id = preview.id.value, fillId = preview.id.value, orderId = preview.orderId.value,
+                        market = preview.market, side = preview.side, size = preview.size, price = preview.price,
+                        fee = preview.fee, builderFee = preview.builderFee, realizedPnl = preview.realizedPnl,
+                        isLiquidation = preview.isLiquidation, createdAt = preview.createdAt)
+                } else null
+            if (fill == null || (market != null && fill.market != market)) return@collect
+            val key = fill.fillId ?: fill.id
             lock.withLock {
-                stream.fillsMut.value = resp.fills
-                fillIdSet.clear()
-                resp.fills.forEach { fillIdSet.add(it.id) }
-                previewCorrelations.values.forEach { it.cancel() }
-                previewCorrelations.clear()
-                resolvedCorrelations.clear()
-            }
-            stream.setState(WatchStreamState.CONNECTED)
-        } finally {
-            fetchInFlight.set(false)
-        }
-    }
-
-    jobs += scope.launch {
-        ws.statusStream.collect { s ->
-            if (s == ConnectionStatus.DISCONNECTED && stream.state.value != WatchStreamState.LOADING) {
-                stream.setState(WatchStreamState.RECONNECTING)
-            } else if (s == ConnectionStatus.CONNECTED && stream.fills.value.isNotEmpty()) {
-                fetchFills()
-            }
-        }
-    }
-
-    val gapId = ws.onGap { scope.launch { fetchFills() } }
-
-    ws.watchPath(objectPath)
-
-    jobs += scope.launch {
-        ws.fillEvents().collect { (simFill, event) ->
-            if (!matchesObject(event)) return@collect
-            val orderId = simFill.orderId.value
-            val correlationKey = event.correlationId ?: orderId
-
-            val skip = lock.withLock {
-                previewCorrelations.containsKey(correlationKey) || resolvedCorrelations.contains(correlationKey)
-            }
-            if (skip) return@collect
-
-            val preview = Fill(
-                id = simFill.id.value,
-                orderId = orderId,
-                market = simFill.market,
-                side = simFill.side,
-                size = simFill.size,
-                price = simFill.price,
-                fee = simFill.fee,
-                builderFee = simFill.builderFee,
-                realizedPnl = simFill.realizedPnl,
-                isLiquidation = simFill.isLiquidation,
-                createdAt = simFill.createdAt,
-            )
-
-            val timerJob = scope.launch {
-                delay(FillWatchStream.CONVERGENCE_TIMEOUT_MS)
-                val stillPending = lock.withLock { previewCorrelations.containsKey(correlationKey) }
-                if (stillPending) stream.fireConvergenceTimeout(correlationKey)
-            }
-
-            lock.withLock {
-                previewCorrelations[correlationKey] = timerJob
-                stream.fillsMut.value = buildList { add(preview); addAll(stream.fillsMut.value) }
-            }
-            stream.push(preview, event)
-        }
-    }
-
-    jobs += scope.launch {
-        ws.fillRecordedEvents().collect { (fill, event) ->
-            if (!matchesObject(event)) return@collect
-            val correlationKey = event.correlationId ?: fill.orderId
-
-            lock.withLock {
-                var replaced = false
-                if (correlationKey != null) {
-                    val hadPreview = previewCorrelations.containsKey(correlationKey)
-                    val cur = stream.fillsMut.value.toMutableList()
-                    val idx = if (hadPreview) {
-                        cur.indexOfFirst {
-                            (it.orderId == correlationKey || it.orderId == fill.orderId) && it.operationId == null
-                        }
-                    } else {
-                        cur.indexOfFirst { it.orderId == correlationKey && it.operationId == null }
+                stream.fillsMut.value = mergeWatchedFills(stream.fills.value, listOf(fill))
+                if (!fill.operationId.isNullOrEmpty()) timers.remove(key)?.cancel()
+                else if (stream.fills.value.none { (it.fillId ?: it.id) == key && !it.operationId.isNullOrEmpty() } && key !in timers) {
+                    val correlation = event.correlationId ?: fill.orderId ?: key
+                    timers[key] = scope.launch {
+                        delay(FillWatchStream.CONVERGENCE_TIMEOUT_MS)
+                        if (!stopped.get()) stream.fireConvergenceTimeout(correlation)
                     }
-                    if (idx >= 0) {
-                        cur[idx] = fill
-                        stream.fillsMut.value = cur
-                        replaced = true
-                    }
-                    previewCorrelations.remove(correlationKey)?.cancel()
-                    resolvedCorrelations.add(correlationKey)
                 }
-                if (!replaced) {
-                    if (fillIdSet.contains(fill.id)) return@withLock
-                    stream.fillsMut.value = buildList { add(fill); addAll(stream.fillsMut.value) }
-                }
-                fillIdSet.add(fill.id)
             }
             stream.push(fill, event)
         }
     }
-
-    fetchFills()
-
+    jobs += scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+        ws.statusStream.collect { status ->
+            if (status == ConnectionStatus.DISCONNECTED && !stopped.get() && stream.state.value != WatchStreamState.LOADING) {
+                stream.setState(WatchStreamState.RECONNECTING)
+            }
+        }
+    }
+    val gap = ws.onGap { requestRecovery() }
+    val auth = ws.onAuthenticated { requestRecovery() }
+    ws.watchPath(path)
+    jobs += scope.launch {
+        var completed = 0L
+        for (requested in requests) {
+            if (stopped.get()) break
+            if (requested <= completed) continue
+            var covered = requested
+            for (attempt in 0 until 3) {
+                var acknowledged = false
+                try { kotlinx.coroutines.withTimeout(1000) { ws.recoverPathReady(path) }; acknowledged = true }
+                catch (e: kotlinx.coroutines.TimeoutCancellationException) { /* bounded readiness failure */ }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (_: Exception) { /* the read may still recover recorded evidence */ }
+                covered = revision.get()
+                try {
+                    val snapshot = fillWatchSnapshot(objectId, market, limit)
+                    coroutineContext.ensureActive()
+                    if (stopped.get()) return@launch
+                    lock.withLock {
+                        stream.fillsMut.value = mergeWatchedFills(stream.fills.value, snapshot)
+                        stream.fills.value.filter { !it.operationId.isNullOrEmpty() }.forEach { timers.remove(it.fillId ?: it.id)?.cancel() }
+                    }
+                    if (acknowledged) { stream.setState(WatchStreamState.CONNECTED); break }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) {
+                    log.warning("watch", e, mapOf("objectId" to objectId)) { "fills recovery snapshot failed" }
+                }
+                if (attempt < 2) delay((attempt + 1) * 100L)
+                else stream.setState(WatchStreamState.RECONNECTING)
+            }
+            completed = covered
+        }
+    }
     stream.stopAction = {
+        stopped.set(true)
+        requests.close()
         jobs.forEach { it.cancel() }
-        clearAllTimers()
-        ws.removeGapHandler(gapId)
-        ws.unwatchPath(objectPath)
+        lock.withLock { timers.values.forEach { it.cancel() }; timers.clear() }
+        ws.removeGapHandler(gap)
+        ws.removeAuthenticatedHandler(auth)
+        ws.unwatchPath(path)
+    }
+    requestRecovery()
+    try { stream.ready() } catch (e: kotlinx.coroutines.CancellationException) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { stream.stop() }
+        throw e
     }
     return stream
 }

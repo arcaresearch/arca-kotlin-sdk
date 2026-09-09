@@ -1,6 +1,8 @@
 package network.arca.sdk
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
@@ -34,18 +36,27 @@ class ArcaExchangeBracketTest {
 
     private lateinit var server: MockWebServer
     private val posts = Collections.synchronizedList(mutableListOf<JsonObject>())
+    private var beforeBatchResponse: (() -> Unit)? = null
 
     @BeforeEach
     fun setUp() {
         posts.clear()
+        beforeBatchResponse = null
         server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val path = request.path ?: ""
                 if (request.method == "POST" && path.endsWith("/exchange/orders/batch")) {
                     val bodyStr = request.body.readUtf8()
-                    posts.add(arcaJson.parseToJsonElement(bodyStr).jsonObject)
-                    return json(BRACKET_ENVELOPE)
+                    val original = arcaJson.parseToJsonElement(bodyStr).jsonObject
+                    posts.add(original)
+                    val input = buildJsonObject { put("exchangeObjectId", "obj_1"); put("orders", original.getValue("orders")) }
+                    val envelope = arcaJson.parseToJsonElement(BRACKET_ENVELOPE).jsonObject
+                    val data = envelope.getValue("data").jsonObject
+                    val operation = data.getValue("operation").jsonObject
+                    val replacement = buildJsonObject { operation.forEach { (key, value) -> put(key, value) }; put("input", input.toString()) }
+                    beforeBatchResponse?.invoke()
+                    return json(JsonObject(envelope + ("data" to JsonObject(data + ("operation" to replacement)))).toString())
                 }
                 return json("""{"success":true,"data":{}}""")
             }
@@ -56,6 +67,36 @@ class ArcaExchangeBracketTest {
     @AfterEach
     fun tearDown() {
         server.shutdown()
+    }
+
+    @Test
+    fun earlyEntryEvidencePreservesIndependentChildCaptureAndQuantity() = runBlocking {
+        val arca = makeArca()
+        beforeBatchResponse = {
+            arca.ws.injectMessage("""{"type":"order.updated","entityId":"obj_1","order":{"order":{"id":"ord_entry","status":"FILLED","filledSize":"0.004"}}}""")
+        }
+        try {
+            val bracket = arca.openWithBracket(path = "/op/bracket/early", objectId = "obj_1", market = "hl:0:BTC",
+                side = OrderSide.BUY, size = "0.02", takeProfitPx = "72000", takeProfitSz = "0.01")
+            val entry = bracket.entry.executionReceipt(timeoutSeconds = 1.0)
+            assertEquals("ord_entry", entry.orderId)
+            assertEquals("0.02", entry.requestedSize)
+            assertEquals("0.004", entry.filledSize)
+            val foreign = bracket.takeProfit!!.submitted().operation.copy(state = network.arca.sdk.models.OperationState.FAILED, input = """{"exchangeObjectId":"foreign"}""")
+            val foreignEvent = buildJsonObject {
+                put("type", "operation.updated")
+                put("operation", arcaJson.encodeToJsonElement(network.arca.sdk.models.Operation.serializer(), foreign))
+            }
+            arca.ws.injectMessage(foreignEvent.toString())
+            kotlinx.coroutines.delay(20)
+            val child = async(start = CoroutineStart.UNDISPATCHED) { bracket.takeProfit!!.executionReceipt(timeoutSeconds = 1.0) }
+            arca.ws.injectMessage("""{"type":"order.updated","entityId":"obj_1","order":{"order":{"id":"ord_tp","status":"FILLED","filledSize":"0.01"}}}""")
+            val receipt = child.await()
+            assertEquals("ord_tp", receipt.orderId)
+            assertEquals("0.01", receipt.requestedSize)
+            assertEquals("0.01", receipt.filledSize)
+            assertEquals(1, posts.size)
+        } finally { arca.close() }
     }
 
     @Test

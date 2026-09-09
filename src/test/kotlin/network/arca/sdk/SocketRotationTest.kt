@@ -1,5 +1,8 @@
 package network.arca.sdk
 
+import kotlinx.coroutines.async
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -50,7 +53,50 @@ class SocketRotationTest {
         servers.clear()
     }
 
+    @Test
+    fun pathReadinessNeedsSnapshotAndCancellationPreservesOtherWatcher() = runBlocking {
+        val h = harness()
+        h.connectAndAuth()
+        h.manager.watchPath("/")
+        h.manager.watchPath("/")
+        val first = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { h.manager.awaitPathReady("/") }
+        assertFalse(first.isCompleted, "auth/send alone is not a watch ACK")
+        first.cancel()
+        first.join()
+        h.manager.unwatchPath("/")
+        val second = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { h.manager.awaitPathReady("/") }
+        h.factory[0].deliver("""{"type":"watch_snapshot","path":"/","watchId":"old","requestId":"retired-request"}""")
+        assertFalse(second.isCompleted, "stale acknowledgement cannot satisfy a fresh watch")
+        val watch = h.factory[0].sent.map { network.arca.sdk.internal.arcaJson.parseToJsonElement(it).jsonObject }.last { it["action"]?.jsonPrimitive?.content == "watch" }
+        val requestId = watch["requestId"]!!.jsonPrimitive.content
+        h.factory[0].deliver("""{"type":"watch_snapshot","path":"/","watchId":"ack","requestId":"$requestId"}""")
+        kotlinx.coroutines.withTimeout(1000) { second.await() }
+        h.manager.unwatchPath("/")
+        h.stop()
+    }
+
     // MARK: - 1. Warming
+
+    @Test
+    fun recoveryRequiresFreshSnapshotAndPreservesExistingWatchOwner() = runBlocking {
+        val h = harness()
+        h.connectAndAuth()
+        h.manager.watchPath("/")
+        fun latestRequest() = h.factory[0].sent.map { network.arca.sdk.internal.arcaJson.parseToJsonElement(it).jsonObject }
+            .last { it["action"]?.jsonPrimitive?.content == "watch" }["requestId"]!!.jsonPrimitive.content
+        val original = latestRequest()
+        h.factory[0].deliver("""{"type":"watch_snapshot","path":"/","requestId":"$original"}""")
+        h.manager.awaitPathReady("/")
+        val recovery = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { h.manager.recoverPathReady("/") }
+        val fresh = latestRequest()
+        assertTrue(fresh != original)
+        h.factory[0].deliver("""{"type":"watch_snapshot","path":"/","requestId":"$original"}""")
+        assertFalse(recovery.isCompleted)
+        h.factory[0].deliver("""{"type":"watch_snapshot","path":"/","requestId":"$fresh"}""")
+        kotlinx.coroutines.withTimeout(1000) { recovery.await(); h.manager.awaitPathReady("/") }
+        h.manager.unwatchPath("/")
+        h.stop()
+    }
 
     @Test
     fun warmsSecondSocketWithoutClosingTheFirstOrChangingStatus() = runBlocking {

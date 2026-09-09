@@ -40,8 +40,9 @@ public class OperationHandle<R : OperationResponse> internal constructor(
 ) {
     private val submittedDeferred: Deferred<R> = scope.async { submit() }
 
-    private val settledDeferred: Deferred<R> = scope.async {
+    private val settledDeferred: Deferred<R> by lazy { scope.async {
         val response = submittedDeferred.await()
+        throwIfOperationFailed(response.operation)
         if (response.operation.state != OperationState.PENDING) {
             response
         } else {
@@ -49,6 +50,14 @@ public class OperationHandle<R : OperationResponse> internal constructor(
             @Suppress("UNCHECKED_CAST")
             response.withOperation(completed) as R
         }
+    } }
+
+    private suspend fun settlementResult(): R {
+        val response = submittedDeferred.await()
+        throwIfOperationFailed(response.operation)
+        // A known terminal HTTP response stays readable after client close.
+        if (response.operation.state != OperationState.PENDING) return response
+        return settledDeferred.await()
     }
 
     /**
@@ -63,10 +72,10 @@ public class OperationHandle<R : OperationResponse> internal constructor(
      * [ArcaException.OperationFailed] if the terminal state is `failed` or
      * `expired`.
      */
-    public suspend fun settled(): R = settledDeferred.await()
+    public suspend fun settled(): R = settlementResult()
 
     /** Wait for full operation settlement; convenience alias for [settled]. */
-    public suspend fun settle(): R = settledDeferred.await()
+    public suspend fun settle(): R = settlementResult()
 
     /**
      * Wait for settlement with an explicit timeout. Throws
@@ -75,7 +84,7 @@ public class OperationHandle<R : OperationResponse> internal constructor(
      */
     public suspend fun settled(timeoutSeconds: Double): R =
         try {
-            withTimeout((timeoutSeconds * 1000).toLong()) { settledDeferred.await() }
+            withTimeout((timeoutSeconds * 1000).toLong()) { settlementResult() }
         } catch (_: TimeoutCancellationException) {
             throw ArcaException.Unknown(
                 "TIMEOUT",

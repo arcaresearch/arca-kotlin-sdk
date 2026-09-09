@@ -1,5 +1,13 @@
 package network.arca.sdk
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.selects.select
+import network.arca.sdk.models.OrderExecutionReceipt
+import network.arca.sdk.models.OrderExecutionUpdate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
@@ -8,6 +16,11 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -30,6 +43,12 @@ public class OrderHandleDeps internal constructor(
     internal val modifyOrder: (modifyPath: String, objectId: String, orderId: String, newSize: String) -> OperationHandle<OrderOperationResponse>,
     internal val waitForSettlement: suspend (operationId: String) -> Operation,
     internal val listFills: suspend (objectId: String) -> FillListResponse,
+    internal val executionEvents: (() -> Flow<RealmEvent>)? = null,
+    internal val releaseExecution: (() -> Unit)? = null,
+    internal val awaitExecutionReady: (suspend () -> Unit)? = null,
+    internal val getExecutionOperation: (suspend (String) -> Operation)? = null,
+    internal val executionGaps: (() -> Flow<Unit>)? = null,
+    internal val recoverExecutionReady: (suspend () -> Unit)? = null,
 )
 
 /**
@@ -55,6 +74,8 @@ public class OrderHandle internal constructor(
     private val placementPath: String,
     private val deps: OrderHandleDeps,
 ) {
+    @Volatile private var executionDetail: SimOrderWithFills? = null
+
     /** The HTTP response (before settlement). */
     public suspend fun submitted(): OrderOperationResponse = inner.submitted()
 
@@ -67,46 +88,84 @@ public class OrderHandle internal constructor(
     /** Wait for settlement with an explicit timeout. */
     public suspend fun settled(timeoutSeconds: Double): OrderOperationResponse = inner.settled(timeoutSeconds)
 
-    /**
-     * Wait for the order to be fully filled. Re-fetches the order on each
-     * inbound fill, returning it with all fills once the status is terminal
-     * with fills. Throws if the order reaches a terminal state without fills.
-     */
-    public suspend fun filled(timeoutSeconds: Double = 30.0): SimOrderWithFills {
-        inner.settled()
-        val orderId = resolveOrderId()
-
-        return try {
-            withTimeout((timeoutSeconds * 1000).toLong()) {
-                val initial = deps.getOrder(objectId, orderId)
-                if (initial.order.isTerminalWithFills) return@withTimeout initial
-                throwIfTerminalWithoutFills(initial.order, orderId)
-
-                deps.fillEvents()
-                    .map { deps.getOrder(objectId, orderId) }
-                    .firstOrTerminal(orderId)
+    /** Prompt terminal evidence; full metadata and ledger history remain separate. */
+    public suspend fun executionReceipt(timeoutSeconds: Double = 30.0): OrderExecutionReceipt = try {
+        withTimeout((timeoutSeconds * 1000).toLong()) {
+            coroutineScope {
+                val submitted = inner.submitted()
+                val operation = submitted.operation
+                throwIfOperationFailed(operation)
+                OrderExecutionReceipt.from(operation, objectId)?.let { return@coroutineScope it }
+                val orderId = runCatching { extractOrderId(operation.outcome, allowStructuredFallback = false) }.getOrNull()
+                val evidence = OrderExecutionEvidence(operation, objectId, orderId)
+                val requests = Channel<Long>(Channel.CONFLATED)
+                val revision = AtomicLong()
+                requests.trySend(0)
+                val gaps = launch(start = CoroutineStart.UNDISPATCHED) {
+                    deps.executionGaps?.invoke()?.collect { requests.trySend(revision.incrementAndGet()) }
+                }
+                val pushed = async(start = CoroutineStart.UNDISPATCHED) {
+                    deps.executionEvents?.invoke()?.map { evidence.receive(it) }?.first { it != null } ?: awaitCancellation()
+                }
+                val snapshot = async {
+                    var attempts = 0
+                    var consumedRevision = -1L
+                    for (requestedRevision in requests) {
+                        if (requestedRevision <= consumedRevision) continue
+                        var retry = true
+                        while (retry && attempts < 3) {
+                            attempts++
+                            retry = false
+                            try {
+                                if (attempts == 1) deps.awaitExecutionReady?.invoke() else deps.recoverExecutionReady?.invoke()
+                                currentCoroutineContext().ensureActive()
+                                consumedRevision = revision.get()
+                                if (evidence.orderId() == null && deps.getExecutionOperation != null) {
+                                    val recovered = deps.getExecutionOperation.invoke(operation.id.value)
+                                    evidence.receive(RealmEvent(type = "operation.updated", operation = recovered))?.let { return@async it }
+                                    if (evidence.orderId() == null) break // Healthy pending: wait for push.
+                                }
+                                val detail = deps.getOrder(objectId, evidence.orderId() ?: operation.id.value)
+                                val receipt = evidence.snapshot(detail)
+                                if (evidence.orderId() == detail.order.id.value) executionDetail = detail
+                                if (receipt != null) return@async receipt
+                            } catch (failure: ArcaException.OperationFailed) {
+                                throw failure
+                            } catch (_: Exception) {
+                                currentCoroutineContext().ensureActive()
+                                retry = attempts < 3
+                            }
+                            if (retry) delay(250L * attempts)
+                        }
+                    }
+                    awaitCancellation()
+                }
+                try { select { pushed.onAwait { it!! }; snapshot.onAwait { it } } }
+                finally { pushed.cancel(); snapshot.cancel(); gaps.cancel(); requests.close() }
             }
-        } catch (_: TimeoutCancellationException) {
-            throw ArcaException.Unknown("TIMEOUT", "Order fill timed out after ${timeoutSeconds.toInt()}s", null)
-        }
+        }.also { deps.releaseExecution?.invoke() }
+    } catch (failure: ArcaException.OperationFailed) {
+        deps.releaseExecution?.invoke()
+        throw failure
+    } catch (_: TimeoutCancellationException) {
+        throw ArcaException.Unknown("TIMEOUT", "Order execution timed out", null)
     }
 
-    private suspend fun Flow<SimOrderWithFills>.firstOrTerminal(orderId: String): SimOrderWithFills {
-        var result: SimOrderWithFills? = null
-        try {
-            first { detail ->
-                throwIfTerminalWithoutFills(detail.order, orderId)
-                if (detail.order.isTerminalWithFills) {
-                    result = detail
-                    true
-                } else {
-                    false
-                }
-            }
-        } catch (_: NoSuchElementException) {
-            throw ArcaException.Unknown("STREAM_ENDED", "Fill event stream ended before order was filled", null)
+    /** Resolves execution, then returns complete order metadata with available fill history. */
+    public suspend fun filled(timeoutSeconds: Double = 30.0): SimOrderWithFills {
+        val receipt = executionReceipt(timeoutSeconds)
+        val cached = executionDetail
+        val detail = if (cached?.order?.id?.value == receipt.orderId && cached.order.isTerminalWithFills) cached
+            else deps.getOrder(objectId, receipt.orderId)
+        if (detail.order.id.value != receipt.orderId) {
+            throw ArcaException.Unknown("ORDER_IDENTITY_MISMATCH", "Order details do not match execution", null)
         }
-        return result ?: throw ArcaException.Unknown("STREAM_ENDED", "Fill event stream ended before order was filled", null)
+        throwIfTerminalWithoutFills(detail.order, receipt.orderId)
+        if (!detail.order.isTerminalWithFills ||
+            detail.order.filledSize.toBigDecimalOrNull()?.compareTo(receipt.filledSize.toBigDecimal()) != 0) {
+            throw ArcaException.Unknown("ORDER_DETAILS_PENDING", "Execution completed; full order details are not available yet", null)
+        }
+        return detail
     }
 
     /**
@@ -114,29 +173,73 @@ public class OrderHandle internal constructor(
      * order reaches a terminal status, or after [timeoutSeconds] elapses (which
      * throws [ArcaException.Unknown] with code `TIMEOUT`).
      */
+    private sealed interface FillMessage {
+        data class Execution(val fill: SimFill) : FillMessage
+        data class Update(val event: RealmEvent) : FillMessage
+    }
+
     public fun fills(timeoutSeconds: Double = 300.0): Flow<SimFill> = flow {
         try {
             withTimeout((timeoutSeconds * 1000).toLong()) {
-                val response = inner.submitted()
-                val orderId = extractOrderId(response.operation.outcome)
-                val cloid = extractCloid(response.operation.outcome)
-
-                deps.fillEvents().collect { (fill, _) ->
-                    if (fillMatches(fill, orderId, cloid)) {
-                        emit(fill)
-                        val detail = deps.getOrder(objectId, orderId)
-                        val status = detail.order.status
-                        if (status == OrderStatus.FILLED || status == OrderStatus.CANCELLED || status == OrderStatus.FAILED) {
-                            throw StopCollecting
+                coroutineScope {
+                    val queue = kotlinx.coroutines.channels.Channel<FillMessage>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+                    val live = launch(start = CoroutineStart.UNDISPATCHED) { deps.fillEvents().collect { queue.send(FillMessage.Execution(it.first)) } }
+                    val execution = launch(start = CoroutineStart.UNDISPATCHED) { deps.executionEvents?.invoke()?.collect { queue.send(FillMessage.Update(it)) } }
+                    var seed: kotlinx.coroutines.Job? = null
+                    try {
+                        val response = inner.submitted()
+                        throwIfOperationFailed(response.operation)
+                        val orderId = extractOrderId(response.operation.outcome)
+                        val cloid = extractCloid(response.operation.outcome)
+                        var receipt = OrderExecutionReceipt.from(response.operation, objectId)
+                        val seen = mutableMapOf<String, SimFill>()
+                        if (receipt?.let { fillTotalMatches(seen.values, it.filledSize) } == true) return@coroutineScope
+                        seed = launch {
+                            val detail = try { deps.getOrder(objectId, orderId) }
+                                catch (cancelled: CancellationException) { throw cancelled }
+                                catch (_: Exception) { null }
+                            if (detail?.order?.id?.value == orderId) {
+                                for (fill in detail.fills) queue.send(FillMessage.Execution(fill))
+                                queue.send(FillMessage.Update(RealmEvent(type = "order.updated", entityId = objectId,
+                                    order = OrderExecutionUpdate(OrderExecutionUpdate.Value(id = orderId, status = detail.order.status.wire, filledSize = detail.order.filledSize, avgFillPrice = detail.order.avgFillPrice)))))
+                            }
                         }
-                    }
+                        for (message in queue) {
+                            when (message) {
+                                is FillMessage.Execution -> {
+                                    val fill = message.fill
+                                    val key = fill.fillId ?: fill.id.value
+                                    if (!fill.isOptimistic && key.isNotEmpty() && fillMatches(fill, orderId, cloid) && !seen.containsKey(key)) {
+                                        seen[key] = fill
+                                        emit(fill)
+                                    }
+                                }
+                                is FillMessage.Update -> {
+                                    val event = message.event
+                                    if (event.operation?.id == response.operation.id) {
+                                        OrderExecutionReceipt.from(event.operation, objectId, originalInput = response.operation.input)?.takeIf { it.orderId == orderId }?.let { receipt = it }
+                                    }
+                                    val update = event.order?.order
+                                    if (event.entityId == objectId && (update?.orderId ?: update?.id) == orderId) {
+                                        OrderExecutionReceipt.from(response.operation, objectId, update)?.let { receipt = it }
+                                    }
+                                }
+                            }
+                            if (receipt?.let { fillTotalMatches(seen.values, it.filledSize) } == true) return@coroutineScope
+                        }
+                    } finally { live.cancel(); execution.cancel(); seed?.cancel(); queue.cancel() }
                 }
             }
-        } catch (_: StopCollecting) {
-            // Normal completion: terminal status reached.
         } catch (_: TimeoutCancellationException) {
-            throw ArcaException.Unknown("TIMEOUT", "Fill stream timed out after ${timeoutSeconds.toInt()}s", null)
+            throw ArcaException.Unknown("TIMEOUT", "Fill stream timed out", null)
         }
+    }
+
+    private fun fillTotalMatches(fills: Collection<SimFill>, executed: String): Boolean {
+        val expected = OrderExecutionReceipt.decimal(executed) ?: return false
+        var total = java.math.BigDecimal.ZERO
+        for (fill in fills) total = total.add(OrderExecutionReceipt.decimal(fill.size) ?: return false)
+        return total.compareTo(expected) == 0
     }
 
     /**
@@ -153,14 +256,25 @@ public class OrderHandle internal constructor(
 
     /** Callback-based fill listener. Returns a cancellation closure. */
     public fun onFill(callback: (SimFill) -> Unit): () -> Unit {
-        val job = scope.launch {
-            runCatching {
-                val response = inner.submitted()
-                val orderId = extractOrderId(response.operation.outcome)
-                val cloid = extractCloid(response.operation.outcome)
-                deps.fillEvents().collect { (fill, _) ->
-                    if (fillMatches(fill, orderId, cloid)) callback(fill)
+        val job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            coroutineScope {
+                val queued = kotlinx.coroutines.channels.Channel<Pair<SimFill, RealmEvent>>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+                val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+                    try { deps.fillEvents().collect { queued.send(it) } }
+                    finally { queued.close() }
                 }
+                try {
+                    val response = inner.submitted()
+                    val orderId = extractOrderId(response.operation.outcome)
+                    val cloid = extractCloid(response.operation.outcome)
+                    val seen = mutableSetOf<String>()
+                    for ((fill, _) in queued) {
+                        val key = fill.fillId ?: fill.id.value
+                        if (!fill.isOptimistic && key.isNotEmpty() && fillMatches(fill, orderId, cloid) && seen.add(key)) callback(fill)
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { /* callback observers close on submission failure */ }
+                finally { collector.cancel(); queued.cancel() }
             }
         }
         return { job.cancel() }
@@ -209,19 +323,23 @@ public class OrderHandle internal constructor(
         when {
             order.status == OrderStatus.FAILED ->
                 throw ArcaException.Unknown("ORDER_${order.status.wire}", "Order $orderId reached ${order.status.wire}", null)
-            order.status == OrderStatus.CANCELLED && (order.filledSize == "0" || order.filledSize.isEmpty()) ->
+            order.status == OrderStatus.CANCELLED && (order.filledSize.toBigDecimalOrNull()?.signum() == 0) ->
                 throw ArcaException.Unknown("ORDER_${order.status.wire}", "Order $orderId was cancelled with no fills", null)
         }
     }
 
     private companion object {
-        private fun extractOrderId(outcome: String?): String {
+        private fun extractOrderId(outcome: String?, allowStructuredFallback: Boolean = true): String {
             val raw = outcome?.takeIf { it.isNotEmpty() }
                 ?: throw ArcaException.Unknown("NO_ORDER_ID", "Operation outcome does not contain an order ID", null)
             val parsed = runCatching {
                 arcaJson.parseToJsonElement(raw).jsonObject["orderId"]?.jsonPrimitive?.contentOrNull
             }.getOrNull()
-            return parsed?.takeIf { it.isNotEmpty() } ?: raw
+            parsed?.takeIf { it.isNotEmpty() }?.let { return it }
+            if (!allowStructuredFallback && raw.trimStart().firstOrNull() in setOf('{', '[')) {
+                throw ArcaException.Unknown("NO_ORDER_ID", "Operation outcome has no venue order ID yet", null)
+            }
+            return raw
         }
 
         /**

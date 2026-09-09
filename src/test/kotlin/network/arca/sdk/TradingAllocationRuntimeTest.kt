@@ -27,10 +27,22 @@ class TradingAllocationRuntimeTest {
                 """{"inputId":"input","market":"gllt:3","referencePrice":"1000","limitPrice":"1010.0","allocation":$state,"maximum":{"revision":"2","maxSize":"1.234567890123456789","maxNotional":"1234.567890123456789"},"affordable":false}""",
                 """{"operation":{"id":"op","realmId":"rlm_test","path":"/op/1","type":"order","state":"completed","createdAt":"2026-09-06T00:00:00Z","updatedAt":"2026-09-06T00:00:00Z"}}""",
             )
-            responses.forEach { server.enqueue(MockResponse().setHeader("Content-Type","application/json").setBody("""{"success":true,"data":$it}""")) }
+            val pending = java.util.concurrent.ConcurrentLinkedQueue(responses)
+            val httpRequests = java.util.Collections.synchronizedList(mutableListOf<okhttp3.mockwebserver.RecordedRequest>())
+            server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+                override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                    // The factory now opens its owned stream before POST. That
+                    // handshake must not consume a REST fixture from this test.
+                    if (request.path?.endsWith("/ws") == true) return MockResponse().setResponseCode(503)
+                    httpRequests.add(request)
+                    val body = pending.poll() ?: return MockResponse().setResponseCode(500)
+                    return MockResponse().setHeader("Content-Type","application/json").setBody("""{"success":true,"data":$body}""")
+                }
+            }
             server.start()
             val payload = Base64.getUrlEncoder().withoutPadding().encodeToString("""{"realmId":"rlm_test","sub":"user"}""".toByteArray())
             val arca = Arca(token = "e30.$payload.signature", baseUrl = server.url("/").toString().trimEnd('/'))
+            try {
             val result = arca.updateLeverage("obj","gllt:3",8,LeveragePreferenceMode.FIXED,"same-retry")
             assertNull(result.leverage)
             assertEquals(8,result.intendedLeverage)
@@ -44,7 +56,8 @@ class TradingAllocationRuntimeTest {
             val quote = arca.quoteTradingAllocation("obj",TradingAllocationQuoteRequest(market="gllt:3",side=OrderSide.BUY,orderType="market",selection=TradingLeverageSelection(LeveragePreferenceMode.FIXED,1)))
             assertEquals("1.234567890123456789",quote.maximum.maxSize); assertEquals(false,quote.affordable)
             arca.placeOrder(path="/op/1",objectId="obj",market="gllt:3",side=OrderSide.BUY,orderType=OrderType.MARKET,size="1",leverage=1,leverageMode=LeveragePreferenceMode.FIXED,slippageBps=100).submitted()
-            val requests = (1..7).map { server.takeRequest() }
+            val requests = httpRequests.toList()
+            assertEquals(7, requests.size)
             val first = arcaJson.parseToJsonElement(requests[0].body.readUtf8()).jsonObject
             assertTrue(requests[0].path!!.endsWith("/exchange/leverage"))
             assertEquals("fixed",first["mode"]!!.jsonPrimitive.content)
@@ -57,6 +70,7 @@ class TradingAllocationRuntimeTest {
             val placed = arcaJson.parseToJsonElement(requests[6].body.readUtf8()).jsonObject
             assertEquals("fixed",placed["leverageMode"]!!.jsonPrimitive.content)
             assertEquals("100",placed["slippageBps"]!!.jsonPrimitive.content)
+            } finally { arca.close() }
         }
     }
 }
