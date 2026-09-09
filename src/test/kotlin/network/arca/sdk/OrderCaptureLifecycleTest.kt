@@ -30,7 +30,7 @@ class OrderCaptureLifecycleTest {
         }
         override fun close() { scope.cancel(); ws.shutdown() }
     }
-    @Test fun submittedOnlyLearnsIdentityAndReleasesOnTerminalInEitherOrder() = runBlocking {
+    @Test fun submittedOnlyLearnsIdentityAndReleasesOnTerminalInEitherOrder() = runBlocking<Unit> {
         for (terminalFirst in listOf(false, true)) Harness().use { h ->
             h.start(); h.capture.submitted(operation(), "account")
             if (terminalFirst) h.ws.injectMessage(terminal())
@@ -39,7 +39,7 @@ class OrderCaptureLifecycleTest {
             waitFor { "unwatch" in h.socket.actions() }
         }
     }
-    @Test fun bufferedBeforeSubmissionAndWrongAccountOrderDoNotLeakOrReleaseEarly() = runBlocking {
+    @Test fun bufferedBeforeSubmissionAndWrongAccountOrderDoNotLeakOrReleaseEarly() = runBlocking<Unit> {
         Harness().use { h ->
             h.start(); h.ws.injectMessage(terminal())
             h.ws.injectMessage(operationEvent(operation("""{"orderId":"wrong"}""", "foreign")))
@@ -51,7 +51,7 @@ class OrderCaptureLifecycleTest {
             waitFor { "unwatch" in h.socket.actions() }
         }
     }
-    @Test fun knownOrderCannotBeReplacedByAnotherLegAndKeepsOtherWatchOwner() = runBlocking {
+    @Test fun knownOrderCannotBeReplacedByAnotherLegAndKeepsOtherWatchOwner() = runBlocking<Unit> {
         Harness().use { h ->
             h.start(); h.ws.watchPath("/")
             h.capture.submitted(operation("""{"orderId":"venue","status":"OPEN","filledSize":"0"}"""), "account")
@@ -61,7 +61,7 @@ class OrderCaptureLifecycleTest {
             h.ws.injectMessage(terminal()); waitFor { "unwatch" in h.socket.actions() }
         }
     }
-    @Test fun receiptTimeoutStillReleasesLaterWithoutRetry() = runBlocking {
+    @Test fun receiptTimeoutStillReleasesLaterWithoutRetry() = runBlocking<Unit> {
         Harness().use { h ->
             h.start(); val original = operation(); h.capture.submitted(original, "account")
             val inner = OperationHandle(h.scope, submit = { OrderOperationResponse(original) }, waitForSettlement = { original })
