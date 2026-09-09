@@ -186,3 +186,13 @@ MIT
 ## Account capabilities and reduction sizing
 
 Use getExchangeCapabilities for account-authoritative optional controls. Use normalizedReductionSize with canonical market, exact size and fraction; it reads market lot precision and returns an exact rounded-down decimal, rejecting missing metadata and invalid/sub-lot values. Never infer precision or feature support from a venue prefix.
+## Operation wait recovery
+
+`waitForOperation` listens before acquiring its subscription. Startup and actual
+stream gaps, reauthentication, or sparse operation notifications request a fresh,
+correlated acknowledgement before reading the operation. A failed acknowledgement
+or read gets at most three attempts per recovery; a healthy pending operation
+stays on the stream without periodic reads. A terminal push can complete during
+acknowledgement or snapshot recovery. Timeout stops the wait and preserves the
+original operation identity; it never submits a replacement operation.
+

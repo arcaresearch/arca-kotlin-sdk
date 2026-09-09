@@ -1,5 +1,7 @@
 package network.arca.sdk
 
+import kotlinx.coroutines.ensureActive
+
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -88,8 +90,7 @@ public suspend fun Arca.summary(): ExplorerSummary =
 
 /**
  * Wait for a specific operation to reach a terminal state. Uses WebSocket
- * `operation.updated` events for real-time settlement detection with periodic
- * HTTP polling as a safety net. Throws [ArcaException.OperationFailed] if the
+ * `operation.updated` events for real-time settlement detection with bounded snapshot recovery on startup and actual stream gaps. Throws [ArcaException.OperationFailed] if the
  * terminal state is `failed` or `expired`.
  */
 public suspend fun Arca.waitForOperation(operationId: String, timeoutSeconds: Double = 30.0): Operation =
@@ -98,45 +99,63 @@ public suspend fun Arca.waitForOperation(operationId: String, timeoutSeconds: Do
 /** Internal WebSocket-based settlement wait used by [OperationHandle]. */
 internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds: Double = 30.0): Operation {
     ws.ensureConnected()
-    ws.watchPath("/")
+    val requests = kotlinx.coroutines.channels.Channel<Long>(kotlinx.coroutines.channels.Channel.CONFLATED)
+    val revision = java.util.concurrent.atomic.AtomicLong()
+    fun recover() { requests.trySend(revision.incrementAndGet()) }
+    val gap = ws.onGap { recover() }
+    val auth = ws.onAuthenticated { recover() }
+    var acquired = false
     try {
-        val result = withTimeoutOrNull((timeoutSeconds * 1000).toLong()) {
+        val result = withTimeoutOrNull<Operation>((timeoutSeconds * 1000).toLong()) {
             coroutineScope {
-                val wsDeferred = async {
-                    val (op, _) = ws.operationEvents().first { (op, _) ->
-                        op.id.value == operationId && op.state.isTerminal
-                    }
-                    op
-                }
-                val pollDeferred = async {
-                    var found: Operation? = null
-                    while (isActive && found == null) {
-                        val detail = getOperation(operationId)
-                        if (detail.operation.state.isTerminal) {
-                            found = detail.operation
-                        } else {
-                            delay(2_000)
+                // Register the replay-zero collector before acquiring transport interest.
+                val pushed = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                    ws.events.first { event ->
+                        if (event.operation?.id?.value == operationId) event.operation.state.isTerminal
+                        else {
+                            if (event.operation == null && event.entityId == operationId && event.type in setOf("operation.updated", "operation.created")) recover()
+                            false
                         }
+                    }.operation!!
+                }
+                ws.watchPath("/"); acquired = true; recover()
+                val snapshots = async<Operation> {
+                    var completed = 0L
+                    for (requested in requests) {
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        if (requested <= completed) continue
+                        var covered = requested
+                        for (attempt in 0 until 3) {
+                            var acknowledged = false
+                            try { kotlinx.coroutines.withTimeout(1000) { ws.recoverPathReady("/") }; acknowledged = true }
+                            catch (_: kotlinx.coroutines.TimeoutCancellationException) { /* bounded ACK failure */ }
+                            catch (e: CancellationException) { throw e }
+                            catch (_: Exception) { /* REST may still recover a terminal result */ }
+                            covered = revision.get()
+                            try {
+                                val operation = getOperation(operationId).operation
+                                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                                check(operation.id.value == operationId) { "Operation recovery identity mismatch" }
+                                if (operation.state.isTerminal) return@async operation
+                                if (acknowledged) break
+                            } catch (e: CancellationException) { throw e }
+                            catch (_: Exception) { /* retry only actual read failures */ }
+                            if (attempt < 2) delay((attempt + 1) * 100L)
+                        }
+                        completed = covered
                     }
-                    found ?: throw CancellationException("poll cancelled")
+                    throw CancellationException("Operation recovery stopped")
                 }
-                val op = select {
-                    wsDeferred.onAwait { it }
-                    pollDeferred.onAwait { it }
-                }
-                wsDeferred.cancel()
-                pollDeferred.cancel()
-                op
+                try { select<Operation> { pushed.onAwait { it }; snapshots.onAwait { it } } }
+                finally { pushed.cancel(); snapshots.cancel() }
             }
-        } ?: throw ArcaException.Unknown(
-            "TIMEOUT",
-            "Timed out waiting for operation $operationId after ${timeoutSeconds.toInt()}s",
-            null,
-        )
+        } ?: throw ArcaException.Unknown("TIMEOUT", "Timed out waiting for operation $operationId after ${timeoutSeconds.toInt()}s", null)
         throwIfOperationFailed(result)
         return result
     } finally {
-        ws.unwatchPath("/")
+        requests.close()
+        ws.removeGapHandler(gap); ws.removeAuthenticatedHandler(auth)
+        if (acquired) ws.unwatchPath("/")
     }
 }
 
