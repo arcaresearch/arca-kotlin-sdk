@@ -341,3 +341,8 @@ order id, retaining the cloid; the platform re-correlates later fills/cancels on
 replacement back to the original placement operation. newSize must exceed the
 already-filled quantity (a resize at-or-below the filled amount is rejected). Unsized
 (sizeToMax) whole-position triggers have no size to amend and are rejected.
+
+
+## Account capabilities and reduction sizing
+
+Use getExchangeCapabilities for account-authoritative optional controls. Use normalizedReductionSize with canonical market, exact size and fraction; it reads market lot precision and returns an exact rounded-down decimal, rejecting missing metadata and invalid/sub-lot values. Never infer precision or feature support from a venue prefix.
