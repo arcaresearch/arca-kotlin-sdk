@@ -196,3 +196,5 @@ stays on the stream without periodic reads. A terminal push can complete during
 acknowledgement or snapshot recovery. Timeout stops the wait and preserves the
 original operation identity; it never submits a replacement operation.
 
+Terminal operations in the initial or buffered subscription snapshot resolve the wait before any HTTP read, including typed failed/expired results. Socket rotation requests fresh operation evidence on the replacement connection; its pong only establishes transport readiness. Stale snapshot request IDs and unrelated operation IDs cannot settle the wait.
+Verified snapshot operations are shared with all live waiters, including results buffered while another caller refreshes the same root watch; each waiter still accepts only its original operation ID.

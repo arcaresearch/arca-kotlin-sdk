@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -294,8 +295,11 @@ public class WebSocketManager internal constructor(
     // MARK: - Path watch management (ref-counted)
 
     private val acknowledgedPaths = HashMap<String, WebSocket?>()
+    private val acknowledgedOperations = HashMap<String, List<Operation>>()
+    private val operationSnapshotHandlers = ConcurrentHashMap<UUID, (List<Operation>) -> Unit>()
     private val pathWatchRequests = HashMap<WebSocket?, MutableMap<String, String>>()
     private val pathReadyWaiters = HashMap<UUID, Pair<String, CompletableDeferred<Unit>>>()
+    private val pathSnapshotWaiters = HashMap<UUID, Pair<String, CompletableDeferred<List<Operation>>>>()
 
     internal suspend fun awaitPathReady(path: String) {
         val id = UUID.randomUUID()
@@ -308,6 +312,18 @@ public class WebSocketManager internal constructor(
         finally { lock.withLock { pathReadyWaiters.remove(id) }; ready.cancel() }
     }
 
+    private suspend fun awaitPathSnapshotOperations(path: String): List<Operation> {
+        val id = UUID.randomUUID()
+        val ready = CompletableDeferred<List<Operation>>()
+        lock.withLock {
+            val operations = acknowledgedOperations[path]
+            if (statusFlow.value == ConnectionStatus.CONNECTED && (pathRefs[path] ?: 0) > 0 && acknowledgedPaths.containsKey(path) && acknowledgedPaths[path] === webSocket && operations != null) ready.complete(operations)
+            else pathSnapshotWaiters[id] = path to ready
+        }
+        return try { ready.await() }
+        finally { lock.withLock { pathSnapshotWaiters.remove(id) }; ready.cancel() }
+    }
+
     internal suspend fun recoverPathReady(path: String) {
         watchPath(path)
         try {
@@ -316,10 +332,18 @@ public class WebSocketManager internal constructor(
         } finally { unwatchPath(path) }
     }
 
+    internal suspend fun recoverPathSnapshotOperations(path: String): List<Operation> {
+        watchPath(path)
+        try {
+            lock.withLock { sendPathWatchLocked(webSocket, path) }
+            return awaitPathSnapshotOperations(path)
+        } finally { unwatchPath(path) }
+    }
+
     private fun sendPathWatchLocked(target: WebSocket?, path: String) {
         val requestId = "path-${UUID.randomUUID()}"
         pathWatchRequests.getOrPut(target) { HashMap() }[path] = requestId
-        if (target === webSocket) acknowledgedPaths.remove(path)
+        if (target === webSocket) { acknowledgedPaths.remove(path); acknowledgedOperations.remove(path) }
         sendMessage(target, buildJsonObject { put("action", "watch"); put("path", path); put("requestId", requestId) })
     }
 
@@ -329,6 +353,23 @@ public class WebSocketManager internal constructor(
         val matching = pathReadyWaiters.filterValues { it.first == path }
         matching.forEach { (id, value) -> pathReadyWaiters.remove(id); value.second.complete(Unit) }
     }
+
+    // Pong acknowledges transport readiness; only a correlated snapshot can
+    // resolve operation-payload recovery.
+    private fun acknowledgePathSnapshotLocked(path: String, operations: List<Operation>) {
+        if (statusFlow.value != ConnectionStatus.CONNECTED || (pathRefs[path] ?: 0) <= 0) return
+        acknowledgePathLocked(path)
+        acknowledgedOperations[path] = operations
+        operationSnapshotHandlers.values.forEach { it(operations) }
+        val matching = pathSnapshotWaiters.filterValues { it.first == path }
+        matching.forEach { (id, value) -> pathSnapshotWaiters.remove(id); value.second.complete(operations) }
+    }
+
+    internal fun onOperationSnapshot(handler: (List<Operation>) -> Unit): UUID {
+        val id = UUID.randomUUID(); operationSnapshotHandlers[id] = handler; return id
+    }
+
+    internal fun removeOperationSnapshotHandler(id: UUID) { operationSnapshotHandlers.remove(id) }
 
     public fun watchPath(path: String) {
         lock.withLock {
@@ -369,7 +410,7 @@ public class WebSocketManager internal constructor(
         lock.withLock {
             unsubJobs.remove(timerKey)
             if (!pathRefs.containsKey(path)) {
-                acknowledgedPaths.remove(path)
+                acknowledgedPaths.remove(path); acknowledgedOperations.remove(path)
                 pathWatchRequests[webSocket]?.remove(path)
                 sendMessage(buildJsonObject { put("action", "unwatch"); put("path", path) })
             }
@@ -1094,7 +1135,7 @@ public class WebSocketManager internal constructor(
 
     private fun handleAuthenticated(obj: JsonObject?) {
         lock.withLock {
-            acknowledgedPaths.clear()
+            acknowledgedPaths.clear(); acknowledgedOperations.clear()
             pathWatchRequests.clear()
             log.info("websocket") { "authenticated" }
             reconnectAttempt = 0
@@ -1199,7 +1240,11 @@ public class WebSocketManager internal constructor(
     private fun handleWatchSnapshot(obj: JsonObject) {
         obj["path"]?.jsonPrimitive?.contentOrNull?.let { path -> lock.withLock {
             val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull
-            if (requestId != null && pathWatchRequests[webSocket]?.get(path) == requestId) acknowledgePathLocked(path)
+            if (requestId != null && pathWatchRequests[webSocket]?.get(path) == requestId) {
+                val rows = (obj["operations"] as? JsonArray).orEmpty() + (obj["bufferedOperations"] as? JsonArray).orEmpty()
+                val operations = rows.mapNotNull { runCatching { arcaJson.decodeFromJsonElement(Operation.serializer(), it) }.getOrNull() }
+                acknowledgePathSnapshotLocked(path, operations)
+            }
         } }
         val watchId = obj["watchId"]?.jsonPrimitive?.contentOrNull ?: return
         obj["valuation"]?.let { valEl ->
@@ -1375,10 +1420,13 @@ public class WebSocketManager internal constructor(
             // second dispatch to consumers, no spurious DISCONNECTED, and no
             // reconnect competing with the socket that just took over.
             webSocket = socket
+            acknowledgedOperations.clear()
             pathRefs.keys.forEach { path ->
                 if (pathWatchRequests[socket]?.containsKey(path) == true) acknowledgePathLocked(path)
                 else sendPathWatchLocked(socket, path)
             }
+            // Restart payload recovery on the new connection; pong carries no snapshot.
+            pathSnapshotWaiters.values.map { it.first }.toSet().forEach { sendPathWatchLocked(socket, it) }
             pathWatchRequests.keys.retainAll(setOf(socket))
             // New connection, new sequence space.
             lastDeliverySeq = 0

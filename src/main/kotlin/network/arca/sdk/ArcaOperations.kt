@@ -104,6 +104,11 @@ internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds:
     fun recover() { requests.trySend(revision.incrementAndGet()) }
     val gap = ws.onGap { recover() }
     val auth = ws.onAuthenticated { recover() }
+    val rotated = ws.onRotated { recover() }
+    val snapshotTerminal = kotlinx.coroutines.CompletableDeferred<Operation>()
+    val snapshotObserver = ws.onOperationSnapshot { operations ->
+        operations.firstOrNull { it.id.value == operationId && it.state.isTerminal }?.let { snapshotTerminal.complete(it) }
+    }
     var acquired = false
     try {
         val result = withTimeoutOrNull<Operation>((timeoutSeconds * 1000).toLong()) {
@@ -127,7 +132,11 @@ internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds:
                         var covered = requested
                         for (attempt in 0 until 3) {
                             var acknowledged = false
-                            try { kotlinx.coroutines.withTimeout(1000) { ws.recoverPathReady("/") }; acknowledged = true }
+                            try {
+                                val operations = kotlinx.coroutines.withTimeout(1000) { ws.recoverPathSnapshotOperations("/") }
+                                acknowledged = true
+                                operations.firstOrNull { it.id.value == operationId && it.state.isTerminal }?.let { return@async it }
+                            }
                             catch (_: kotlinx.coroutines.TimeoutCancellationException) { /* bounded ACK failure */ }
                             catch (e: CancellationException) { throw e }
                             catch (_: Exception) { /* REST may still recover a terminal result */ }
@@ -146,7 +155,7 @@ internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds:
                     }
                     throw CancellationException("Operation recovery stopped")
                 }
-                try { select<Operation> { pushed.onAwait { it }; snapshots.onAwait { it } } }
+                try { select<Operation> { pushed.onAwait { it }; snapshots.onAwait { it }; snapshotTerminal.onAwait { it } } }
                 finally { pushed.cancel(); snapshots.cancel() }
             }
         } ?: throw ArcaException.Unknown("TIMEOUT", "Timed out waiting for operation $operationId after ${timeoutSeconds.toInt()}s", null)
@@ -154,7 +163,8 @@ internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds:
         return result
     } finally {
         requests.close()
-        ws.removeGapHandler(gap); ws.removeAuthenticatedHandler(auth)
+        ws.removeGapHandler(gap); ws.removeAuthenticatedHandler(auth); ws.removeRotatedHandler(rotated)
+        ws.removeOperationSnapshotHandler(snapshotObserver); snapshotTerminal.cancel()
         if (acquired) ws.unwatchPath("/")
     }
 }

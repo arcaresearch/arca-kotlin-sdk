@@ -352,3 +352,6 @@ watchFills.fills is the merged StateFlow<List<Fill>>. Listener registration prec
 ## General operation recovery
 
 Operation waits register listeners before subscribing. Startup, actual gaps, reauthentication and sparse operation notifications recover behind a fresh correlated ACK, with at most three failed attempts. Healthy pending operations do not poll. Terminal pushes win during recovery; cancellation releases only the owned watch. No timeout automatically replays a mutation.
+
+Operation snapshot evidence: Terminal operations in the initial or buffered subscription snapshot resolve the wait before any HTTP read, including typed failed/expired results. Socket rotation requests fresh operation evidence on the replacement connection; its pong only establishes transport readiness. Stale snapshot request IDs and unrelated operation IDs cannot settle the wait.
+Verified snapshot operations are shared with all live waiters, including results buffered while another caller refreshes the same root watch; each waiter still accepts only its original operation ID.
