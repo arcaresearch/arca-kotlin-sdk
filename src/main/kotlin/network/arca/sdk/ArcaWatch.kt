@@ -836,7 +836,12 @@ public suspend fun Arca.watchOI(
 
 /**
  * Watch real-time mid prices. Each update is a full snapshot of all known prices.
- * Call [MarketPriceStream.stop] when done.
+ *
+ * Returns once prices are available, so [MarketPriceStream.prices] is
+ * populated on return — for the first subscriber that is the server's
+ * snapshot, and for every later one it is the map the manager retained from it
+ * (the subscription is ref-counted, so the server only sends a snapshot per
+ * subscribe). Call [MarketPriceStream.stop] when done.
  */
 public suspend fun Arca.watchPrices(exchange: String = "sim"): MarketPriceStream {
     ws.ensureConnected()
@@ -879,6 +884,13 @@ public suspend fun Arca.watchPrices(exchange: String = "sim"): MarketPriceStream
  * changes. When the object is server-priced, max-order-size comes from the
  * server's active-asset-data endpoint instead of local derivation. Call
  * [MaxOrderSizeWatchStream.stop] when done.
+ *
+ * [MaxOrderSizeWatchStream.activeAssetData] can still be `null` when this
+ * returns — it needs both an exchange state and a mark for the selected
+ * market, and a market the venue prices nowhere has neither. `state` stays
+ * `LOADING` and [MaxOrderSizeWatchStream.pendingReason] says which input is
+ * missing. Hold sizing controls in a loading state while it is set; an empty
+ * rail reads to the user as an empty account.
  */
 public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): MaxOrderSizeWatchStream {
     ws.ensureConnected()
@@ -903,6 +915,12 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     var tiers: List<MarginTier>? = null
     var askRatio = 1.0
     var bidRatio = 1.0
+    // Fallback mark for the selected market, used only when the live mids map
+    // has no entry for it. The same response already supplies the spread
+    // ratios below; reading its `markPx` costs nothing and is the difference
+    // between a ticket that can size the order and one that waits for a quiet
+    // market to print its next mid.
+    var seedMark: String? = null
     runCatching {
         getActiveAssetData(
             objectId = options.objectId,
@@ -915,6 +933,7 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
         data.marginTiers?.takeIf { it.isNotEmpty() }?.let { tiers = it }
         val mid = data.markPx.toDoubleOrNull()
         if (mid != null && mid > 0) {
+            seedMark = data.markPx
             data.bidPx?.toDoubleOrNull()?.let { if (it > 0) bidRatio = it / mid }
             data.askPx?.toDoubleOrNull()?.let { if (it > 0) askRatio = it / mid }
         }
@@ -926,9 +945,18 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     val jobs = mutableListOf<Job>()
 
     fun recompute(): ActiveAssetData? {
-        val exState = exchangeStateBox.value ?: return null
+        val exState = exchangeStateBox.value ?: run {
+            stream.pendingReasonMut.value = MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE
+            return null
+        }
         val mids = priceStream.prices.value
-        val markPx = mids[options.market]?.toDoubleOrNull() ?: 0.0
+        // Live mid wins; the snapshot mark only covers a market the mids map
+        // has not carried yet.
+        val markPx = (mids[options.market] ?: seedMark)?.toDoubleOrNull() ?: 0.0
+        if (markPx <= 0) {
+            stream.pendingReasonMut.value = MaxOrderSizePendingReason.AWAITING_MARK_PRICE
+            return null
+        }
         // Re-mark the book against current mids before deriving.
         //
         // Load-bearing for HIP-3 markets, not merely a freshness nicety: the
@@ -942,7 +970,7 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
         // `totalCollateralUsd` is spot cash and price-invariant by
         // construction, so re-marking positions is the whole of what moves.
         val marked = if (mids.isEmpty()) exState else exState.revalued(mids)
-        return deriveActiveAssetData(
+        val derived = deriveActiveAssetData(
             exchangeState = marked,
             market = options.market,
             markPx = markPx,
@@ -956,16 +984,24 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
             askRatio = askRatio,
             bidRatio = bidRatio,
         )
+        stream.pendingReasonMut.value =
+            if (derived == null) MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE else null
+        return derived
     }
 
-    suspend fun fetchServerActiveAssetData(): ActiveAssetData? = runCatching {
-        getActiveAssetData(
-            objectId = options.objectId,
-            market = options.market,
-            applicationFeeTenthsBps = options.builderFeeBps,
-            leverage = options.leverage,
-        )
-    }.getOrNull()
+    suspend fun fetchServerActiveAssetData(): ActiveAssetData? {
+        val data = runCatching {
+            getActiveAssetData(
+                objectId = options.objectId,
+                market = options.market,
+                applicationFeeTenthsBps = options.builderFeeBps,
+                leverage = options.leverage,
+            )
+        }.getOrNull()
+        stream.pendingReasonMut.value =
+            if (data == null) MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE else null
+        return data
+    }
 
     if (initialExchangeState.pricingMode == network.arca.sdk.models.PricingMode.SERVER) {
         fetchServerActiveAssetData()?.let { stream.activeAssetDataMut.value = it }

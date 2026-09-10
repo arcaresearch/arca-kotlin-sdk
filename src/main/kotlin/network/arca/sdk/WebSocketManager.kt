@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
@@ -130,6 +131,17 @@ public class WebSocketManager internal constructor(
     private val pathRefs = HashMap<String, Int>()
     private var midsRefs = 0
     private var midsExchange = "sim"
+
+    // Latest merged mid prices, held while the mids subscription is live.
+    //
+    // The server answers each `subscribe_mids` with one `mids.snapshot`, and
+    // the subscription is ref-counted, so only the consumer that took the 0→1
+    // edge is collecting when that snapshot arrives. Without a retained copy
+    // every later `watchPrices()` starts empty and fills one delta at a time —
+    // so a market that does not tick stays unpriced for that consumer for as
+    // long as it stays quiet. [midsEvents] replays this map to each new
+    // collector as its first element.
+    private var retainedMids: Map<String, String>? = null
     private val candleRefCoins = HashMap<String, MutableSet<String>>()
     private val oiRefCoins = HashMap<String, MutableSet<String>>()
     private val chartHistoryWatches = HashMap<String, ChartWatch>()
@@ -454,6 +466,7 @@ public class WebSocketManager internal constructor(
             unsubJobs.remove("mids")
             if (midsRefs == 0) {
                 subscribedMids = null
+                retainedMids = null
                 sendMessage(buildJsonObject { put("action", "unsubscribe_mids") })
             }
             maybeStartIdleTimerLocked()
@@ -719,10 +732,27 @@ public class WebSocketManager internal constructor(
         if (event.type == EventType.EXCHANGE_UPDATED.wire) event else null
     }
 
-    public fun midsEvents(): Flow<Map<String, String>> = filtered { event ->
-        val mids = event.mids
-        if (event.type == EventType.MIDS_UPDATED.wire && mids != null) mids else null
-    }
+    /**
+     * A stream of mid price updates.
+     *
+     * The current merged price map is replayed as the first element when one
+     * is held, so a collector that subscribes after the server's
+     * `mids.snapshot` starts from the same prices as the one that received it
+     * rather than from nothing. `onSubscription` runs after the subscription
+     * is registered, so a live update cannot fall between replay and
+     * registration.
+     */
+    public fun midsEvents(): Flow<Map<String, String>> = bus.asSharedFlow()
+        .onSubscription {
+            val retained = lock.withLock { retainedMids }
+            if (retained != null) {
+                emit(RealmEvent(type = EventType.MIDS_UPDATED.wire, mids = retained))
+            }
+        }
+        .mapNotNull { event ->
+            val mids = event.mids
+            if (event.type == EventType.MIDS_UPDATED.wire && mids != null) mids else null
+        }
 
     public fun aggregationEvents(): Flow<Triple<String, PathAggregation?, RealmEvent>> = filtered { event ->
         val id = event.entityId
@@ -1096,6 +1126,10 @@ public class WebSocketManager internal constructor(
                 "mids.snapshot" -> {
                     val midsRaw = obj["mids"]?.jsonObject ?: return
                     val mids = midsRaw.mapValues { it.value.jsonPrimitive.content }
+                    // A snapshot is the authoritative current state for
+                    // whatever the socket is subscribed to, so it replaces the
+                    // retained map rather than merging into it.
+                    lock.withLock { retainedMids = mids }
                     emit(RealmEvent(type = EventType.MIDS_UPDATED.wire, mids = mids))
                     return
                 }
@@ -1130,7 +1164,14 @@ public class WebSocketManager internal constructor(
             obj["deliverySeq"]?.jsonPrimitive?.intOrNull?.let { lock.withLock { checkDeliveryGap(it) } }
         }
 
-        runCatching { arcaJson.decodeFromString(RealmEvent.serializer(), text) }.getOrNull()?.let { emit(it) }
+        runCatching { arcaJson.decodeFromString(RealmEvent.serializer(), text) }.getOrNull()?.let { event ->
+            if (event.type == EventType.MIDS_UPDATED.wire) {
+                event.mids?.let { mids ->
+                    lock.withLock { retainedMids = (retainedMids ?: emptyMap()) + mids }
+                }
+            }
+            emit(event)
+        }
     }
 
     private fun handleAuthenticated(obj: JsonObject?) {

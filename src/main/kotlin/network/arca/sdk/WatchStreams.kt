@@ -322,7 +322,15 @@ public class MarketPriceStream internal constructor() : BaseWatchStream() {
     internal val pricesMut: MutableStateFlow<Map<String, String>> = MutableStateFlow(emptyMap())
     internal val updatesMut: MutableSharedFlow<Map<String, String>> = snapshotUpdatesFlow()
 
-    /** Current mid prices, populated on first snapshot and refreshed on reconnect. */
+    /**
+     * Current mid prices, populated before this stream is returned and
+     * refreshed on reconnect.
+     *
+     * Every subscriber starts from the same map, not only the first one on the
+     * socket: the mids subscription is ref-counted and the server sends its
+     * snapshot once per subscribe, so the manager retains that map and replays
+     * it to each later subscriber.
+     */
     public val prices: StateFlow<Map<String, String>> get() = pricesMut.asStateFlow()
 
     /** A stream of mid price updates (each update is a full snapshot of all prices). */
@@ -460,19 +468,52 @@ public data class MaxOrderSizeWatchOptions(
     public val builderFeeBps: Int get() = applicationFeeTenthsBps ?: 0
 }
 
+/** Why a [MaxOrderSizeWatchStream] has no [ActiveAssetData] yet.
+ *
+ * Wire values match the TypeScript SDK's `MaxOrderSizePendingReason`. */
+public enum class MaxOrderSizePendingReason(public val wire: String) {
+    /** No usable account snapshot yet (or the venue quotes this account
+     *  through a mirror the client must not second-guess). */
+    AWAITING_EXCHANGE_STATE("awaiting_exchange_state"),
+
+    /** No mark price for the selected market yet — neither from the live mids
+     *  map nor from the setup `getActiveAssetData` read. */
+    AWAITING_MARK_PRICE("awaiting_mark_price"),
+}
+
 /** A stream that recomputes [ActiveAssetData] whenever exchange state or mid prices change. */
 public class MaxOrderSizeWatchStream internal constructor() : BaseWatchStream() {
     internal val activeAssetDataMut: MutableStateFlow<ActiveAssetData?> = MutableStateFlow(null)
+    internal val pendingReasonMut: MutableStateFlow<MaxOrderSizePendingReason?> =
+        MutableStateFlow(MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE)
     internal val updatesMut: MutableSharedFlow<ActiveAssetData> = snapshotUpdatesFlow()
 
-    /** Latest derived active asset data (null until first computation). */
+    /**
+     * Latest derived active asset data.
+     *
+     * `null` until the first computation, which needs both an exchange state
+     * and a mark for the selected market — so this can still be `null` when
+     * `watchMaxOrderSize` returns. Read [pendingReason] before treating an
+     * absent figure as zero.
+     */
     public val activeAssetData: StateFlow<ActiveAssetData?> get() = activeAssetDataMut.asStateFlow()
+
+    /**
+     * Why no [activeAssetData] is available yet, or `null` when it is.
+     *
+     * [MaxOrderSizePendingReason.AWAITING_MARK_PRICE] in particular means the
+     * account is fine and the market is simply unpriced so far — a ticket
+     * should hold its sizing controls in a loading state rather than render a
+     * $0 rail, which reads to the user as "you have no money".
+     */
+    public val pendingReason: StateFlow<MaxOrderSizePendingReason?> get() = pendingReasonMut.asStateFlow()
 
     /** A stream of recomputed active asset data. */
     public val updates: Flow<ActiveAssetData> get() = updatesMut.asSharedFlow()
 
     internal fun push(data: ActiveAssetData) {
         activeAssetDataMut.value = data
+        pendingReasonMut.value = null
         updatesMut.tryEmit(data)
     }
 }

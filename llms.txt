@@ -151,7 +151,7 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchPnlChart(path, from, to) | StateFlow<List<PnlPoint>> + PnlChartUpdate |
 | arca.watchCandleChart(market, interval, ...) | StateFlow<List<Candle>> + CandleChartUpdate |
 | arca.watchOI(coins, intervals) | Flow<OIEvent> (market, interval, bar, isClosed) |
-| arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> |
+| arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> + StateFlow<MaxOrderSizePendingReason?> pendingReason |
 | arca.watchProjection(name) | StateFlow<Map<String,ProjectedValuation>> valuations keyed by path — one batched watch over every object the projection covers. Loads the full initial snapshot (watch reply + REST pages), merges per-account DELTA frames (only changed rows arrive; a `removed` list drops deleted paths), re-marks rows client-side on every mids tick, and re-creates the server-side watch on reconnect/rotation. Requires arca:ReadProjection. |
 
 Buying power is TWO numbers on a venue with a cross-dex reservation (the live
@@ -198,6 +198,23 @@ evaluation on `collateralModel.nativeAvailableUsd` / `crossDexAvailableUsd`;
 treat those as an anchor (correct at the marks of that read, stale as soon as
 the price moves), keep deriving, and remember they are absent on older servers
 — absent is not zero.
+
+Unknown is never `$0`. `MaxOrderSizeWatchStream.activeAssetData` is `null`
+until the stream has both an exchange state and a mark for the market, so it
+can still be `null` when `watchMaxOrderSize` returns; `pendingReason` says
+which is missing (`AWAITING_EXCHANGE_STATE` / `AWAITING_MARK_PRICE`). Hold
+sizing controls in a loading state while it is set — an empty amount rail on an
+unpriced market is indistinguishable, to the user, from being told the account
+is empty. A quiet market does not produce this state on its own: the stream
+inherits the retained price snapshot and seeds the selected market's mark from
+the setup `getActiveAssetData` read.
+
+`watchPrices()` returns with `prices.value` populated for **every** subscriber,
+not only the first. The subscription is ref-counted, so the server sends one
+`mids.snapshot` per subscribe; the SDK retains that merged map and replays it to
+each later collector (which is what keeps the price stream `watchMaxOrderSize`
+opens internally from starting empty and filling in one market at a time as each
+one ticks).
 
 Venues can advertise `stateRefreshIntervalMs`; account and max-size watches
 then refresh even without trades or ticks (clamped to 5–60 seconds, canceled on

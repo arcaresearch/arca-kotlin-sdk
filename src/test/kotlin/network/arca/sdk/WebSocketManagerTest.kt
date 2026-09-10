@@ -120,6 +120,73 @@ class WebSocketManagerTest {
         assertEquals("97100", received.first()["hl:0:BTC"])
     }
 
+    // MARK: - Retained mids replay
+
+    /**
+     * The mids subscription is ref-counted and the server answers each
+     * `subscribe_mids` with exactly one `mids.snapshot`, so only the collector
+     * holding the 0→1 edge is live when it lands. A collector created
+     * afterwards has to be handed the retained map, or it starts from nothing
+     * and fills one market at a time as each one happens to tick.
+     */
+    @Test
+    fun midsEventsReplaysRetainedSnapshotToALateCollector() = runBlocking {
+        val manager = makeManager()
+        manager.injectMessage("""{"type":"mids.snapshot","mids":{"hl:0:BTC":"80000","hl:0:ADA":"0.5"}}""")
+        // A delta after the snapshot: the replayed map must carry the merge,
+        // not just the snapshot.
+        manager.injectMessage("""{"type":"mids.updated","mids":{"hl:0:ADA":"0.51"},"deliverySeq":1}""")
+
+        val received = collect(manager.midsEvents()) { }
+
+        assertEquals(1, received.size)
+        assertEquals("80000", received.first()["hl:0:BTC"], "A late collector must inherit the quiet market's price")
+        assertEquals("0.51", received.first()["hl:0:ADA"], "The retained map merges deltas over the snapshot")
+    }
+
+    /** The replay is a seed, not a substitute: live updates still arrive, and they arrive after it. */
+    @Test
+    fun midsEventsDeliversLiveUpdatesAfterTheReplay() = runBlocking {
+        val manager = makeManager()
+        manager.injectMessage("""{"type":"mids.snapshot","mids":{"hl:0:BTC":"80000"}}""")
+
+        val received = collect(manager.midsEvents()) {
+            manager.injectMessage("""{"type":"mids.updated","mids":{"hl:0:BTC":"80100"},"deliverySeq":1}""")
+        }
+
+        assertEquals(2, received.size)
+        assertEquals("80000", received.first()["hl:0:BTC"], "The replay comes first")
+        assertEquals("80100", received.last()["hl:0:BTC"], "Then the live tick")
+    }
+
+    /**
+     * Nothing is retained before the first snapshot, and nothing is retained
+     * once the subscription is dropped — a stale map must not outlive the
+     * subscription it describes.
+     */
+    @Test
+    fun retainedMidsAreNotReplayedBeforeSubscribeOrAfterRelease() = runBlocking {
+        val manager = makeManager()
+
+        val cold = collect(manager.midsEvents(), durationMs = 100) { }
+        assertTrue(cold.isEmpty(), "There is nothing to replay before the first snapshot")
+
+        manager.acquireMids("sim")
+        manager.injectMessage("""{"type":"mids.snapshot","mids":{"hl:0:BTC":"80000"}}""")
+        assertEquals(
+            "80000",
+            collect(manager.midsEvents(), durationMs = 100) { }.firstOrNull()?.get("hl:0:BTC"),
+        )
+
+        // Releasing the last reference unsubscribes after the debounce, which
+        // is what drops the map.
+        manager.releaseMids()
+        delay(400) // comfortably past the 100ms unsubscribe debounce
+
+        val afterRelease = collect(manager.midsEvents(), durationMs = 100) { }
+        assertTrue(afterRelease.isEmpty(), "Dropping the subscription drops the retained map")
+    }
+
     @Test
     fun exchangeNotificationsDeliverBareExchangeUpdated() = runBlocking {
         val manager = makeManager()
