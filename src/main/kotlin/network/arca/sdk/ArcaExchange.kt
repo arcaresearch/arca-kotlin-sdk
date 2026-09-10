@@ -807,6 +807,7 @@ public fun Arca.openWithBracket(
     // `tpsl == null` selects the entry (orders[0]).
     fun legHandle(tpsl: String?): OrderHandle {
         val deps = makeOrderHandleDeps(captures.getValue(tpsl ?: "")) { selectLegOperation(it, tpsl) }
+        deps.lifecycleLeg = if (tpsl == null) 0 else if (tpsl == "tp") 1 else if (takeProfitPx.isNullOrEmpty()) 1 else 2
         val inner = OperationHandle(
             scope = scope,
             submit = {
@@ -910,6 +911,7 @@ private fun Arca.makeOrderHandleDeps(capture: OrderEventCapture? = null,
             awaitClose { self.ws.removeGapHandler(gap); self.ws.removeAuthenticatedHandler(auth) }
         } },
         recoverExecutionReady = { self.ws.recoverPathReady("/") },
+        watchLifecycle = { objectId, original, leg -> self.watchOrderLifecycle(objectId, original, leg) },
     )
 }
 

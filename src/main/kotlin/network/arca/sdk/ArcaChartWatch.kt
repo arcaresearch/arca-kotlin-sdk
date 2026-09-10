@@ -136,7 +136,6 @@ public suspend fun Arca.watchEquityChart(
 
     var historical = trimmed.toMutableList()
     var liveEquity: String? = aggStream.aggregation.value?.totalEquityUsd
-    var lastAggAtMs = System.currentTimeMillis()
 
     val initialChart = trimmed.toMutableList()
     aggStream.aggregation.value?.let { agg ->
@@ -207,7 +206,6 @@ public suspend fun Arca.watchEquityChart(
             var doRefresh = false
             var emit: List<EquityPoint>? = null
             mutex.withLock {
-                lastAggAtMs = System.currentTimeMillis()
                 val previousLiveEquity = liveEquity
                 val live = agg.totalEquityUsd
                 val currentBoundary = bucketBoundary(nowEpochSeconds(), resolutionSeconds)
@@ -270,25 +268,7 @@ public suspend fun Arca.watchEquityChart(
         ws.authenticatedStream.collect { refreshHistory() }
     }
 
-    jobs += scope.launch {
-        val tick = maxOf(minOf(30L, mutex.withLock { resolutionSeconds }), 1L)
-        while (isActive) {
-            delay(tick * 1000)
-            if (!isActive) return@launch
-            val nowEpoch = nowEpochSeconds()
-            var shouldRefresh = false
-            mutex.withLock {
-                val currentBoundary = bucketBoundary(nowEpoch, resolutionSeconds)
-                val silenceMs = System.currentTimeMillis() - lastAggAtMs
-                if (currentBoundary > hourBoundary &&
-                    silenceMs > (BOUNDARY_AGG_SILENCE_FACTOR * resolutionSeconds * 1000).toLong()
-                ) {
-                    shouldRefresh = true
-                }
-            }
-            if (shouldRefresh) refreshHistory()
-        }
-    }
+    // Quiet streams are valid; chart snapshots and detected gaps own history reads.
 
     stream.stopAction = {
         ws.removeGapHandler(gapId)
@@ -409,7 +389,6 @@ public suspend fun Arca.watchPnlChart(
     var historical = trimmed.toMutableList()
     var flows: List<ExternalFlowEntry> = history.externalFlows ?: emptyList()
     var liveEquity: String? = aggStream.aggregation.value?.totalEquityUsd
-    var lastAggAtMs = System.currentTimeMillis()
 
     var initialChart = trimmed.toMutableList()
     aggStream.aggregation.value?.let { agg ->
@@ -488,7 +467,6 @@ public suspend fun Arca.watchPnlChart(
             var doRefresh = false
             var emit: PnlChartUpdate? = null
             mutex.withLock {
-                lastAggAtMs = System.currentTimeMillis()
                 // Capture the previous live values BEFORE absorbing the new agg
                 // so a boundary cross emits the value current right before the
                 // boundary (matching the TS PnlChartStream behaviour).
@@ -568,25 +546,7 @@ public suspend fun Arca.watchPnlChart(
         ws.authenticatedStream.collect { refreshHistory() }
     }
 
-    jobs += scope.launch {
-        val tick = maxOf(minOf(30L, mutex.withLock { resolutionSeconds }), 1L)
-        while (isActive) {
-            delay(tick * 1000)
-            if (!isActive) return@launch
-            val nowEpoch = nowEpochSeconds()
-            var shouldRefresh = false
-            mutex.withLock {
-                val currentBoundary = bucketBoundary(nowEpoch, resolutionSeconds)
-                val silenceMs = System.currentTimeMillis() - lastAggAtMs
-                if (currentBoundary > hourBoundary &&
-                    silenceMs > (BOUNDARY_AGG_SILENCE_FACTOR * resolutionSeconds * 1000).toLong()
-                ) {
-                    shouldRefresh = true
-                }
-            }
-            if (shouldRefresh) refreshHistory()
-        }
-    }
+    // Quiet streams are valid; chart snapshots and detected gaps own history reads.
 
     stream.stopAction = {
         ws.removeGapHandler(gapId)
