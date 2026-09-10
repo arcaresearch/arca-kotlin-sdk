@@ -145,19 +145,6 @@ public class WebSocketManager internal constructor(
     private val candleRefCoins = HashMap<String, MutableSet<String>>()
     private val oiRefCoins = HashMap<String, MutableSet<String>>()
     private val chartHistoryWatches = HashMap<String, ChartWatch>()
-    private val orderLifecycleTransport = OrderLifecycleTransport(
-        lock, scope, realmId,
-        connected = { status == ConnectionStatus.CONNECTED },
-        send = { sendMessage(it) },
-        sequence = { checkDeliveryGap(it) },
-        interestChanged = { starting ->
-            if (starting) { cancelIdleTimerLocked(); ensureConnected() }
-            else maybeStartIdleTimerLocked()
-        },
-    )
-
-    internal fun watchOrderLifecycle(objectId: String, operationId: String, leg: Int, snapshotTimeoutMs: Long = 45_000): OrderLifecycleWatch =
-        orderLifecycleTransport.watch(objectId, operationId, leg, snapshotTimeoutMs)
 
     // Watches created out-of-band (REST POST /aggregations/watch) that this
     // socket registered for delivery. Delivery is ownership-gated
@@ -257,7 +244,6 @@ public class WebSocketManager internal constructor(
     /** Disconnect and stop reconnecting. */
     public fun disconnect() {
         lock.withLock {
-            orderLifecycleTransport.stopAll()
             shouldReconnect = false
             reconnectJob?.cancel(); reconnectJob = null
             resumeProbeJob?.cancel(); resumeProbeJob = null
@@ -682,7 +668,6 @@ public class WebSocketManager internal constructor(
     private fun hasAnyInterestLocked(): Boolean =
         pathRefs.isNotEmpty() || midsRefs > 0 || candleRefCoins.isNotEmpty() || oiRefCoins.isNotEmpty() ||
             chartHistoryWatches.isNotEmpty() || attachedWatches.isNotEmpty()
-            || orderLifecycleTransport.hasInterest()
 
     private fun maybeStartIdleTimerLocked() {
         if (hasAnyInterestLocked() || idleDisconnectJob != null) return
@@ -919,7 +904,6 @@ public class WebSocketManager internal constructor(
                     "currentSeq" to seq.toString(),
                 ),
             ) { "delivery gap detected" }
-            orderLifecycleTransport.recover()
             gapHandlers.values.forEach { it(missed) }
         }
         lastDeliverySeq = seq
@@ -1118,7 +1102,6 @@ public class WebSocketManager internal constructor(
         val obj = runCatching { arcaJson.parseToJsonElement(text).jsonObject }.getOrNull()
 
         if (obj != null) {
-            if (orderLifecycleTransport.deliver(obj)) return
             when (obj["type"]?.jsonPrimitive?.contentOrNull ?: "") {
                 "pong" -> return
                 "stream.resync" -> {
@@ -1132,10 +1115,7 @@ public class WebSocketManager internal constructor(
                     // sequence check runs first and stays contiguous for
                     // subsequent messages. A control message: never emitted to
                     // event flows.
-                    lock.withLock {
-                        obj["deliverySeq"]?.jsonPrimitive?.intOrNull?.let { checkDeliveryGap(it) }
-                        orderLifecycleTransport.recover()
-                    }
+                    obj["deliverySeq"]?.jsonPrimitive?.intOrNull?.let { lock.withLock { checkDeliveryGap(it) } }
                     log.warning("websocket") { "server announced event loss (stream.resync)" }
                     gapHandlers.values.forEach { it(1) }
                     return
@@ -1205,7 +1185,6 @@ public class WebSocketManager internal constructor(
             setStatusLocked(ConnectionStatus.CONNECTED)
             startHeartbeatLocked()
             resubscribeAllLocked(webSocket)
-            orderLifecycleTransport.reattach()
             scheduleRotationLocked()
         }
         // Notify subscribers AFTER all subscriptions are re-issued.
@@ -1493,7 +1472,6 @@ public class WebSocketManager internal constructor(
             // New connection, new sequence space.
             lastDeliverySeq = 0
             lastMessageAtMs = System.currentTimeMillis()
-            orderLifecycleTransport.reattach()
             startHeartbeatLocked()
             scheduleRotationLocked()
             previous

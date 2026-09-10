@@ -49,8 +49,6 @@ public class OrderHandleDeps internal constructor(
     internal val getExecutionOperation: (suspend (String) -> Operation)? = null,
     internal val executionGaps: (() -> Flow<Unit>)? = null,
     internal val recoverExecutionReady: (suspend () -> Unit)? = null,
-    internal val watchLifecycle: (suspend (String, OriginalOrderReference, Int) -> OrderLifecycleWatch)? = null,
-    internal var lifecycleLeg: Int = 0,
 )
 
 /**
@@ -91,12 +89,7 @@ public class OrderHandle internal constructor(
     public suspend fun settled(timeoutSeconds: Double): OrderOperationResponse = inner.settled(timeoutSeconds)
 
     /** Prompt terminal evidence; full metadata and ledger history remain separate. */
-    public suspend fun executionReceipt(timeoutSeconds: Double = 30.0): OrderExecutionReceipt {
-        if (deps.watchLifecycle != null) return serverLifecycleReceipt(timeoutSeconds, false).receipt()
-        return legacyExecutionReceipt(timeoutSeconds)
-    }
-
-    private suspend fun legacyExecutionReceipt(timeoutSeconds: Double): OrderExecutionReceipt = try {
+    public suspend fun executionReceipt(timeoutSeconds: Double = 30.0): OrderExecutionReceipt = try {
         withTimeout((timeoutSeconds * 1000).toLong()) {
             coroutineScope {
                 val submitted = inner.submitted()
@@ -158,49 +151,8 @@ public class OrderHandle internal constructor(
         throw ArcaException.Unknown("TIMEOUT", "Order execution timed out", null)
     }
 
-    /** Follow the retained operation and exact batch leg; stop the returned watch when done. */
-    public suspend fun lifecycleUpdates(timeoutSeconds: Double = 30.0): OrderLifecycleWatch {
-        val watch = deps.watchLifecycle ?: throw ArcaException.Unknown("ORDER_LIFECYCLE_UNAVAILABLE", "Original order lifecycle is unavailable", null)
-        require(timeoutSeconds.isFinite() && timeoutSeconds > 0)
-        return withTimeout((timeoutSeconds * 1000).toLong()) {
-            val original = try { OriginalOrderReference.Id(inner.submitted().operation.id.value) }
-                catch (error: Exception) { currentCoroutineContext().ensureActive(); OriginalOrderReference.Path(placementPath) }
-            currentCoroutineContext().ensureActive()
-            val attachment = watch(objectId, original, deps.lifecycleLeg)
-            try { currentCoroutineContext().ensureActive() }
-            catch (error: Exception) { attachment.stop(); throw error }
-            attachment
-        }
-    }
-
-    private suspend fun serverLifecycleReceipt(timeoutSeconds: Double, accounting: Boolean): OrderLifecycleReceipt {
-        require(timeoutSeconds.isFinite() && timeoutSeconds > 0)
-        try {
-            return withTimeout((timeoutSeconds * 1000).toLong()) {
-                val watch = lifecycleUpdates(timeoutSeconds)
-                try {
-                    watch.updates.map { update ->
-                        if (update.unavailable && !update.recoverable)
-                            throw ArcaException.Unknown("ORDER_LIFECYCLE_UNAVAILABLE", update.reason ?: "Original order unavailable", null)
-                        if (update.unavailable) null else update.lifecycle?.executionReceipt
-                    }.first { it != null && (!accounting || it.fillsComplete) }!!
-                } finally { watch.stop() }
-            }
-        } catch (_: TimeoutCancellationException) {
-            throw ArcaException.Unknown("TIMEOUT", "Original order wait timed out", null)
-        } finally { deps.releaseExecution?.invoke() }
-    }
-
     /** Resolves execution, then returns complete order metadata with available fill history. */
     public suspend fun filled(timeoutSeconds: Double = 30.0): SimOrderWithFills {
-        if (deps.watchLifecycle != null) {
-            val receipt = serverLifecycleReceipt(timeoutSeconds, true)
-            if (receipt.orderId.isEmpty()) throw ArcaException.Unknown("ORDER_DETAILS_UNAVAILABLE", "Original execution has no venue order metadata", null)
-            val detail = deps.getOrder(objectId, receipt.orderId)
-            if (detail.order.id.value != receipt.orderId || detail.fillsComplete != true)
-                throw ArcaException.Unknown("ORDER_DETAILS_PENDING", "Complete original order accounting is unavailable", null)
-            return detail
-        }
         val receipt = executionReceipt(timeoutSeconds)
         val cached = executionDetail
         val detail = if (cached?.order?.id?.value == receipt.orderId && cached.order.isTerminalWithFills) cached
@@ -226,33 +178,7 @@ public class OrderHandle internal constructor(
         data class Update(val event: RealmEvent) : FillMessage
     }
 
-    public fun fills(timeoutSeconds: Double = 300.0): Flow<SimFill> =
-        if (deps.watchLifecycle != null) lifecycleFills(timeoutSeconds) else legacyFills(timeoutSeconds)
-
-    private fun lifecycleFills(timeoutSeconds: Double): Flow<SimFill> = flow {
-        require(timeoutSeconds.isFinite() && timeoutSeconds > 0)
-        try {
-            withTimeout((timeoutSeconds * 1000).toLong()) {
-                val watch = lifecycleUpdates(timeoutSeconds)
-                try {
-                    val seen = mutableSetOf<String>()
-                    watch.updates.first { update ->
-                        currentCoroutineContext().ensureActive()
-                        if (update.unavailable && !update.recoverable)
-                            throw ArcaException.Unknown("ORDER_LIFECYCLE_UNAVAILABLE",update.reason ?: "Original order unavailable",null)
-                        val view = if(update.unavailable) null else update.lifecycle
-                        if(view == null) false else {
-                            val fills = view.committedFills ?: throw ArcaException.Unknown("ORDER_FILLS_UNAVAILABLE","Original order has no canonical fill snapshot",null)
-                            for(fill in fills) { currentCoroutineContext().ensureActive(); if(seen.add(fill.id)) emit(fill.fill()) }
-                            view.accountingComplete && !view.recoveryRequired
-                        }
-                    }
-                } finally { watch.stop() }
-            }
-        } finally { deps.releaseExecution?.invoke() }
-    }
-
-    private fun legacyFills(timeoutSeconds: Double): Flow<SimFill> = flow {
+    public fun fills(timeoutSeconds: Double = 300.0): Flow<SimFill> = flow {
         try {
             withTimeout((timeoutSeconds * 1000).toLong()) {
                 coroutineScope {
@@ -330,10 +256,6 @@ public class OrderHandle internal constructor(
 
     /** Callback-based fill listener. Returns a cancellation closure. */
     public fun onFill(callback: (SimFill) -> Unit): () -> Unit {
-        if(deps.watchLifecycle != null) {
-            val job = scope.launch { try { fills().collect { currentCoroutineContext().ensureActive(); callback(it) } } catch (_: Exception) { } }
-            return { job.cancel() }
-        }
         val job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             coroutineScope {
                 val queued = kotlinx.coroutines.channels.Channel<Pair<SimFill, RealmEvent>>(kotlinx.coroutines.channels.Channel.UNLIMITED)

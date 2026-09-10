@@ -186,7 +186,6 @@ MIT
 ## Account capabilities and reduction sizing
 
 Use getExchangeCapabilities for account-authoritative optional controls. Use normalizedReductionSize with canonical market, exact size and fraction; it reads market lot precision and returns an exact rounded-down decimal, rejecting missing metadata and invalid/sub-lot values. Never infer precision or feature support from a venue prefix.
-
 ## Operation wait recovery
 
 `waitForOperation` listens before acquiring its subscription. Startup and actual

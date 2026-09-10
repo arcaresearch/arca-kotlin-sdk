@@ -156,16 +156,13 @@ public class ArcaClient(
         deserializer: KSerializer<T>,
     ): T {
         var lastError: Throwable? = null
-        // An accepted order can lose its HTTP response. Reattach its original
-        // operation; do not resend an order when the result is unknown.
-        val originalOrder = method == "POST" && (path.endsWith("/exchange/orders") || path.endsWith("/exchange/orders/batch"))
         for (attempt in 0..MAX_RETRIES) {
             currentCoroutineContext().ensureActive()
             try {
                 return requestOnce(method, path, query, body, deserializer)
             } catch (e: TransientHttpException) {
                 lastError = e
-                if (originalOrder || attempt == MAX_RETRIES) throw e
+                if (attempt == MAX_RETRIES) throw e
                 logger.warning(
                     "network",
                     e,

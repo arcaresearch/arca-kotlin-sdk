@@ -60,6 +60,7 @@ class WatchPnlChartSelfHealingTest {
         val markers: List<Pair<String, String>> = listOf(
             "resume task subscribes to ws.resumeStream" to "ws.resumeStream",
             "auth task subscribes to ws.authenticatedStream" to "ws.authenticatedStream",
+            "boundary timer guards on agg-silence factor" to "BOUNDARY_AGG_SILENCE_FACTOR",
             "multi-bucket gap detection refetches dense window" to "Multi-bucket gap",
             "live-tail sliding window helper" to "slideIfLiveLocked",
             "live-tail threshold check vs LIVE_TAIL_THRESHOLD_S" to "LIVE_TAIL_THRESHOLD_S",

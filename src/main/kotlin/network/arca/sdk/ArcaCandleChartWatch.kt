@@ -500,8 +500,7 @@ public suspend fun Arca.watchCandleChart(
         jobs += scope.launch {
             var delayMs = 1_000L
             val maxDelayMs = 30_000L
-            // Bound sparse bootstrap recovery; gaps/reconnects own later reads.
-            for (attempt in 0 until 3) {
+            while (isActive) {
                 delay(delayMs)
                 if (!isActive) return@launch
                 val res = runCatching {
