@@ -49,7 +49,29 @@ public class OrderHandleDeps internal constructor(
     internal val getExecutionOperation: (suspend (String) -> Operation)? = null,
     internal val executionGaps: (() -> Flow<Unit>)? = null,
     internal val recoverExecutionReady: (suspend () -> Unit)? = null,
+    /**
+     * Platform-recorded fills (`fill.recorded`), the accounting-time event.
+     * Optional so partial bundles keep working; without it [OrderHandle.accounted]
+     * converges through its bounded reads alone.
+     */
+    internal val recordedFillEvents: (() -> Flow<Pair<Fill, RealmEvent>>)? = null,
+    /**
+     * Keep the realm root watched until the returned release runs, so
+     * `fill.recorded` frames for this order reach the socket even when the
+     * application holds no other watch covering the account.
+     */
+    internal val holdAccountWatch: (() -> (() -> Unit))? = null,
+    /**
+     * Tell any live exchange-state watch for the object that its account
+     * changed, so it re-reads. Called when accounting completion was learned
+     * through a REST read — the moment a lost account push is most likely.
+     */
+    internal val exchangeStateChanged: ((String) -> Unit)? = null,
 )
+
+/** Bounded fallback-read schedule for [OrderHandle.accounted]. */
+private const val ACCOUNTED_READ_INITIAL_MS = 500L
+private const val ACCOUNTED_READ_MAX_MS = 8_000L
 
 /**
  * Handle for exchange order lifecycle. Extends the [OperationHandle] pattern
@@ -149,6 +171,131 @@ public class OrderHandle internal constructor(
         throw failure
     } catch (_: TimeoutCancellationException) {
         throw ArcaException.Unknown("TIMEOUT", "Order execution timed out", null)
+    }
+
+    /**
+     * Wait until the account reflects this order's execution.
+     *
+     * [executionReceipt] proves terminal execution at the venue; the ledger
+     * commit that updates the account's positions and balances happens
+     * afterwards, and an exchange-state read taken in between returns the
+     * pre-accounting snapshot. This resolves once every executed quantity is
+     * recorded — the platform's `fillsComplete` — so a `getExchangeState` /
+     * `watchExchangeState` observation taken after it includes the execution.
+     * A live `watchExchangeState` for the account is refreshed when completion
+     * had to be learned through a read.
+     *
+     * Push-first: each `fill.recorded` for this order triggers one order read,
+     * as do delivery gaps and reconnects. A lost push is covered by a bounded
+     * backoff read (500ms doubling to 8s) until the deadline. On venues whose
+     * order read carries no `fillsComplete`, completion is the recorded fills
+     * for the order covering its executed size exactly.
+     *
+     * Resolves for a zero-fill terminal order too (nothing to account). Throws
+     * the placement failure, or [ArcaException.Unknown] with code `TIMEOUT`
+     * when accounting has not completed within [timeoutSeconds].
+     *
+     * ```kotlin
+     * val receipt = order.executionReceipt()   // show the receipt
+     * val detail = order.accounted()           // then trust the account
+     * val state = arca.getExchangeState(objectId)
+     * ```
+     */
+    public suspend fun accounted(timeoutSeconds: Double = 30.0): SimOrderWithFills {
+        val deadlineMs = System.currentTimeMillis() + (timeoutSeconds * 1000).toLong()
+        // Register recorded-fill delivery and hold the root watch BEFORE the
+        // receipt, so a fill recorded between the two cannot be missed.
+        val recorded = deps.recordedFillEvents?.invoke()
+        val release = deps.holdAccountWatch?.invoke()
+        try {
+            return accountedDetail(deadlineMs, recorded)
+        } finally {
+            release?.invoke()
+        }
+    }
+
+    private suspend fun accountedDetail(deadlineMs: Long, recorded: Flow<Pair<Fill, RealmEvent>>?): SimOrderWithFills {
+        val receipt = executionReceipt(maxOf(0L, deadlineMs - System.currentTimeMillis()) / 1000.0)
+        val orderId = receipt.orderId
+        val operationId = receipt.operationId
+        executionDetail?.let { cached ->
+            if (cached.order.id.value == orderId && cached.fillsComplete == true) return cached
+        }
+        val detail = try {
+            withTimeout(maxOf(1L, deadlineMs - System.currentTimeMillis())) {
+                coroutineScope {
+                    val requests = Channel<Unit>(Channel.CONFLATED)
+                    requests.trySend(Unit)
+                    val pushes = launch(start = CoroutineStart.UNDISPATCHED) {
+                        recorded?.collect { (fill, _) ->
+                            if (recordedFillMatches(fill, orderId, operationId)) requests.trySend(Unit)
+                        }
+                    }
+                    val gaps = launch(start = CoroutineStart.UNDISPATCHED) {
+                        deps.executionGaps?.invoke()?.collect { requests.trySend(Unit) }
+                    }
+                    // The fallback for a lost push: exchange.updated / fill.recorded
+                    // have no durable log, and a deferred enrichment is dropped
+                    // without a deliverySeq, so a quiet socket proves nothing.
+                    val backoff = launch {
+                        var attempt = 0
+                        while (true) {
+                            delay(minOf(ACCOUNTED_READ_MAX_MS, ACCOUNTED_READ_INITIAL_MS shl attempt))
+                            attempt = minOf(attempt + 1, 6)
+                            requests.trySend(Unit)
+                        }
+                    }
+                    try {
+                        var found: SimOrderWithFills? = null
+                        for (request in requests) {
+                            currentCoroutineContext().ensureActive()
+                            try {
+                                val current = deps.getOrder(objectId, orderId)
+                                if (current.order.id.value != orderId) continue
+                                if (isAccounted(current, orderId, operationId)) { found = current; break }
+                            } catch (failure: ArcaException.OperationFailed) {
+                                throw failure
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                // Transient read failure: the next trigger re-reads.
+                            }
+                        }
+                        found ?: throw ArcaException.Unknown("STREAM_ENDED", "Order accounting evidence unavailable", null)
+                    } finally { pushes.cancel(); gaps.cancel(); backoff.cancel(); requests.close() }
+                }
+            }
+        } catch (_: TimeoutCancellationException) {
+            throw ArcaException.Unknown("TIMEOUT", "Order accounting timed out", null)
+        }
+        // Completion was established by a read. The account push for this
+        // commit travels a different path (the mirror relay) from the
+        // `fill.recorded` push that may have triggered the read, so seeing one
+        // proves nothing about the other: always nudge the account watch. Its
+        // re-read coalesces with any push-triggered read already in flight.
+        deps.exchangeStateChanged?.invoke(objectId)
+        return detail
+    }
+
+    /**
+     * Completion check with the venue-read fallback: when the order read does
+     * not carry the platform's accounting view, the platform-recorded fills
+     * for the order must cover its executed size exactly (a zero-fill terminal
+     * order is trivially covered).
+     */
+    private suspend fun isAccounted(detail: SimOrderWithFills, orderId: String, operationId: String): Boolean {
+        detail.fillsComplete?.let { return it }
+        when (detail.order.status) {
+            OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.FAILED -> Unit
+            else -> return false
+        }
+        val executed = detail.order.filledSize
+        if (recordedSizesCover(emptyList(), executed)) return true
+        val recorded = deps.listFills(objectId)
+        val sizes = recorded.fills
+            .filter { !it.operationId.isNullOrEmpty() && (it.orderId == orderId || it.orderOperationId == operationId) }
+            .mapNotNull { it.size }
+        return sizes.isNotEmpty() && recordedSizesCover(sizes, executed)
     }
 
     /** Resolves execution, then returns complete order metadata with available fill history. */
@@ -328,7 +475,7 @@ public class OrderHandle internal constructor(
         }
     }
 
-    private companion object {
+    internal companion object {
         private fun extractOrderId(outcome: String?, allowStructuredFallback: Boolean = true): String {
             val raw = outcome?.takeIf { it.isNotEmpty() }
                 ?: throw ArcaException.Unknown("NO_ORDER_ID", "Operation outcome does not contain an order ID", null)
@@ -367,6 +514,30 @@ public class OrderHandle internal constructor(
             if (fill.orderId.value.isNotEmpty() && fill.orderId.value == orderId) return true
             if (!cloid.isNullOrEmpty() && !fill.cloid.isNullOrEmpty() && fill.cloid == cloid) return true
             return false
+        }
+
+        /**
+         * Whether a platform-recorded fill belongs to this order. Recorded
+         * fills carry the venue order id and the placement operation id; a
+         * bracket child that was still pending when it filled is matched by
+         * the latter.
+         */
+        internal fun recordedFillMatches(fill: Fill, orderId: String, operationId: String): Boolean {
+            if (!fill.orderId.isNullOrEmpty() && fill.orderId == orderId) return true
+            if (!fill.orderOperationId.isNullOrEmpty() && fill.orderOperationId == operationId) return true
+            return false
+        }
+
+        /**
+         * Exact decimal comparison: the recorded sizes must sum to the
+         * executed size. Sizes cross the wire as decimal strings and never
+         * round-trip through a binary float here — `0.1 + 0.2` must cover `0.3`.
+         */
+        internal fun recordedSizesCover(sizes: List<String>, executed: String): Boolean {
+            val expected = OrderExecutionReceipt.decimal(executed) ?: return false
+            var total = java.math.BigDecimal.ZERO
+            for (raw in sizes) total = total.add(OrderExecutionReceipt.decimal(raw) ?: return false)
+            return total.compareTo(expected) == 0
         }
     }
 }

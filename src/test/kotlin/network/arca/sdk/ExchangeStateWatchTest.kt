@@ -97,6 +97,74 @@ class ExchangeStateWatchTest {
         arca.close()
     }
 
+    /**
+     * `exchange.updated` has no durable log and a deferred enrichment is
+     * dropped without a deliverySeq, so after an invalidation the next push is
+     * not guaranteed. The bounded recovery read is the only way back.
+     */
+    @Test
+    fun invalidatedObservationRecoversThroughBoundedReadWhenNoPushArrives() = runBlocking {
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        delay(150)
+        arca.ws.injectMessage("""{"type":"exchange.updated","entityId":"obj_1","exchangeStateUnavailable":true}""")
+        withTimeout(2_000) { stream.exchangeState.first { it == null } }
+        // Not immediate: the first attempt waits ~1s.
+        delay(300)
+        assertEquals(1, dispatcher.stateRequestCount)
+        assertEquals(WatchStreamState.RECONNECTING, stream.state.value)
+
+        withTimeout(3_000) { stream.exchangeState.first { it != null } }
+        assertEquals(2, dispatcher.stateRequestCount, "one recovery read restored the observation")
+        assertEquals(WatchStreamState.CONNECTED, stream.state.value)
+        // A restored state cancels the schedule: no further reads.
+        delay(1_500)
+        assertEquals(2, dispatcher.stateRequestCount)
+        stream.stop()
+        arca.close()
+    }
+
+    @Test
+    fun serverResyncMarkerTriggersReRead() = runBlocking {
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        delay(150)
+        assertEquals(1, dispatcher.stateRequestCount)
+        val reapplied = async { withTimeoutOrNull(2_000) { stream.updates.first() } }
+        delay(50)
+        arca.ws.injectMessage("""{"type":"stream.resync"}""")
+        assertNotNull(reapplied.await(), "re-read after the resync marker must be applied")
+        assertEquals(2, dispatcher.stateRequestCount)
+        stream.stop()
+        arca.close()
+    }
+
+    @Test
+    fun refreshHookAndRegistryReReadUntilStop() = runBlocking {
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        assertEquals(1, dispatcher.stateRequestCount)
+        assertEquals(1, arca.exchangeStateRefresherCount("obj_1"))
+
+        stream.refresh()
+        withTimeout(2_000) { while (dispatcher.stateRequestCount < 2) delay(20) }
+
+        // The client-level nudge an accounted order uses.
+        arca.refreshExchangeStateWatches("obj_1")
+        withTimeout(2_000) { while (dispatcher.stateRequestCount < 3) delay(20) }
+        arca.refreshExchangeStateWatches("obj_other")
+        delay(200)
+        assertEquals(3, dispatcher.stateRequestCount)
+
+        stream.stop()
+        assertEquals(0, arca.exchangeStateRefresherCount("obj_1"), "stop must unregister the hook")
+        arca.refreshExchangeStateWatches("obj_1")
+        stream.refresh()
+        delay(300)
+        assertEquals(3, dispatcher.stateRequestCount, "a stopped stream never reads")
+        arca.close()
+    }
+
     @Test
     fun quietPaperRefreshLearnsPolicyAndStopsAtTeardown() = runBlocking {
         dispatcher.refreshScenario = "quiet"

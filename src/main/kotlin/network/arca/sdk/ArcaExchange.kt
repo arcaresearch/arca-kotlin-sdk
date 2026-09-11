@@ -910,6 +910,11 @@ private fun Arca.makeOrderHandleDeps(capture: OrderEventCapture? = null,
             awaitClose { self.ws.removeGapHandler(gap); self.ws.removeAuthenticatedHandler(auth) }
         } },
         recoverExecutionReady = { self.ws.recoverPathReady("/") },
+        recordedFillEvents = { self.ws.fillRecordedEvents() },
+        // Ref-counted with every other owner of `/`, so `fill.recorded` frames
+        // reach this socket for the duration of an accounted() wait.
+        holdAccountWatch = { self.ws.watchPath("/"); { self.ws.unwatchPath("/") } },
+        exchangeStateChanged = { objectId -> self.refreshExchangeStateWatches(objectId) },
     )
 }
 

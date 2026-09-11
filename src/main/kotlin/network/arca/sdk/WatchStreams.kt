@@ -524,12 +524,23 @@ public class MaxOrderSizeWatchStream internal constructor() : BaseWatchStream() 
 public class ExchangeStateWatchStream internal constructor() : BaseWatchStream() {
     internal val exchangeStateMut: MutableStateFlow<ExchangeState?> = MutableStateFlow(null)
     internal val updatesMut: MutableSharedFlow<ExchangeState> = snapshotUpdatesFlow()
+    internal var refreshAction: () -> Unit = {}
 
     /** Current exchange state (positions, orders, margin). */
     public val exchangeState: StateFlow<ExchangeState?> get() = exchangeStateMut.asStateFlow()
 
     /** A stream of exchange state updates. */
     public val updates: Flow<ExchangeState> get() = updatesMut.asSharedFlow()
+
+    /**
+     * Re-read the exchange state now, guarded by the observation epoch.
+     *
+     * For callers that learned out of band that the account changed — e.g.
+     * [OrderHandle.accounted] resolving through a REST read after the account
+     * push for that commit was lost. Coalesces with any in-flight read; a push
+     * that lands first wins and the read is discarded.
+     */
+    public fun refresh() { refreshAction() }
 
     internal fun push(state: ExchangeState) {
         exchangeStateMut.value = state

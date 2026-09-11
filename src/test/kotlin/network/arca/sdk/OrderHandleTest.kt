@@ -533,4 +533,137 @@ class OrderHandleTest {
         assertFalse(open.isPartiallyFilled)
         assertFalse(open.isTerminalWithFills)
     }
+
+    // MARK: - accounted()
+
+    private fun recordedFill(orderId: String, size: String, operationId: String? = "op_fill"): network.arca.sdk.models.Fill =
+        network.arca.sdk.models.Fill(id = "pl_$size", operationId = operationId, fillId = "f_$size", orderId = orderId, market = "ETH", size = size)
+
+    /** A terminal placement whose receipt comes from the operation outcome, so accounted() never waits for execution. */
+    private fun terminalHandle(deps: OrderHandleDeps, filledSize: String = "1.0", status: String = "filled"): OrderHandle {
+        val op = makeOrderOperation(
+            outcome = """{"orderId":"ord_abc","status":"$status","filledSize":"$filledSize","avgFillPrice":"2000"}""",
+            input = """{"exchangeObjectId":"obj_exchange","size":"$filledSize"}""")
+        val inner = OperationHandle(scope, submit = { OrderOperationResponse(operation = op) }, waitForSettlement = { op })
+        return orderHandle(inner, "/order", deps)
+    }
+
+    private fun accountedDeps(
+        getOrder: suspend (String, String) -> SimOrderWithFills,
+        listFills: suspend (String) -> network.arca.sdk.models.FillListResponse = { network.arca.sdk.models.FillListResponse(emptyList(), 0) },
+        recordedFillEvents: (() -> kotlinx.coroutines.flow.Flow<Pair<network.arca.sdk.models.Fill, RealmEvent>>)? = null,
+        holdAccountWatch: (() -> (() -> Unit))? = null,
+        exchangeStateChanged: ((String) -> Unit)? = null,
+    ): OrderHandleDeps = OrderHandleDeps(getOrder, { emptyFlow() }, { _, _, _ -> error("unused") }, { _, _, _, _ -> error("unused") },
+        { error("unused") }, listFills, recordedFillEvents = recordedFillEvents, holdAccountWatch = holdAccountWatch,
+        exchangeStateChanged = exchangeStateChanged)
+
+    @Test
+    fun accountedResolvesAtOnceWhenTheReadCarriesFillsComplete() = runBlocking {
+        val reads = java.util.concurrent.atomic.AtomicInteger()
+        val nudged = mutableListOf<String>()
+        val held = java.util.concurrent.atomic.AtomicInteger(); val released = java.util.concurrent.atomic.AtomicInteger()
+        val deps = accountedDeps(
+            getOrder = { _, _ -> reads.incrementAndGet(); SimOrderWithFills(makeSimOrder(), emptyList(), fillsComplete = true) },
+            holdAccountWatch = { held.incrementAndGet(); { released.incrementAndGet(); Unit } },
+            exchangeStateChanged = { nudged += it })
+        val detail = terminalHandle(deps).accounted(timeoutSeconds = 2.0)
+        assertEquals(true, detail.fillsComplete)
+        assertEquals(1, reads.get())
+        assertEquals(listOf("obj_exchange"), nudged, "the account watch is nudged once accounting is known complete")
+        assertEquals(1, held.get()); assertEquals(1, released.get())
+    }
+
+    @Test
+    fun accountedWaitsForTheRecordedFillPushThenReReads() = runBlocking {
+        val reads = java.util.concurrent.atomic.AtomicInteger()
+        val deps = accountedDeps(
+            // Execution known, ledger not caught up — the state Home read at receipt time.
+            getOrder = { _, _ -> SimOrderWithFills(makeSimOrder(), emptyList(), fillsComplete = reads.incrementAndGet() >= 2) },
+            recordedFillEvents = { kotlinx.coroutines.flow.flow {
+                delay(100); emit(recordedFill("ord_other", "1.0") to RealmEvent(type = "fill.recorded"))
+                delay(50); emit(recordedFill("ord_abc", "1.0") to RealmEvent(type = "fill.recorded"))
+            } })
+        val started = System.currentTimeMillis()
+        val detail = terminalHandle(deps).accounted(timeoutSeconds = 5.0)
+        assertEquals(true, detail.fillsComplete)
+        assertEquals(2, reads.get(), "one read at start, one after the matching recorded fill")
+        assertTrue(System.currentTimeMillis() - started < 450, "the push, not the 500ms backoff, drove the re-read")
+    }
+
+    @Test
+    fun accountedFallsBackToABoundedBackoffReadWhenNoPushArrives() = runBlocking {
+        val reads = java.util.concurrent.atomic.AtomicInteger()
+        val deps = accountedDeps(getOrder = { _, _ -> SimOrderWithFills(makeSimOrder(), emptyList(), fillsComplete = reads.incrementAndGet() >= 3) })
+        val started = System.currentTimeMillis()
+        val detail = terminalHandle(deps).accounted(timeoutSeconds = 5.0)
+        assertEquals(true, detail.fillsComplete)
+        assertEquals(3, reads.get())
+        val elapsed = System.currentTimeMillis() - started
+        assertTrue(elapsed > 1_300, "0.5s + 1s backoff before the third read, got ${elapsed}ms")
+        assertTrue(elapsed < 3_000, "got ${elapsed}ms")
+    }
+
+    @Test
+    fun accountedVenueReadWithoutFillsCompleteRequiresRecordedFillsToCoverExecutedSizeExactly() = runBlocking {
+        val listCalls = java.util.concurrent.atomic.AtomicInteger()
+        val deps = accountedDeps(
+            getOrder = { _, _ -> SimOrderWithFills(makeSimOrder(filledSize = "0.3"), emptyList()) },
+            listFills = {
+                val n = listCalls.incrementAndGet()
+                val fills = mutableListOf(recordedFill("ord_abc", "0.1"))
+                if (n >= 2) fills += recordedFill("ord_abc", "0.2")
+                fills += recordedFill("ord_abc", "9", operationId = null) // a preview never counts
+                network.arca.sdk.models.FillListResponse(fills, fills.size)
+            })
+        val detail = terminalHandle(deps, filledSize = "0.3").accounted(timeoutSeconds = 5.0)
+        assertEquals("0.3", detail.order.filledSize)
+        assertEquals(2, listCalls.get(), "0.1 alone does not cover 0.3; 0.1 + 0.2 does, compared as exact decimals")
+    }
+
+    @Test
+    fun accountedZeroFillTerminalOrderIsAccountedTrivially() = runBlocking {
+        val listed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deps = accountedDeps(
+            getOrder = { _, _ -> SimOrderWithFills(makeSimOrder(status = OrderStatus.CANCELLED, filledSize = "0"), emptyList()) },
+            listFills = { listed.set(true); network.arca.sdk.models.FillListResponse(emptyList(), 0) })
+        val detail = terminalHandle(deps, filledSize = "0", status = "cancelled").accounted(timeoutSeconds = 2.0)
+        assertEquals(OrderStatus.CANCELLED, detail.order.status)
+        assertFalse(listed.get())
+    }
+
+    @Test
+    fun accountedTimesOutAndReleasesTheWatchWhenAccountingNeverCompletes() = runBlocking {
+        val released = java.util.concurrent.atomic.AtomicInteger()
+        val nudged = java.util.concurrent.atomic.AtomicBoolean(false)
+        val deps = accountedDeps(
+            getOrder = { _, _ -> SimOrderWithFills(makeSimOrder(), emptyList(), fillsComplete = false) },
+            holdAccountWatch = { { released.incrementAndGet(); Unit } },
+            exchangeStateChanged = { nudged.set(true) })
+        val thrown = runCatching { terminalHandle(deps).accounted(timeoutSeconds = 0.7) }.exceptionOrNull()
+        assertEquals("TIMEOUT", (thrown as? ArcaException.Unknown)?.code, "got $thrown")
+        assertEquals(1, released.get())
+        assertFalse(nudged.get())
+    }
+
+    @Test
+    fun recordedSizesCoverIsExactDecimalArithmetic() {
+        assertTrue(OrderHandle.recordedSizesCover(listOf("0.1", "0.2"), "0.3"))
+        assertTrue(OrderHandle.recordedSizesCover(listOf("0.1", "0.2"), "0.30000"))
+        assertFalse(OrderHandle.recordedSizesCover(listOf("0.1"), "0.3"))
+        assertFalse(OrderHandle.recordedSizesCover(listOf("0.1", "0.2", "0.000000001"), "0.3"))
+        assertTrue(OrderHandle.recordedSizesCover(emptyList(), "0"))
+        assertFalse(OrderHandle.recordedSizesCover(emptyList(), "1"))
+        assertFalse(OrderHandle.recordedSizesCover(listOf("abc"), "0"))
+    }
+
+    @Test
+    fun recordedFillMatchesByOrderIdOrPlacementOperation() {
+        val byOrder = recordedFill("ord_abc", "1")
+        assertTrue(OrderHandle.recordedFillMatches(byOrder, "ord_abc", "op_x"))
+        assertFalse(OrderHandle.recordedFillMatches(byOrder, "ord_other", "op_x"))
+        val byPlacement = network.arca.sdk.models.Fill(id = "pl_2", operationId = "op_fill", orderOperationId = "op_order_1", market = "ETH", size = "1")
+        assertTrue(OrderHandle.recordedFillMatches(byPlacement, "ord_abc", "op_order_1"))
+        assertFalse(OrderHandle.recordedFillMatches(byPlacement, "ord_abc", "op_other"))
+    }
 }

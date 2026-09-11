@@ -61,6 +61,34 @@ public class Arca internal constructor(
 
     private val autoTracking = AtomicReference(AutoTrackingState())
 
+    /**
+     * Live `watchExchangeState` re-read hooks by object id, so an order handle
+     * that learns its accounting completed through a read (the moment the
+     * account push for that commit is most likely to have been lost) can ask
+     * the account's watch to re-read. Streams unregister themselves on stop.
+     */
+    private val exchangeStateRefreshers = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<java.util.UUID, () -> Unit>>()
+
+    internal fun registerExchangeStateRefresher(objectId: String, refresh: () -> Unit): java.util.UUID {
+        val id = java.util.UUID.randomUUID()
+        exchangeStateRefreshers.getOrPut(objectId) { java.util.concurrent.ConcurrentHashMap() }[id] = refresh
+        return id
+    }
+
+    internal fun unregisterExchangeStateRefresher(objectId: String, id: java.util.UUID) {
+        val hooks = exchangeStateRefreshers[objectId] ?: return
+        hooks.remove(id)
+        if (hooks.isEmpty()) exchangeStateRefreshers.remove(objectId, hooks)
+    }
+
+    /** Ask every live `watchExchangeState` for [objectId] to re-read. */
+    internal fun refreshExchangeStateWatches(objectId: String) {
+        exchangeStateRefreshers[objectId]?.values?.toList()?.forEach { it() }
+    }
+
+    /** Number of registered exchange-state re-read hooks; test visibility only. */
+    internal fun exchangeStateRefresherCount(objectId: String): Int = exchangeStateRefreshers[objectId]?.size ?: 0
+
     private val metaMutex = Mutex()
 
     @Volatile

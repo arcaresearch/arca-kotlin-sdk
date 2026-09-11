@@ -441,6 +441,33 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     val observationLock = Any()
     var observationEpoch = 0L
     var expiryJob: Job? = null
+    var recoveryJob: Job? = null
+    var recoveryAttempt = 0
+    val stopped = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Coalescing gate for REST re-reads: a request while one is in flight runs
+    // once more after it lands. The in-flight read belongs to an older epoch
+    // and would otherwise be the only read of that burst.
+    var refetchInFlight = false
+    var refetchQueued = false
+    val gateLock = Any()
+    lateinit var scheduleRecovery: () -> Unit
+
+    fun clearRecovery() {
+        recoveryJob?.cancel()
+        recoveryJob = null
+        recoveryAttempt = 0
+    }
+
+    /** Drop the current observation and arm the fallback re-read. Callers hold [observationLock]. */
+    fun invalidate() {
+        expiryJob?.cancel()
+        expiryJob = null
+        structural.value = null
+        stream.exchangeStateMut.value = null
+        stream.setState(WatchStreamState.RECONNECTING)
+        scheduleRecovery()
+    }
+
     fun armExpiry(state: ExchangeState, epoch: Long): Boolean {
         expiryJob?.cancel()
         expiryJob = null
@@ -452,9 +479,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
             minOf(Duration.between(Instant.now(), deadline).toMillis(), Duration.between(asOf, deadline).toMillis())
         }.getOrDefault(0)
         if (remaining <= 0) {
-            structural.value = null
-            stream.exchangeStateMut.value = null
-            stream.setState(WatchStreamState.RECONNECTING)
+            invalidate()
             return false
         }
         expiryJob = scope.launch {
@@ -462,15 +487,77 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
             synchronized(observationLock) {
                 if (observationEpoch == epoch) {
                     observationEpoch++
-                    structural.value = null
-                    stream.exchangeStateMut.value = null
-                    stream.setState(WatchStreamState.RECONNECTING)
+                    invalidate()
                 }
             }
         }
         return true
     }
 
+    /**
+     * Apply a structural state observed at [epoch], unless a newer observation
+     * has landed since. The single write path for pushes, re-reads and the
+     * periodic refresh.
+     */
+    fun applyObservation(state: ExchangeState, epoch: Long) {
+        synchronized(observationLock) {
+            if (epoch == observationEpoch && armExpiry(state, ++observationEpoch)) {
+                clearRecovery()
+                structural.value = state
+                val cur = mids.value
+                stream.setState(WatchStreamState.CONNECTED)
+                stream.push(if (cur.isEmpty()) state else state.revalued(cur))
+            }
+        }
+    }
+
+    /** Coalesced, epoch-guarded REST re-read. */
+    suspend fun refetch() {
+        val run = synchronized(gateLock) {
+            if (refetchInFlight) { refetchQueued = true; false } else { refetchInFlight = true; true }
+        }
+        if (!run) return
+        while (true) {
+            if (stopped.get()) break
+            val epoch = synchronized(observationLock) { observationEpoch }
+            try {
+                val fresh = getExchangeState(objectId)
+                if (!stopped.get()) applyObservation(fresh, epoch)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Throwable) {
+                log.warning("watch", e, mapOf("objectId" to objectId)) { "exchange state refetch failed" }
+            }
+            val again = synchronized(gateLock) {
+                if (refetchQueued && !stopped.get()) { refetchQueued = false; true } else { refetchInFlight = false; false }
+            }
+            if (!again) break
+        }
+    }
+
+    // Backoff for re-reading an invalidated observation. The designed recovery
+    // is the next coherent push and the first retry is deliberately not
+    // immediate — an unavailable projection re-read at once would hammer a
+    // mirror that just said it cannot answer. But a push is not guaranteed:
+    // `exchange.updated` has no durable log, and the server drops an
+    // enrichment that exceeds its budget without a deliverySeq, so nothing
+    // client-side can see that loss. Doubles from 1s to a 30s ceiling (±20%
+    // jitter) and stops the moment any structural state is applied.
+    scheduleRecovery = {
+        if (!stopped.get()) {
+            recoveryJob?.cancel()
+            val base = minOf(30_000.0, 1_000.0 * Math.pow(2.0, recoveryAttempt.toDouble()))
+            val delayMs = (base + base * 0.2 * (Math.random() * 2 - 1)).toLong().coerceAtLeast(0)
+            recoveryAttempt = minOf(recoveryAttempt + 1, 10)
+            recoveryJob = scope.launch {
+                delay(delayMs)
+                if (stopped.get() || structural.value != null) return@launch
+                refetch()
+                if (stopped.get() || structural.value != null) return@launch
+                synchronized(observationLock) { if (structural.value == null) scheduleRecovery() }
+            }
+        }
+    }
 
     val initial = getExchangeState(objectId)
     if (armExpiry(initial, 0)) {
@@ -484,25 +571,16 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
             if (s == ConnectionStatus.DISCONNECTED && stream.state.value != WatchStreamState.LOADING) {
                 stream.setState(WatchStreamState.RECONNECTING)
             } else if (s == ConnectionStatus.CONNECTED && stream.state.value == WatchStreamState.RECONNECTING) {
-                try {
-                    val epoch = synchronized(observationLock) { observationEpoch }
-                    val refreshed = getExchangeState(objectId)
-                    synchronized(observationLock) {
-                        if (epoch == observationEpoch && armExpiry(refreshed, ++observationEpoch)) {
-                            structural.value = refreshed
-                            val cur = mids.value
-                            stream.exchangeStateMut.value = if (cur.isEmpty()) refreshed else refreshed.revalued(cur)
-                            stream.setState(WatchStreamState.CONNECTED)
-                        }
-                    }
-                } catch (e: Throwable) {
-                    log.warning("watch", e, mapOf("objectId" to objectId)) {
-                        "exchange state refresh on reconnect failed"
-                    }
-                }
+                refetch()
             }
         }
     }
+    // A hole in the server-assigned deliverySeq, or a server resync marker,
+    // means at least one frame for this connection was lost, and there is no
+    // durable log to replay `exchange.updated` from.
+    val gapId = ws.onGap { scope.launch { refetch() } }
+    stream.refreshAction = { if (!stopped.get()) scope.launch { refetch() } }
+    val refresherId = registerExchangeStateRefresher(objectId) { stream.refresh() }
 
     ws.acquireMids(exchange)
     ws.watchPath(objectPath)
@@ -512,12 +590,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
             if (event.entityId != objectId && event.entityPath != objectPath) return@collect
             val epoch = synchronized(observationLock) { ++observationEpoch }
             if (event.exchangeStateUnavailable == true) {
-                synchronized(observationLock) {
-                    expiryJob?.cancel()
-                    structural.value = null
-                    stream.exchangeStateMut.value = null
-                    stream.setState(WatchStreamState.RECONNECTING)
-                }
+                synchronized(observationLock) { invalidate() }
                 return@collect
             }
             val structuralState: ExchangeState = run {
@@ -533,14 +606,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
                     }
                 }
             }
-            synchronized(observationLock) {
-                if (epoch == observationEpoch && armExpiry(structuralState, ++observationEpoch)) {
-                    structural.value = structuralState
-                    val cur = mids.value
-                    stream.setState(WatchStreamState.CONNECTED)
-                    stream.push(if (cur.isEmpty()) structuralState else structuralState.revalued(cur))
-                }
-            }
+            applyObservation(structuralState, epoch)
         }
     }
 
@@ -559,23 +625,16 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         while (true) {
             delay((structural.value?.stateRefreshIntervalMs ?: 30000L).coerceIn(5000L, 60000L))
             if ((structural.value?.stateRefreshIntervalMs ?: 0L) <= 0L) continue
-            val epoch = synchronized(observationLock) { observationEpoch }
-            val fresh = runCatching { getExchangeState(objectId) }.getOrNull()
-            coroutineContext.ensureActive()
-            if (fresh == null) continue
-            synchronized(observationLock) {
-                if (epoch == observationEpoch && armExpiry(fresh, ++observationEpoch)) {
-                    structural.value = fresh
-                    stream.setState(WatchStreamState.CONNECTED)
-                    stream.push(fresh.revalued(mids.value))
-                }
-            }
+            refetch()
         }
     }
 
     stream.stopAction = {
-        synchronized(observationLock) { expiryJob?.cancel(); observationEpoch++ }
+        stopped.set(true)
+        synchronized(observationLock) { expiryJob?.cancel(); recoveryJob?.cancel(); observationEpoch++ }
         jobs.forEach { it.cancel() }
+        ws.removeGapHandler(gapId)
+        unregisterExchangeStateRefresher(objectId, refresherId)
         ws.unwatchPath(objectPath)
         ws.releaseMids()
     }
