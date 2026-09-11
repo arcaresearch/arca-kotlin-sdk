@@ -31,6 +31,7 @@ import network.arca.sdk.models.Market
 import network.arca.sdk.models.MarketTickersResponse
 import network.arca.sdk.models.MinOrderSize
 import network.arca.sdk.models.Operation
+import network.arca.sdk.models.OperationType
 import network.arca.sdk.models.OrderLimits
 import network.arca.sdk.models.OrderListResponse
 import network.arca.sdk.models.OrderOperationResponse
@@ -320,6 +321,81 @@ public fun Arca.placeOrder(
         placementPath = path,
         deps = makeOrderHandleDeps(capture),
     )
+}
+
+/**
+ * Attach to an order this client did not place.
+ *
+ * Every other factory here is a mutation: it submits an order and hands back a
+ * handle to it. An integration whose orders are submitted by its own backend
+ * holds an operation id and nothing else, and calling [placeOrder] again to
+ * obtain a handle would be a second submission, not a read. This performs one
+ * [getOperation] read and returns a handle bound to that existing order, so
+ * [OrderHandle.accounted], [OrderHandle.executionReceipt], [OrderHandle.filled]
+ * and the fill streams work on it exactly as they do on a placed order.
+ *
+ * Attaching is read-only: it places nothing, cancels nothing and resizes
+ * nothing. [OrderHandle.cancel] and [OrderHandle.resize] remain on the returned
+ * handle and are, as always, explicit mutations the caller opts into.
+ *
+ * An order that already completed its accounting resolves immediately; one
+ * still in flight converges on the same pushes a placed handle sees, because
+ * execution observers are installed before the read.
+ *
+ * ```kotlin
+ * val order = arca.orderHandle(objectId = accountId, operationId = opId)
+ * order.accounted()
+ * val state = arca.getExchangeState(accountId)
+ * ```
+ *
+ * @throws ArcaException.Unknown with code `ORDER_IDENTITY_MISMATCH` when the
+ *   operation is not an order, or records a different exchange account — an id
+ *   from another account must never resolve into a handle on this one.
+ */
+public suspend fun Arca.orderHandle(objectId: String, operationId: String): OrderHandle {
+    val self = this
+    val capture = OrderEventCapture(scope, ws)
+    val response = capture.submit(objectId) { self.readOrderOperation(objectId, operationId) }
+    // Built directly rather than through `operationHandle`, which registers an
+    // optimistic submission with auto-tracking. This operation already exists;
+    // announcing it as newly submitted would be a lie to every tracked
+    // operation stream.
+    val inner = OperationHandle(scope, { response }) { id -> self.waitForSettlement(id) }
+    return OrderHandle(
+        scope = scope,
+        inner = inner,
+        objectId = objectId,
+        placementPath = response.operation.path,
+        deps = makeOrderHandleDeps(capture),
+    )
+}
+
+/**
+ * Read an existing order operation and refuse anything that is not this
+ * account's order. Absent input is not a mismatch — older operations may not
+ * carry it — but a present and different account is.
+ */
+private suspend fun Arca.readOrderOperation(objectId: String, operationId: String): OrderOperationResponse {
+    val operation = getOperation(operationId).operation
+    if (operation.type != OperationType.ORDER) {
+        throw ArcaException.Unknown(
+            "ORDER_IDENTITY_MISMATCH",
+            "Operation $operationId is a ${operation.type.value} operation, not an order",
+            null,
+        )
+    }
+    val account = operation.input
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { runCatching { arcaJson.parseToJsonElement(it).jsonObject["exchangeObjectId"]?.jsonPrimitive?.contentOrNull }.getOrNull() }
+        ?.takeIf { it.isNotEmpty() }
+    if (account != null && account != objectId) {
+        throw ArcaException.Unknown(
+            "ORDER_IDENTITY_MISMATCH",
+            "Operation $operationId belongs to a different exchange account",
+            null,
+        )
+    }
+    return OrderOperationResponse(operation)
 }
 
 /** List orders for an exchange Arca object. */
