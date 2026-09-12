@@ -5,6 +5,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -143,8 +144,19 @@ public class Arca internal constructor(
         historyCache.clear()
     }
 
+    private val positionViews = java.util.concurrent.ConcurrentHashMap<String, PositionView>()
+
+    /** Shared display view; keep watchExchangeState alive to feed its baseline. */
+    public fun positionView(objectId: String): PositionView = positionViews.computeIfAbsent(objectId) {
+        PositionView(objectId, { getExchangeState(objectId) }, { work -> scope.launch { work() } })
+    }
+
+    /** Retire the old view; delayed old handles cannot mutate its replacement. */
+    public fun resetPositionView(objectId: String) { positionViews.remove(objectId)?.reset() }
+
     /** Tear down all background work. Call when the SDK instance is no longer needed. */
     public fun close() {
+        positionViews.values.forEach { it.reset() }; positionViews.clear()
         ws.shutdown()
         tokenManager.shutdown()
         scope.cancel()

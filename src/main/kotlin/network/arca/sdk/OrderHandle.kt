@@ -96,7 +96,14 @@ public class OrderHandle internal constructor(
     private val placementPath: String,
     private val deps: OrderHandleDeps,
 ) {
+    @Volatile private var positionUpdate: PositionUpdate? = null
     @Volatile private var executionDetail: SimOrderWithFills? = null
+
+    /** Bind a baseline captured before submission, including backend-submitted orders. */
+    public suspend fun trackPositionUpdate(update: PositionUpdate) {
+        update.view.bind(update, inner.submitted().operation, objectId)
+        positionUpdate = update
+    }
 
     /** The HTTP response (before settlement). */
     public suspend fun submitted(): OrderOperationResponse = inner.submitted()
@@ -165,7 +172,10 @@ public class OrderHandle internal constructor(
                 try { select { pushed.onAwait { it!! }; snapshot.onAwait { it } } }
                 finally { pushed.cancel(); snapshot.cancel(); gaps.cancel(); requests.close() }
             }
-        }.also { deps.releaseExecution?.invoke() }
+        }.also { receipt ->
+            positionUpdate?.let { it.view.receive(it, receipt) }
+            deps.releaseExecution?.invoke()
+        }
     } catch (failure: ArcaException.OperationFailed) {
         deps.releaseExecution?.invoke()
         throw failure
@@ -208,7 +218,9 @@ public class OrderHandle internal constructor(
         val recorded = deps.recordedFillEvents?.invoke()
         val release = deps.holdAccountWatch?.invoke()
         try {
-            return accountedDetail(deadlineMs, recorded)
+            val detail = accountedDetail(deadlineMs, recorded)
+            positionUpdate?.let { it.view.accounted(it, detail) }
+            return detail
         } finally {
             release?.invoke()
         }

@@ -435,6 +435,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     val objectPath = detail.`object`.path
 
     val stream = ExchangeStateWatchStream()
+    val visible = positionView(objectId)
     val structural = MutableStateFlow<ExchangeState?>(null)
     val mids = MutableStateFlow<Map<String, String>>(emptyMap())
     val jobs = mutableListOf<Job>()
@@ -462,6 +463,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     fun invalidate() {
         expiryJob?.cancel()
         expiryJob = null
+        visible.invalidate()
         structural.value = null
         stream.exchangeStateMut.value = null
         stream.setState(WatchStreamState.RECONNECTING)
@@ -506,7 +508,9 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
                 structural.value = state
                 val cur = mids.value
                 stream.setState(WatchStreamState.CONNECTED)
-                stream.push(if (cur.isEmpty()) state else state.revalued(cur))
+                val value = if (cur.isEmpty()) state else state.revalued(cur)
+                stream.push(value)
+                visible.observe(value)
             }
         }
     }
@@ -563,12 +567,14 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     if (armExpiry(initial, 0)) {
         structural.value = initial
         stream.exchangeStateMut.value = initial
+        visible.observe(initial)
         stream.setState(WatchStreamState.CONNECTED)
     }
 
     jobs += scope.launch {
         ws.statusStream.collect { s ->
             if (s == ConnectionStatus.DISCONNECTED && stream.state.value != WatchStreamState.LOADING) {
+                visible.invalidate()
                 stream.setState(WatchStreamState.RECONNECTING)
             } else if (s == ConnectionStatus.CONNECTED && stream.state.value == WatchStreamState.RECONNECTING) {
                 refetch()
@@ -578,9 +584,15 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     // A hole in the server-assigned deliverySeq, or a server resync marker,
     // means at least one frame for this connection was lost, and there is no
     // durable log to replay `exchange.updated` from.
-    val gapId = ws.onGap { scope.launch { refetch() } }
+    val gapId = ws.onGap { visible.invalidate(); scope.launch { refetch() } }
     stream.refreshAction = { if (!stopped.get()) scope.launch { refetch() } }
     val refresherId = registerExchangeStateRefresher(objectId) { stream.refresh() }
+
+    jobs += scope.launch {
+        ws.fillRecordedEvents().collect { (fill, event) ->
+            if (event.entityId == objectId || event.entityPath == objectPath) visible.observeFill(fill.market, fill.orderOperationId, fill.orderId, fill.createdAt)
+        }
+    }
 
     ws.acquireMids(exchange)
     ws.watchPath(objectPath)
@@ -615,7 +627,10 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
             mids.update { it + m }
             synchronized(observationLock) {
                 val base = structural.value
-                if (base != null) stream.push(base.revalued(mids.value))
+                if (base != null) {
+                    val value = base.revalued(mids.value)
+                    stream.push(value); visible.observe(value)
+                }
             }
         }
     }

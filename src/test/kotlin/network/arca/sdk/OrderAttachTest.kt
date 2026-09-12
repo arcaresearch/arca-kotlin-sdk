@@ -47,6 +47,22 @@ class OrderAttachTest {
     }
 
     @Test
+    fun attachedReceiptUpdatesSharedDisplayBeforeReturning() = runBlocking {
+        val arca = makeArca()
+        val view = arca.positionView("obj-1")
+        view.observe(PositionViewTest.snapshot("0", market = "hl:0:BTC"))
+        val update = view.begin("hl:0:BTC", network.arca.sdk.models.OrderSide.BUY)
+        val order = arca.orderHandle("obj-1", "op_place")
+        order.trackPositionUpdate(update)
+        val receipt = order.executionReceipt(2.0)
+        assertEquals(receipt.filledSize, view.current.value.positions.first().signedSize)
+        assertEquals("op_place", view.current.value.coverage.first().operationId)
+        assertEquals("execution", view.current.value.coverage.first().status)
+        assertTrue(dispatcher.requests().all { it.startsWith("GET ") })
+        arca.close()
+    }
+
+    @Test
     fun accountedResolvesOnAnAlreadyRecordedOrder() = runBlocking {
         dispatcher.fillsComplete = mutableListOf(true)
         val arca = makeArca()
@@ -147,7 +163,7 @@ private class AttachDispatcher : Dispatcher() {
               "type":"$operationType","state":"completed",
               $inputField
               "outcome":"$outcome",
-              "createdAt":"2026-09-11T00:00:00.000000Z","updatedAt":"2026-09-11T00:00:00.000000Z"
+              "createdAt":"2026-09-11T10:00:01.000000Z","updatedAt":"2026-09-11T10:00:01.000000Z"
             },"events":[],"deltas":[]}}
         """.trimIndent()
     }
