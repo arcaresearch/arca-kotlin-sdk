@@ -105,6 +105,21 @@ public class OrderHandle internal constructor(
         positionUpdate = update
     }
 
+    /**
+     * Read-only, retryable server verification of terminal zero execution for this display scope.
+     * False or a read error leaves it active. This does not report ledger completion or order success.
+     */
+    public suspend fun retirePositionUpdateIfNoExecution(): Boolean {
+        val update = positionUpdate ?: return false
+        val original = inner.submitted().operation
+        val operation = deps.getExecutionOperation?.invoke(original.id.value) ?: original
+        if (operation.id != original.id) return false
+        if (update.view.retireNoExecution(update, operation)) return true
+        // The lifecycle endpoint explicitly supports the original operation ID.
+        val detail = deps.getOrder(objectId, original.id.value)
+        return update.view.retireNoExecution(update, operation, detail)
+    }
+
     /** The HTTP response (before settlement). */
     public suspend fun submitted(): OrderOperationResponse = inner.submitted()
 
@@ -177,6 +192,9 @@ public class OrderHandle internal constructor(
             deps.releaseExecution?.invoke()
         }
     } catch (failure: ArcaException.OperationFailed) {
+        try { retirePositionUpdateIfNoExecution() }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { /* Preserve the original failure and the unverified scope. */ }
         deps.releaseExecution?.invoke()
         throw failure
     } catch (_: TimeoutCancellationException) {

@@ -95,4 +95,78 @@ class PositionViewTest {
         ws.shutdown()
     }
 
+    private fun failed(outcome: String, id: String = "rejected") = operation(id, OrderSide.BUY).copy(state = OperationState.FAILED, outcome = outcome)
+
+    @Test fun rejectedScopeUnblocksAlreadyAccountedPeer() = runTest {
+        var reads = 0
+        val view = PositionView("a", { reads++; snapshot("3", 4) }, { work -> launch { work() } })
+        view.observe(snapshot("2"))
+        val rejected = bind(view, OrderSide.BUY, "rejected"); val successful = bind(view, OrderSide.BUY, "successful")
+        receipt(view, successful, "1", "successful"); view.accounted(successful)
+        assertEquals(0, reads); assertEquals("3", size(view))
+        val proof = failed("""{"definitiveRejection":true,"filledSize":"0","status":"FAILED"}""")
+        assertTrue(view.retireNoExecution(rejected, proof)); assertEquals(1, reads); assertTrue(view.current.value.pendingMarkets.isEmpty())
+        assertEquals("3", size(view))
+        assertEquals("no_execution", view.current.value.coverage.first { it.operationId == "rejected" }.status)
+        assertEquals("", view.current.value.coverage.first { it.operationId == "rejected" }.orderId)
+        assertEquals("accounted", view.current.value.coverage.first { it.operationId == "successful" }.status)
+        assertFalse(view.retireNoExecution(rejected, proof)); assertEquals(1, reads)
+    }
+
+    @Test fun ambiguousOrContradictoryFailureCannotRetire() = runTest {
+        for (outcome in listOf("""{"error":"response timeout"}""", """{"definitiveRejection":true,"filledSize":"1"}""",
+            """{"definitiveRejection":true,"filledSize":"garbage"}""", """{"definitiveRejection":true,"executionQuantityFinal":false}""",
+            """{"definitiveRejection":true,"venueOutcome":"unknown"}""", """{"definitiveRejection":true,"status":"FILLED"}""",
+            """{"definitiveRejection":true,"status":{}}""", """{"definitiveRejection":"true"}""", """{"definitiveRejection":1}""", """{"definitiveRejection":true,"orderId":7}""")) {
+            val view = PositionView("a", { error("unsafe reconciliation") }, { work -> launch { work() } })
+            view.observe(snapshot("2")); val token = bind(view, OrderSide.BUY, "rejected")
+            assertFalse(view.retireNoExecution(token, failed(outcome)), outcome); assertEquals(listOf("BTC"), view.current.value.pendingMarkets)
+        }
+        for (recorded in listOf(false, true)) {
+            val view = PositionView("a", { error("contradictory execution") }, { work -> launch { work() } })
+            view.observe(snapshot("2")); val token = bind(view, OrderSide.BUY, "rejected")
+            if (recorded) view.observeFill("BTC", "rejected", "venue") else receipt(view, token, "0.1", "rejected")
+            assertFalse(view.retireNoExecution(token, failed("""{"definitiveRejection":true}""")))
+        }
+    }
+
+    @Test fun newScopeDuringRetirementReadRemainsPending() = runTest {
+        val response = CompletableDeferred<ExchangeState>(); val started = CompletableDeferred<Unit>()
+        val view = PositionView("a", { started.complete(Unit); response.await() }, { work -> launch { work() } })
+        view.observe(snapshot("2")); val token = bind(view, OrderSide.BUY, "rejected")
+        val retirement = async { view.retireNoExecution(token, failed("""{"definitiveRejection":true}""")) }; started.await()
+        val later = bind(view, OrderSide.BUY, "later"); receipt(view, later, "1", "later")
+        response.complete(snapshot("2", 2)); assertTrue(retirement.await())
+        assertEquals("3", size(view)); assertEquals(listOf("BTC"), view.current.value.pendingMarkets)
+        assertEquals("execution", view.current.value.coverage.first { it.operationId == "later" }.status)
+    }
+
+    @Test fun originalOrderProofRequiresMatchingTerminalCompleteZero() = runTest {
+        val base = SimOrder(SimOrderId("venue"), market = "BTC", side = OrderSide.BUY, orderType = OrderType.MARKET,
+            size = "1", filledSize = "0", status = OrderStatus.CANCELLED, reduceOnly = false, timeInForce = TimeInForce.IOC,
+            leverage = 1, createdAt = "", updatedAt = "")
+        val details = listOf(SimOrderWithFills(base, emptyList(), true),
+            SimOrderWithFills(base.copy(status = OrderStatus.PENDING), emptyList(), true),
+            SimOrderWithFills(base.copy(filledSize = "0.1"), emptyList(), true),
+            SimOrderWithFills(base.copy(market = "ETH"), emptyList(), true),
+            SimOrderWithFills(base.copy(side = OrderSide.SELL), emptyList(), true),
+            SimOrderWithFills(base, emptyList(), false), SimOrderWithFills(base, emptyList(), true))
+        for ((index, detail) in details.withIndex()) {
+            val view = PositionView("a", { snapshot("2", 4) }, { work -> launch { work() } }); view.observe(snapshot("2"))
+            val token = bind(view, OrderSide.BUY, "rejected")
+            val proof = failed(if (index == 6) """{"orderId":"other"}""" else """{"error":"response timeout"}""")
+            assertEquals(index == 0, view.retireNoExecution(token, proof, detail), "variant $index")
+        }
+    }
+
+    @Test fun lateContradictionFencesRetirementRead() = runTest {
+        val started = CompletableDeferred<Unit>(); val response = CompletableDeferred<ExchangeState>()
+        val view = PositionView("a", { started.complete(Unit); response.await() }, { work -> launch { work() } }); view.observe(snapshot("2"))
+        val token = bind(view, OrderSide.BUY, "rejected")
+        val retirement = async { view.retireNoExecution(token, failed("""{"definitiveRejection":true}""")) }; started.await()
+        view.observeFill("BTC", "rejected", "venue"); response.complete(snapshot("2", 4)); retirement.await()
+        assertEquals(listOf("BTC"), view.current.value.unavailableMarkets); assertEquals(listOf("BTC"), view.current.value.pendingMarkets)
+        assertFalse(view.current.value.coverage.any { it.status == "no_execution" })
+    }
+
 }

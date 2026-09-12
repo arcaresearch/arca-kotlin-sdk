@@ -51,7 +51,9 @@ a native-style executionReceipt API in this release.
   authoritative position object. Positive quantity is long; negative is short.
   Zero has no row. Projected entry price and all financial fields are unknown.
 - `coverage`: original `operationId`, venue `orderId`, `market`, cumulative
-  `filledSize`, and status `execution`, `accounted`, or `unavailable`.
+  `filledSize`, and status `execution`, `accounted`, `no_execution`, or `unavailable`.
+  `no_execution` proves this operation executed zero; it does not report ledger
+  completion. Its venue `orderId` is empty if rejection preceded acknowledgement.
   Coverage survives a full close even though its position row disappears.
   Match operation AND account; do not infer coverage merely from a missing row.
 - `pendingMarkets`: every reserved market, including confirmed full closes.
@@ -87,6 +89,30 @@ retain the original confirmed outcome, and continue the existing authoritative
 recovery path. Retrying the attachment with the original scope is allowed.
 `cancelBeforeSubmission()` is only for a provably undispatched order; it never
 cancels a venue order. A bound scope cannot be cancelled with this method.
+
+For a submitted rejection or no-fill result, attach and track the original scope,
+then call `order.retirePositionUpdateIfNoExecution()` (Swift: `try await`, Kotlin:
+`suspend`, TypeScript: `await`). This read-only method verifies the original
+operation and either an explicit server `definitiveRejection` or an original-order
+read with terminal FAILED/CANCELLED, exact zero execution, no fills, and
+`fillsComplete == true`. Contradictory execution or recorded-fill evidence blocks
+retirement. A failed operation alone, a response timeout, or unknown venue
+execution is insufficient. No consumer cancellation or ledger inference is needed.
+
+A true result releases only this scope's reconciliation barrier. Already-accounted
+peers reconcile immediately through one fresh account read; other scopes and
+concurrent orders remain protected. Zero-execution coverage persists as
+`no_execution`. The frozen baseline can remain pending until the shared read
+succeeds. False or a verification read error leaves an unverified scope active;
+retry on new evidence or recovery. A retired/reset token is inert. A failed
+reconciliation read does not undo verified retirement; the normal changed-account
+observation or a repeated retirement call retries it while that scope is retained.
+
+Native `executionReceipt()` and TypeScript `filled()` attempt this verification
+when they encounter an operation failure, and still throw the original failure.
+`accounted()` inherits this behavior and never reports a rejected operation as
+successful ledger accounting. Call the explicit method when the backend result
+means your flow will skip those execution/accounting methods.
 
 On account reset/logout, stop the old watches, remove Swift observers, and call
 `arca.resetPositionView(objectId:)` / `arca.resetPositionView(objectId)` before

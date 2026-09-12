@@ -63,7 +63,7 @@ public class PositionView internal constructor(
     private var closed = false
     private data class Entry(val id: UUID, val market: String, val side: OrderSide, val baselineAsOf: String,
         var operationId: String? = null, var orderId: String? = null,
-        var quantity: BigDecimal = BigDecimal.ZERO, var received: Boolean = false, var accounted: Boolean = false)
+        var quantity: BigDecimal = BigDecimal.ZERO, var received: Boolean = false, var accounted: Boolean = false, var noExecution: Boolean = false)
     private val entries = linkedMapOf<UUID, Entry>()
     private val baselines = linkedMapOf<String, BigDecimal>()
     private val unavailable = mutableSetOf<String>()
@@ -102,11 +102,51 @@ public class PositionView internal constructor(
         val entry = entries[token.id] ?: return
         val quantity = decimal(receipt.filledSize) ?: return
         if (closed || receipt.objectId != objectId || entry.operationId != receipt.operationId ||
-            (entry.orderId != null && entry.orderId != receipt.orderId) || receipt.orderId.isEmpty() ||
+            (entry.orderId != null && entry.orderId != receipt.orderId && !entry.noExecution) || receipt.orderId.isEmpty() ||
             receipt.status.uppercase() !in setOf("FILLED", "CANCELLED", "CANCELED", "EXPIRED", "FAILED", "REJECTED") || quantity < entry.quantity) return
         if (entry.received && quantity.compareTo(entry.quantity) == 0) return
+        if (entry.noExecution) { entry.noExecution = false; unavailable.add(entry.market) }
         entry.orderId = receipt.orderId; entry.quantity = quantity; entry.received = true; entry.accounted = false
         revision++; publish()
+    }
+
+    /** Server-proven zero execution releases this scope's barrier, preserving concurrent deltas. */
+    internal suspend fun retireNoExecution(token: PositionUpdate, operation: Operation, detail: SimOrderWithFills? = null): Boolean {
+        val ticket = synchronized(lock) {
+            val entry = entries[token.id] ?: return false
+            val input = runCatching { operation.input?.let { arcaJson.parseToJsonElement(it).jsonObject } }.getOrNull()
+            if (closed || entry.operationId != operation.id.value || operation.type != OperationType.ORDER ||
+                operation.state !in setOf(OperationState.FAILED, OperationState.EXPIRED, OperationState.COMPLETED) ||
+                input?.get("exchangeObjectId")?.jsonPrimitive?.contentOrNull != objectId ||
+                input["market"]?.jsonPrimitive?.contentOrNull != entry.market || input["side"]?.jsonPrimitive?.contentOrNull != entry.side.wire ||
+                entry.quantity.signum() != 0) return false
+            val outcome = try { operation.outcome?.let { arcaJson.parseToJsonElement(it).jsonObject } ?: JsonObject(emptyMap()) } catch (_: Exception) { return false }
+            fun field(key: String) = (outcome[key] as? JsonPrimitive)?.contentOrNull
+            if ("filledSize" in outcome && (outcome["filledSize"] as? JsonPrimitive)?.isString != true) return false
+            if ("filledSize" in outcome && field("filledSize")?.let { decimal(it)?.signum() } != 0) return false
+            if ("executionQuantityFinal" in outcome && outcome["executionQuantityFinal"] != JsonPrimitive(true)) return false
+            if (field("venueOutcome") == "unknown") return false
+            if ("orderId" in outcome && (outcome["orderId"] as? JsonPrimitive)?.isString != true) return false
+            var orderId = field("orderId") ?: entry.orderId ?: ""
+            if (detail != null) {
+                if (detail.order.market != entry.market || detail.order.side != entry.side ||
+                    detail.order.status !in setOf(OrderStatus.FAILED, OrderStatus.CANCELLED) || decimal(detail.order.filledSize)?.signum() != 0 ||
+                    detail.fillsComplete != true || detail.fills.isNotEmpty() || (orderId.isNotEmpty() && orderId != detail.order.id.value)) return false
+                orderId = detail.order.id.value
+            } else {
+                if (outcome["definitiveRejection"] != JsonPrimitive(true)) return false
+                for (key in listOf("status", "venueStatus")) if (key in outcome && field(key)?.uppercase() !in setOf("FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED")) return false
+            }
+            if ((entry.orderId != null && entry.orderId != orderId) || observedFills.any { it.first == entry.market &&
+                (it.second == entry.operationId || (orderId.isNotEmpty() && it.third == orderId)) }) return false
+            if (!entry.noExecution) {
+                entry.noExecution = true; entry.received = true; entry.accounted = true; entry.orderId = orderId
+                revision++; publish()
+            }
+            if (entries.values.all { it.accounted } && !reconciliationInFlight) { reconciliationInFlight = true; revision } else null
+        }
+        if (ticket != null) recover(ticket)
+        return true
     }
 
     internal suspend fun accounted(token: PositionUpdate, detail: SimOrderWithFills? = null) {
@@ -164,6 +204,11 @@ public class PositionView internal constructor(
         if (committed != null && baseline != null && committed <= baseline) return
         val evidence = Triple(market, operationId, orderId)
         if (evidence in observedFills) return
+        for (entry in entries.values) if (entry.market == market && entry.noExecution &&
+            ((operationId != null && entry.operationId == operationId) || (orderId != null && entry.orderId == orderId))) {
+            entry.noExecution = false; entry.received = false; entry.accounted = false
+            unavailable.add(market); revision++
+        }
         if (observedFills.size >= 256) unavailable.addAll(baselines.keys) else observedFills.add(evidence)
         publish()
     }
@@ -194,7 +239,7 @@ public class PositionView internal constructor(
         val ambiguous = ambiguousMarkets()
         return entries.values.mapNotNull { e ->
             if (!e.received || e.operationId == null || e.orderId == null) null else
-                PositionExecutionCoverage(e.operationId!!, e.orderId!!, e.market, text(e.quantity), status ?: if (e.market in ambiguous) "unavailable" else "execution")
+                PositionExecutionCoverage(e.operationId!!, e.orderId!!, e.market, text(e.quantity), if (e.noExecution) "no_execution" else status ?: if (e.market in ambiguous) "unavailable" else "execution")
         }.sortedBy { it.operationId }
     }
 

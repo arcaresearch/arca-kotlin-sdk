@@ -114,6 +114,32 @@ class OrderAttachTest {
         arca.close()
     }
 
+    @Test fun failedReceiptAutomaticallyRetiresVerifiedRejection() = runBlocking {
+        dispatcher.rejectionOutcome = """{\"definitiveRejection\":true,\"filledSize\":\"0\",\"status\":\"FAILED\"}"""
+        val arca = makeArca(); val view = arca.positionView("obj-1")
+        view.observe(PositionViewTest.snapshot("0", market = "hl:0:BTC"))
+        val token = view.begin("hl:0:BTC", network.arca.sdk.models.OrderSide.BUY)
+        val order = arca.orderHandle("obj-1", "op_place"); order.trackPositionUpdate(token)
+        val failure = runCatching { order.executionReceipt(2.0) }.exceptionOrNull()
+        assertTrue(failure is ArcaException.OperationFailed, "$failure")
+        assertEquals("no_execution", view.current.value.coverage.first().status)
+        assertEquals("", view.current.value.coverage.first().orderId)
+        assertTrue(dispatcher.requests().all { it.startsWith("GET ") }); arca.close()
+    }
+
+    @Test fun originalOperationReadMustProveTerminalZeroExecution() = runBlocking {
+        dispatcher.rejectionOutcome = """{\"error\":\"response timeout\"}"""
+        val arca = makeArca(); val view = arca.positionView("obj-1")
+        view.observe(PositionViewTest.snapshot("0", market = "hl:0:BTC"))
+        val token = view.begin("hl:0:BTC", network.arca.sdk.models.OrderSide.BUY)
+        val order = arca.orderHandle("obj-1", "op_place"); order.trackPositionUpdate(token)
+        assertEquals(false, order.retirePositionUpdateIfNoExecution()); assertEquals(listOf("hl:0:BTC"), view.current.value.pendingMarkets)
+        dispatcher.originalNoExecution = true
+        assertTrue(order.retirePositionUpdateIfNoExecution()); assertEquals("no_execution", view.current.value.coverage.first().status)
+        assertTrue(dispatcher.requests().contains("GET /api/v1/objects/obj-1/exchange/orders/op_place"))
+        assertTrue(dispatcher.requests().all { it.startsWith("GET ") }); arca.close()
+    }
+
     private fun makeArca(): Arca = Arca(token = fakeJwt(), baseUrl = server.url("/").toString().trimEnd('/'))
 
     private fun fakeJwt(): String {
@@ -127,6 +153,8 @@ class OrderAttachTest {
 private class AttachDispatcher : Dispatcher() {
     @Volatile var operationType: String = "order"
     @Volatile var includeInput: Boolean = true
+    @Volatile var rejectionOutcome: String? = null
+    @Volatile var originalNoExecution = false
     @Volatile var fillsComplete: MutableList<Boolean> = mutableListOf(true)
     private val recorded = Collections.synchronizedList(mutableListOf<String>())
 
@@ -148,6 +176,7 @@ private class AttachDispatcher : Dispatcher() {
         recorded.add("${request.method} $path")
         return when {
             path == "/api/v1/operations/op_place" -> json(operationBody())
+            path == "/api/v1/objects/obj-1/exchange/orders/op_place" -> json("""{"success":true,"data":{"order":{"id":"","market":"hl:0:BTC","side":"buy","orderType":"MARKET","size":"1","filledSize":"0","status":"${if (originalNoExecution) "FAILED" else "PENDING"}","reduceOnly":false,"timeInForce":"IOC","leverage":1,"createdAt":"","updatedAt":""},"fills":[],"fillsComplete":$originalNoExecution}}""")
             path == "/api/v1/objects/obj-1/exchange/orders/ord_abc" -> json(orderBody(nextComplete()))
             else -> MockResponse().setResponseCode(404)
         }
@@ -155,12 +184,12 @@ private class AttachDispatcher : Dispatcher() {
 
     private fun operationBody(): String {
         val input = """{\"exchangeObjectId\":\"obj-1\",\"market\":\"hl:0:BTC\",\"side\":\"buy\",\"size\":\"0.01\",\"orderType\":\"MARKET\"}"""
-        val outcome = """{\"orderId\":\"ord_abc\",\"status\":\"filled\",\"filledSize\":\"0.01\",\"avgFillPrice\":\"50000\"}"""
+        val outcome = rejectionOutcome ?: """{\"orderId\":\"ord_abc\",\"status\":\"filled\",\"filledSize\":\"0.01\",\"avgFillPrice\":\"50000\"}"""
         val inputField = if (includeInput) "\"input\": \"$input\"," else ""
         return """
             {"success":true,"data":{"operation":{
               "id":"op_place","realmId":"rlm_test","path":"/op/order/btc-1",
-              "type":"$operationType","state":"completed",
+              "type":"$operationType","state":"${if (rejectionOutcome == null) "completed" else "failed"}",
               $inputField
               "outcome":"$outcome",
               "createdAt":"2026-09-11T10:00:01.000000Z","updatedAt":"2026-09-11T10:00:01.000000Z"
