@@ -175,6 +175,8 @@ public class WebSocketManager internal constructor(
     private val authenticatedHandlers = ConcurrentHashMap<UUID, () -> Unit>()
     private val rotatedHandlers = ConcurrentHashMap<UUID, () -> Unit>()
 
+    private val positionFillObservers = ConcurrentHashMap<UUID, (Fill, RealmEvent) -> Unit>()
+
     private val bus = MutableSharedFlow<RealmEvent>(
         replay = 0,
         extraBufferCapacity = 1024,
@@ -820,6 +822,13 @@ public class WebSocketManager internal constructor(
         if (event.type in setOf(EventType.FILL_PREVIEWED.wire, EventType.FILL_RECORDED.wire) && fill != null) fill to event else null
     }
 
+    /** Inline display-evidence tap, ahead of the lossy general-purpose event bus. */
+    internal fun observePositionFills(handler: (Fill, RealmEvent) -> Unit): UUID {
+        val id = UUID.randomUUID(); positionFillObservers[id] = handler; return id
+    }
+
+    internal fun removePositionFillObserver(id: UUID) { positionFillObservers.remove(id) }
+
     public fun fillRecordedEvents(): Flow<Pair<Fill, RealmEvent>> = filtered { event ->
         val fill = event.recordedFill
         if (event.type == EventType.FILL_RECORDED.wire && fill != null) fill to event else null
@@ -1306,6 +1315,9 @@ public class WebSocketManager internal constructor(
     }
 
     private fun emit(event: RealmEvent) {
+        if (event.type == EventType.FILL_RECORDED.wire) event.recordedFill?.let { fill ->
+            positionFillObservers.values.toList().forEach { observer -> observer(fill, event) }
+        }
         bus.tryEmit(event)
     }
 

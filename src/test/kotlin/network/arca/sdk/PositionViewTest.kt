@@ -4,7 +4,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.runCurrent
 import network.arca.sdk.internal.arcaJson
 import network.arca.sdk.models.*
 import org.junit.jupiter.api.Assertions.*
@@ -83,6 +82,17 @@ class PositionViewTest {
         val token=bind(view,OrderSide.BUY); receipt(view,token,"1")
         view.observeFill("BTC","older","older-order","2026-01-01T00:00:00Z"); assertTrue(view.current.value.unavailableMarkets.isEmpty())
         view.observe(snapshot("4",2)); assertEquals(listOf("BTC"),view.current.value.unavailableMarkets)
+    }
+
+    @Test fun directFillTapDrainsWithoutLossyBufferAndUnregisters() {
+        val ws = WebSocketManager(baseUrl="http://localhost:3052",token="test",realmId="r",httpClient=okhttp3.OkHttpClient())
+        var count = 0
+        val observer = ws.observePositionFills { _, _ -> count++ }
+        val frame = """{"type":"fill.recorded","entityId":"a","fill":{"id":"fill","market":"BTC"}}"""
+        repeat(2048) { ws.injectMessage(frame) }
+        assertEquals(2048,count)
+        ws.removePositionFillObserver(observer); ws.injectMessage(frame); assertEquals(2048,count)
+        ws.shutdown()
     }
 
 }

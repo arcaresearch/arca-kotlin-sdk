@@ -588,10 +588,8 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     stream.refreshAction = { if (!stopped.get()) scope.launch { refetch() } }
     val refresherId = registerExchangeStateRefresher(objectId) { stream.refresh() }
 
-    jobs += scope.launch {
-        ws.fillRecordedEvents().collect { (fill, event) ->
-            if (event.entityId == objectId || event.entityPath == objectPath) visible.observeFill(fill.market, fill.orderOperationId, fill.orderId, fill.createdAt)
-        }
+    val fillObserverId = ws.observePositionFills { fill, event ->
+        if (event.entityId == objectId || event.entityPath == objectPath) visible.observeFill(fill.market, fill.orderOperationId, fill.orderId, fill.createdAt)
     }
 
     ws.acquireMids(exchange)
@@ -648,6 +646,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         stopped.set(true)
         synchronized(observationLock) { expiryJob?.cancel(); recoveryJob?.cancel(); observationEpoch++ }
         jobs.forEach { it.cancel() }
+        ws.removePositionFillObserver(fillObserverId)
         ws.removeGapHandler(gapId)
         unregisterExchangeStateRefresher(objectId, refresherId)
         ws.unwatchPath(objectPath)
