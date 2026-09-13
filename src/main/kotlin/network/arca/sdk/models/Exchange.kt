@@ -222,6 +222,14 @@ public data class ExchangeState(
     public val tradingAllocation: TradingAllocationState? = null,
     public val financialInputId: String? = null,
     public val mirrorUnsettledFunding: String? = null,
+    /**
+     * Every venue-confirmed execution the ledger behind this observation has
+     * not folded into [positions] and [marginSummary] yet. Compose with
+     * [projectedPositions]; keep the previous money while [isAccountingSettled]
+     * is false. Null/empty when nothing is pending, and on venues whose
+     * accounting is synchronous with execution. See [AccountingPendingExecution].
+     */
+    public val accountingPending: List<AccountingPendingExecution>? = null,
 )
 
 /**
