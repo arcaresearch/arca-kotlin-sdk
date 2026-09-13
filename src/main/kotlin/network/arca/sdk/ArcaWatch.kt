@@ -14,6 +14,7 @@ import network.arca.sdk.models.OIEvent
 import network.arca.sdk.models.ConnectionStatus
 import network.arca.sdk.models.EventEnvelope
 import network.arca.sdk.models.ExchangeState
+import network.arca.sdk.models.observedBefore
 import network.arca.sdk.models.Fill
 import network.arca.sdk.models.MarginTier
 import network.arca.sdk.models.ObjectValuation
@@ -503,6 +504,18 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
      */
     fun applyObservation(state: ExchangeState, epoch: Long) {
         synchronized(observationLock) {
+            // The epoch orders this read against pushes that arrived while it
+            // was in flight; the read time orders it against the state already
+            // applied. A frame the platform read before that state describes an
+            // older ledger — a pre-fill snapshot resolving late — and must not
+            // replace it.
+            val applied = structural.value
+            if (applied != null && state.observedBefore(applied)) {
+                log.debug("watch", metadata = mapOf("objectId" to objectId, "observedAt" to (state.observedAt ?: ""), "appliedAt" to (applied.observedAt ?: ""))) {
+                    "dropped an exchange state observed before the one applied"
+                }
+                return
+            }
             if (epoch == observationEpoch && armExpiry(state, ++observationEpoch)) {
                 clearRecovery()
                 structural.value = state

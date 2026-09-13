@@ -230,6 +230,12 @@ public data class ExchangeState(
      * accounting is synchronous with execution. See [AccountingPendingExecution].
      */
     public val accountingPending: List<AccountingPendingExecution>? = null,
+    /**
+     * When the platform began the read this observation came from (RFC 3339,
+     * nanoseconds). Observations of one account are ordered by it; see
+     * [observedBefore]. Null from a platform that predates the field.
+     */
+    public val observedAt: String? = null,
 )
 
 /**

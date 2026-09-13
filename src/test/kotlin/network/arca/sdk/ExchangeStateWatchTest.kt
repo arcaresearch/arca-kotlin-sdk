@@ -64,6 +64,41 @@ class ExchangeStateWatchTest {
         arca.close()
     }
 
+    /**
+     * Reads of one account race. A frame the platform read before the one
+     * already applied — a pre-fill snapshot resolving late — must not replace
+     * it, whatever order the two arrived in; a genuinely newer one still does.
+     */
+    @Test
+    fun anObservationReadBeforeTheAppliedOneIsDropped() = runBlocking {
+        val arca = makeArca()
+        val stream = arca.watchExchangeState(objectId = "obj_1")
+        delay(150)
+        fun frame(equity: String, observedAt: String) = """
+            {"type":"exchange.updated","entityId":"obj_1","entityPath":"/exchanges/main",
+             "exchangeState":{"observedAt":"$observedAt",
+               "account":{"id":"act_1","realmId":"rlm_test","name":"main","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"},
+               "marginSummary":{"equity":"$equity","initialMarginUsed":"0","maintenanceMarginRequired":"0","availableToWithdraw":"$equity","totalNtlPos":"0","totalUnrealizedPnl":"0"},
+               "positions":[],"openOrders":[],
+               "pendingIntents":[{"operationId":"op_$equity","operationPath":"/ops/1","market":"hl:0:BTC","side":"buy","size":"0.1","orderType":"MARKET","reduceOnly":false,"createdAt":"2026-01-01T00:00:00Z"}]}}
+        """.trimIndent()
+
+        arca.ws.injectMessage(frame("1200", "2026-09-13T06:37:40.700000Z"))
+        withTimeout(2_000) { stream.exchangeState.first { it?.marginSummary?.equity == "1200" } }
+
+        // Older read, delivered later: ignored, and not a reason to re-read.
+        arca.ws.injectMessage(frame("900", "2026-09-13T06:37:39.7Z"))
+        delay(300)
+        assertEquals("1200", stream.exchangeState.value?.marginSummary?.equity, "a pre-fill frame that resolved late replaced the newer state")
+        assertEquals(1, dispatcher.stateRequestCount)
+
+        arca.ws.injectMessage(frame("1300", "2026-09-13T06:37:40.700001Z"))
+        withTimeout(2_000) { stream.exchangeState.first { it?.marginSummary?.equity == "1300" } }
+
+        stream.stop()
+        arca.close()
+    }
+
     @Test
     fun unavailableStateClearsMoneyWithoutRefetchAndRecoversOnPush() = runBlocking {
         val arca = makeArca()
