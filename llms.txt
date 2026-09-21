@@ -100,6 +100,8 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Candles | arca.getCandles(market, interval, options) |
 | OI history | arca.getOIHistory(market, interval, options) -> OHLC open interest + 24h ntlVlm + mark; intervals 1m/5m/1h/1d |
 | Funding history | arca.getFundingHistory(market, startTime?, endTime?) -> SETTLED funding observations {t, fundingRate, premium?, s?}; no interval (event series); default 7d, max 30d; HIP-3 supported; not predicted (use ticker funding/nextFundingTime) |
+| One owner-facing wallet, rendered as-is | arca.walletAccount(boundaryId) / arca.walletAccountByOwner(ownerAddress) -> WalletAccount — walletState (setup_required · setting_up · ready · needs_attention · unavailable; `typedWalletState`) + attention reasons, balances{confirmedMicro, availableMicro, reservedMicro, pendingInMicro, pendingOutMicro, asOf}, source (linked external address: balanceMicro null when unknown, health, its own asOf), autoDeposit (state off · active · needs_approval · needs_attention, routeId, allowanceMicro, asOf; null until Arca has observed the source's adapter route), operations[] (kind create_cash/send/deposit/receiver; state sending/confirming/completed/failed; reason only when failed; canRetry), revision. Durable records only, no chain call; ArcaException.NotFound for an unknown boundary/owner; arca:ReadObject is enough (a realm-scoped device token works) |
+| Keep one wallet's Wallet Account current (push, not poll) | arca.walletAccountEvents(boundaryId): Flow<WalletAccount> — SSE of COMPLETE snapshots (on connect and after every boundary or source change; ≤1 per 250 ms), automatic resume from the last revision as Last-Event-ID, 1 s→30 s backoff reset after a delivered snapshot, one credential refresh on 401/403 when a token provider is set; the flow fails only on a refused connection (NotFound, Forbidden, 429 per-key cap). Treat every element as "replace what you show"; do not also poll walletAccount |
 
 ## Venue-to-venue hops
 
@@ -290,6 +292,37 @@ deliverySeq gap, triggers a throttled refetch (10s cooldown, bounded to the
 last 50 bars) of the affected window so server-side backfill corrections reach
 already-open charts. The raw `watchCandles` flow is an unhealed event tap —
 build charts on `watchCandleChart`.
+
+## V9 cash Wallet Account (one read, one stream per wallet)
+
+`walletAccount(boundaryId)` composes what a wallet screen needs from Arca's
+durable records — the V9 cash boundary plus the address watch on its owner — so a
+product renders it instead of re-deriving it from the account read, the observer
+and chain calls. Money is micro-USDC integer STRINGS (parse with BigInteger).
+Every figure carries an asOf {block, hash, time}: balances.asOf is the realm's
+confirmed observation cursor, source.asOf the observer's complete-through
+checkpoint, autoDeposit.asOf the block the route/allowance state is valid through;
+they may differ — show the older one, never block on equality. Freshness is not a
+state: walletState says whether the account is usable (unavailable = the durable
+projection disagrees with the journal; balances are still returned as last-known),
+not whether the data is recent. autoDeposit.state says whether the next sweep from
+the linked source would forward: active (allowance > 0, consent signed under the
+account's current permission version, no recovery); needs_approval (the owner must
+re-approve); needs_attention (recovery started; re-approving cannot help); off (no
+route). Source money behind an inactive route makes walletState needs_attention with
+reason auto_deposit_inactive. awaiting_approval and uncertain are states the
+PRODUCT layer adds from its own records.
+
+`walletAccountEvents(boundaryId)` delivers a COMPLETE WalletAccount on connect and
+after every change, at most one per 250 ms, with 20 s heartbeats; every element is
+the whole state, so a missed frame costs latency, never correctness. Resume is
+automatic (Last-Event-ID = last revision; the ingress resets connections about
+hourly; 1 s→30 s backoff). It fails only on a refused connection — NotFound,
+Forbidden, or a 429 (V9_WALLET_ACCOUNT_STREAMS_EXCEEDED) when one key holds more
+than the per-replica cap (16 by default). Fixtures for every state:
+backend/libs/arca-go/cashv9/testdata/wallet-account/ (WalletAccountTest decodes
+them all and pins the enums to vocabulary.json). Contract:
+documents/contracts/v9-cash-wallet-integration.md.
 
 ## Anti-patterns
 

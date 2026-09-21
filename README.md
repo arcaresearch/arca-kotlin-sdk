@@ -155,6 +155,24 @@ watch.stop()
 The connection is reference-counted and self-heals across reconnects and app
 background/foreground transitions.
 
+### Wallet Account (V9 cash)
+
+One read and one stream per owner-facing wallet, composed by Arca from durable
+records with no chain call. The `Flow` delivers the *complete* Wallet Account on
+connect and after every change (at most one per 250 ms), resumes with
+`Last-Event-ID` and 1 s → 30 s backoff after a disconnect, and fails only when
+the server refuses the connection.
+
+```kotlin
+val wallet = arca.walletAccount(boundaryId)
+
+scope.launch {
+    arca.walletAccountEvents(boundaryId).collect { wallet ->
+        render(wallet) // wallet.typedWalletState, wallet.balances, wallet.autoDeposit, wallet.operations
+    }
+}
+```
+
 ## Error Handling
 
 All failures are subclasses of the sealed `ArcaException`:

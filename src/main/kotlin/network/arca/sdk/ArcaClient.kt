@@ -313,6 +313,70 @@ public class ArcaClient(
             .apply { query?.forEach { (k, v) -> addQueryParameter(k, v) } }
             .build()
 
+    // MARK: - Server-sent events
+
+    /**
+     * Client for long-lived `text/event-stream` responses: the read timeout
+     * covers several missed 20 s heartbeats and there is no call timeout,
+     * the way the WebSocket client is configured.
+     */
+    private val streamClient: OkHttpClient by lazy {
+        httpClient.newBuilder()
+            .readTimeout(STREAM_IDLE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .callTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .build()
+    }
+
+    /**
+     * An authorised GET for a `text/event-stream` endpoint. [lastEventId] is
+     * sent as `Last-Event-ID` so the server resumes the stream.
+     */
+    internal fun streamRequest(path: String, query: Map<String, String>?, lastEventId: String?): Request =
+        Request.Builder()
+            .url(buildUrl(path, query))
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .header("Authorization", "Bearer $currentToken")
+            .header(CLIENT_CAPABILITIES_HEADER, ADVERTISED_CAPABILITIES.joinToString(","))
+            .apply { if (lastEventId != null) header("Last-Event-ID", lastEventId) }
+            .get()
+            .build()
+
+    /** Open a stream connection. The caller owns the [Call] and its response body. */
+    internal fun newStreamCall(request: Request): Call = streamClient.newCall(request)
+
+    /**
+     * The exception a refused stream connection carries: the API envelope
+     * mapped exactly as the REST path maps it, or the raw status.
+     */
+    internal fun streamRefusal(body: String, statusCode: Int): ArcaException {
+        val envelope = runCatching { arcaJson.decodeFromString(ApiResponse.serializer(JsonElement.serializer()), body) }.getOrNull()
+        val error = envelope?.error
+        if (error != null) {
+            if (statusCode == 401) return ArcaException.Unauthorized(error.message, error.errorId)
+            return mapApiError(error.code, error.message, error.errorId, error.details)
+        }
+        if (statusCode == 401) return ArcaException.Unauthorized("Invalid or expired authentication", null)
+        return ArcaException.Unknown("HTTP_$statusCode", "Stream refused with status $statusCode", null)
+    }
+
+    /** Whether a refresh hook is configured, so a stream can retry a 401/403 once. */
+    internal val canRefreshToken: Boolean get() = onUnauthorized != null
+
+    /**
+     * Ask the provider for a fresh credential and install it. Throws what
+     * the provider throws; also reports it through [onAuthError].
+     */
+    internal suspend fun refreshToken(trigger: AuthRefreshTrigger) {
+        val refresh = onUnauthorized ?: throw ArcaException.Unauthorized("No token provider configured", null)
+        try {
+            currentToken = refresh(trigger)
+        } catch (e: Throwable) {
+            onAuthError?.invoke(e)
+            throw e
+        }
+    }
+
     public companion object {
         /** HTTP header carrying the SDK's advertised capabilities (comma-separated). */
         public const val CLIENT_CAPABILITIES_HEADER: String = "X-Arca-Client-Capabilities"
@@ -324,6 +388,13 @@ public class ArcaClient(
         private const val MAX_RETRIES = 2
         private const val RETRY_DELAY_MS = 1_000L
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+
+        /**
+         * Maximum silence on a server-sent-event stream before it is treated
+         * as dead and reconnected: the Wallet Account stream heartbeats every
+         * 20 s, so this is three missed heartbeats.
+         */
+        public const val STREAM_IDLE_MS: Long = 75_000L
     }
 }
 
