@@ -139,6 +139,10 @@ public data class ArcaObjectDetailResponse(
     public val balances: List<ArcaBalance> = emptyList(),
     public val reservedBalances: List<ReservedBalance>? = null,
     public val positions: List<ArcaPositionCurrent>? = null,
+    /** Present on provider objects. */
+    public val provider: ProviderDetail? = null,
+    /** Deposit links this object is either end of. */
+    public val depositLinks: List<DepositLink>? = null,
 )
 
 @Serializable

@@ -69,6 +69,8 @@ public value class DeltaType(public val value: String) {
         public val STATUS_CHANGE: DeltaType = DeltaType("status_change")
         public val HOLD_CHANGE: DeltaType = DeltaType("hold_change")
         public val LABELS_CHANGE: DeltaType = DeltaType("labels_change")
+        public val PROVIDER_CHANGE: DeltaType = DeltaType("provider_change")
+        public val DEPOSIT_LINK_CHANGE: DeltaType = DeltaType("deposit_link_change")
         public val CREATION: DeltaType = DeltaType("creation")
         public val DELETION: DeltaType = DeltaType("deletion")
     }
@@ -88,6 +90,9 @@ public value class ArcaObjectType(public val value: String) {
         public val WITHDRAWAL: ArcaObjectType = ArcaObjectType("withdrawal")
         public val ESCROW: ArcaObjectType = ArcaObjectType("escrow")
         public val INFO: ArcaObjectType = ArcaObjectType("info")
+
+        /** An external wallet-provider account (Privy). Holds no balance. */
+        public val PROVIDER: ArcaObjectType = ArcaObjectType("provider")
     }
 }
 

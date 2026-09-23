@@ -101,6 +101,11 @@ public data class WalletAccount(
     val balances: WalletBalances,
     val autoDeposit: WalletAutoDeposit? = null,
     val operations: List<WalletOperation>,
+    /**
+     * Explicit deposit links into this boundary; with an active one,
+     * [source] and [autoDeposit] describe its source wallet. Null when none.
+     */
+    val depositLinks: List<WalletDepositLink>? = null,
 ) {
     val typedWalletState: WalletState? get() = WalletState.fromWire(walletState)
 }
