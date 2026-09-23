@@ -102,6 +102,11 @@ public data class WalletAccount(
     val autoDeposit: WalletAutoDeposit? = null,
     val operations: List<WalletOperation>,
     /**
+     * Action-proposal attempts awaiting the owner's answer, soonest deadline
+     * first. Null from servers that predate them.
+     */
+    val requirements: List<WalletRequirement>? = null,
+    /**
      * Explicit deposit links into this boundary; with an active one,
      * [source] and [autoDeposit] describe its source wallet. Null when none.
      */
@@ -109,6 +114,23 @@ public data class WalletAccount(
 ) {
     val typedWalletState: WalletState? get() = WalletState.fromWire(walletState)
 }
+
+/**
+ * One open action-proposal attempt on the account. [expiresAt] is the signed
+ * deadline in unix seconds; past it the attempt cannot be accepted. Read the
+ * proposal for its payload.
+ */
+@Serializable
+public data class WalletRequirement(
+    val proposalId: String,
+    val requirementId: String,
+    val attemptId: String,
+    val actionKind: String,
+    val schemaId: String,
+    val variant: String,
+    val state: String,
+    val expiresAt: Long,
+)
 
 /** `walletState` values. */
 public enum class WalletState(public val wire: String) {
