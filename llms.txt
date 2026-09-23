@@ -303,9 +303,11 @@ Every figure carries an asOf {block, hash, time}: balances.asOf is the realm's
 confirmed observation cursor, source.asOf the observer's complete-through
 checkpoint, autoDeposit.asOf the block the route/allowance state is valid through;
 they may differ — show the older one, never block on equality. Freshness is not a
-state: walletState says whether the account is usable (unavailable = the durable
-projection disagrees with the journal; balances are still returned as last-known),
-not whether the data is recent. autoDeposit.state says whether the next sweep from
+state: walletState says whether the account is usable (unavailable = the boundary
+record could not be interpreted, unknown_account_status; balances are returned as
+last-known), not whether the data is recent. An audit disagreement
+(ledger_disagreement, allocation_mismatch) is needs_attention with the durable
+balances served: show the figures; the reason is Arca's to fix, not the owner's. autoDeposit.state says whether the next sweep from
 the linked source would forward: active (allowance > 0, consent signed under the
 account's current permission version, no recovery); needs_approval (the owner must
 re-approve); needs_attention (recovery started; re-approving cannot help); off (no
