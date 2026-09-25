@@ -252,6 +252,13 @@ truth — `BALANCE_UPDATED` is still what says the funds landed.
 Lower-level: `arca.ws` is the WebSocketManager (events flow, typed event flows,
 onGap, onResume, onAuthenticated, onRotated, ensureConnected, disconnect).
 
+Order handles and `waitForOperation` subscribe to the event types they consume
+(`subscribe_events`) and wait for the server's `events_subscribed`
+acknowledgement before a recovery read; they never watch `/`. Do not watch `/`
+yourself to follow one order or object — a realm-root watch assembles a
+snapshot of the whole realm and delivers every realm event, including an hourly
+funding notification for every open position.
+
 `ws.onGap { missed -> }` fires on delivery loss, from either source: a hole
 the client observed in the server-assigned deliverySeq (missed is exact), or
 a server-sent `stream.resync` marker announcing that events were dropped
