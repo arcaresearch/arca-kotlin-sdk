@@ -30,13 +30,22 @@ class OrderCaptureLifecycleTest {
         }
         override fun close() { scope.cancel(); ws.shutdown() }
     }
+    // Order capture holds its event types by subscription, never a realm-root
+    // watch: releasing capture is observed as `unsubscribe_events`.
+    @Test fun captureSubscribesByTypeAndNeverWatchesTheRoot() = runBlocking<Unit> {
+        Harness().use { h ->
+            h.start(); waitFor { "subscribe_events" in h.socket.actions() }
+            assertFalse("watch" in h.socket.actions())
+            h.capture.stop()
+        }
+    }
     @Test fun submittedOnlyLearnsIdentityAndReleasesOnTerminalInEitherOrder() = runBlocking<Unit> {
         for (terminalFirst in listOf(false, true)) Harness().use { h ->
             h.start(); h.capture.submitted(operation(), "account")
             if (terminalFirst) h.ws.injectMessage(terminal())
             h.ws.injectMessage(operationEvent(operation("""{"orderId":"venue","status":"OPEN","filledSize":"0"}""")))
             if (!terminalFirst) h.ws.injectMessage(terminal())
-            waitFor { "unwatch" in h.socket.actions() }
+            waitFor { "unsubscribe_events" in h.socket.actions() }
         }
     }
     @Test fun bufferedBeforeSubmissionAndWrongAccountOrderDoNotLeakOrReleaseEarly() = runBlocking<Unit> {
@@ -44,21 +53,21 @@ class OrderCaptureLifecycleTest {
             h.start(); h.ws.injectMessage(terminal())
             h.ws.injectMessage(operationEvent(operation("""{"orderId":"wrong"}""", "foreign")))
             h.capture.submitted(operation(), "account")
-            delay(30); assertFalse("unwatch" in h.socket.actions())
+            delay(30); assertFalse("unsubscribe_events" in h.socket.actions())
             h.ws.injectMessage(terminal(order = "other")); h.ws.injectMessage(terminal(account = "foreign"))
-            delay(30); assertFalse("unwatch" in h.socket.actions())
+            delay(30); assertFalse("unsubscribe_events" in h.socket.actions())
             h.ws.injectMessage(operationEvent(operation("""{"orderId":"venue","status":"OPEN","filledSize":"0"}""")))
-            waitFor { "unwatch" in h.socket.actions() }
+            waitFor { "unsubscribe_events" in h.socket.actions() }
         }
     }
     @Test fun knownOrderCannotBeReplacedByAnotherLegAndKeepsOtherWatchOwner() = runBlocking<Unit> {
         Harness().use { h ->
-            h.start(); h.ws.watchPath("/")
+            h.start(); h.ws.acquireEventTypes(OrderEventCapture.EXECUTION_TYPES) // another owner of the same types
             h.capture.submitted(operation("""{"orderId":"venue","status":"OPEN","filledSize":"0"}"""), "account")
             h.ws.injectMessage(operationEvent(operation("""{"orderId":"other","status":"OPEN","filledSize":"0"}""")))
             h.ws.injectMessage(terminal(order = "other")); delay(30)
-            h.ws.unwatchPath("/"); assertFalse("unwatch" in h.socket.actions())
-            h.ws.injectMessage(terminal()); waitFor { "unwatch" in h.socket.actions() }
+            h.ws.releaseEventTypes(OrderEventCapture.EXECUTION_TYPES); assertFalse("unsubscribe_events" in h.socket.actions())
+            h.ws.injectMessage(terminal()); waitFor { "unsubscribe_events" in h.socket.actions() }
         }
     }
     @Test fun receiptTimeoutStillReleasesLaterWithoutRetry() = runBlocking<Unit> {
@@ -71,9 +80,9 @@ class OrderCaptureLifecycleTest {
                 releaseExecution = { h.capture.stop() }, awaitExecutionReady = {}, executionEvents = { h.capture.events }, getExecutionOperation = { original })
             val handle = OrderHandle(scope = h.scope, inner = inner, objectId = "account", placementPath = "/op", deps = deps)
             val error = runCatching { handle.executionReceipt(timeoutSeconds = 0.02) }.exceptionOrNull()
-            assertTrue(error is ArcaException.Unknown && error.code == "TIMEOUT"); assertFalse("unwatch" in h.socket.actions())
+            assertTrue(error is ArcaException.Unknown && error.code == "TIMEOUT"); assertFalse("unsubscribe_events" in h.socket.actions())
             h.ws.injectMessage(operationEvent(operation("""{"orderId":"venue","status":"OPEN","filledSize":"0"}""")))
-            h.ws.injectMessage(terminal()); waitFor { "unwatch" in h.socket.actions() }
+            h.ws.injectMessage(terminal()); waitFor { "unsubscribe_events" in h.socket.actions() }
             handle.submitted()
         }
     }

@@ -379,6 +379,130 @@ public class WebSocketManager internal constructor(
         matching.forEach { (id, value) -> pathSnapshotWaiters.remove(id); value.second.complete(operations) }
     }
 
+    // MARK: - Event type interest (ref-counted)
+
+    // Realm event types subscribed by TYPE rather than by path. SDK-internal
+    // owners (operation waits, order capture) hold these instead of a
+    // realm-root watch, which would assemble a full-realm snapshot and put
+    // every realm event on this socket. Counted so one owner's release cannot
+    // unsubscribe a type another still needs.
+    private val eventTypeRefs = HashMap<String, Int>()
+    private val acknowledgedEventTypes = HashMap<String, WebSocket?>()
+    // socket -> type -> latest request id. Only the latest request's
+    // acknowledgement counts, so a stale one cannot pass for a fresh barrier.
+    private val eventTypeRequests = HashMap<WebSocket?, MutableMap<String, String>>()
+    private val eventTypeReadyWaiters = HashMap<UUID, Pair<List<String>, CompletableDeferred<Unit>>>()
+
+    internal fun acquireEventTypes(types: List<String>) {
+        lock.withLock {
+            cancelIdleTimerLocked()
+            val added = mutableListOf<String>()
+            for (type in types) {
+                val prev = eventTypeRefs[type] ?: 0
+                eventTypeRefs[type] = prev + 1
+                if (prev != 0) continue
+                val pending = unsubJobs.remove("event:$type")
+                if (pending != null) pending.cancel() else added += type
+            }
+            if (added.isNotEmpty()) {
+                ensureConnectedLocked()
+                sendEventTypesLocked(webSocket, added)
+            }
+        }
+    }
+
+    internal fun releaseEventTypes(types: List<String>) {
+        lock.withLock {
+            for (type in types) {
+                val current = eventTypeRefs[type] ?: 0
+                if (current > 1) { eventTypeRefs[type] = current - 1; continue }
+                if (current != 1) continue
+                eventTypeRefs.remove(type)
+                val timerKey = "event:$type"
+                unsubJobs[timerKey] = scope.launch {
+                    delay(UNSUB_DEBOUNCE_MS)
+                    if (!isActive) return@launch
+                    finishEventTypeRelease(type, timerKey)
+                }
+            }
+        }
+    }
+
+    private fun finishEventTypeRelease(type: String, timerKey: String) {
+        lock.withLock {
+            unsubJobs.remove(timerKey)
+            if (!eventTypeRefs.containsKey(type)) {
+                acknowledgedEventTypes.remove(type)
+                eventTypeRequests[webSocket]?.remove(type)
+                sendMessage(buildJsonObject {
+                    put("action", "unsubscribe_events")
+                    put("types", buildJsonArray { add(type) })
+                })
+            }
+            maybeStartIdleTimerLocked()
+        }
+    }
+
+    /**
+     * The server's acknowledgement of a type subscription on the current
+     * connection is the registration barrier: anything published after it
+     * reaches this socket. Sending the subscription alone does not close the gap.
+     */
+    internal suspend fun awaitEventTypesReady(types: List<String>) {
+        val id = UUID.randomUUID()
+        val ready = CompletableDeferred<Unit>()
+        lock.withLock {
+            if (eventTypesReadyLocked(types)) ready.complete(Unit) else eventTypeReadyWaiters[id] = types to ready
+        }
+        try { ready.await() }
+        finally { lock.withLock { eventTypeReadyWaiters.remove(id) }; ready.cancel() }
+    }
+
+    /**
+     * Actual-gap recovery requires a newly acknowledged subscription, even if
+     * an earlier acknowledgement is cached — the type-routed counterpart of
+     * [recoverPathReady].
+     */
+    internal suspend fun recoverEventTypesReady(types: List<String>) {
+        acquireEventTypes(types)
+        try {
+            lock.withLock { sendEventTypesLocked(webSocket, types) }
+            awaitEventTypesReady(types)
+        } finally { releaseEventTypes(types) }
+    }
+
+    private fun eventTypesReadyLocked(types: List<String>): Boolean =
+        statusFlow.value == ConnectionStatus.CONNECTED && types.all {
+            (eventTypeRefs[it] ?: 0) > 0 && acknowledgedEventTypes.containsKey(it) && acknowledgedEventTypes[it] === webSocket
+        }
+
+    private fun sendEventTypesLocked(target: WebSocket?, types: Collection<String>) {
+        val requestId = "events-${UUID.randomUUID()}"
+        val requests = eventTypeRequests.getOrPut(target) { HashMap() }
+        types.forEach { requests[it] = requestId }
+        if (target === webSocket) types.forEach { acknowledgedEventTypes.remove(it) }
+        sendMessage(target, buildJsonObject {
+            put("action", "subscribe_events")
+            put("types", buildJsonArray { types.forEach { add(it) } })
+            put("requestId", requestId)
+        })
+    }
+
+    private fun acknowledgeEventTypesLocked(types: Collection<String>) {
+        if (statusFlow.value != ConnectionStatus.CONNECTED) return
+        types.filter { (eventTypeRefs[it] ?: 0) > 0 }.forEach { acknowledgedEventTypes[it] = webSocket }
+        val ready = eventTypeReadyWaiters.filterValues { eventTypesReadyLocked(it.first) }
+        ready.forEach { (id, value) -> eventTypeReadyWaiters.remove(id); value.second.complete(Unit) }
+    }
+
+    private fun handleEventsSubscribed(obj: JsonObject) {
+        val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull ?: return
+        lock.withLock {
+            val types = eventTypeRequests[webSocket]?.filterValues { it == requestId }?.keys?.toList().orEmpty()
+            if (types.isNotEmpty()) acknowledgeEventTypesLocked(types)
+        }
+    }
+
     internal fun onOperationSnapshot(handler: (List<Operation>) -> Unit): UUID {
         val id = UUID.randomUUID(); operationSnapshotHandlers[id] = handler; return id
     }
@@ -669,7 +793,7 @@ public class WebSocketManager internal constructor(
 
     private fun hasAnyInterestLocked(): Boolean =
         pathRefs.isNotEmpty() || midsRefs > 0 || candleRefCoins.isNotEmpty() || oiRefCoins.isNotEmpty() ||
-            chartHistoryWatches.isNotEmpty() || attachedWatches.isNotEmpty()
+            chartHistoryWatches.isNotEmpty() || attachedWatches.isNotEmpty() || eventTypeRefs.isNotEmpty()
 
     private fun maybeStartIdleTimerLocked() {
         if (hasAnyInterestLocked() || idleDisconnectJob != null) return
@@ -1130,6 +1254,7 @@ public class WebSocketManager internal constructor(
                     return
                 }
                 "authenticated" -> { handleAuthenticated(obj); return }
+                "events_subscribed" -> { handleEventsSubscribed(obj); return }
                 "projection_watch_created" -> { handleProjectionWatchCreated(obj); return }
                 "error" -> { handleServerError(obj); return }
                 "mids.snapshot" -> {
@@ -1187,6 +1312,7 @@ public class WebSocketManager internal constructor(
         lock.withLock {
             acknowledgedPaths.clear(); acknowledgedOperations.clear()
             pathWatchRequests.clear()
+            acknowledgedEventTypes.clear(); eventTypeRequests.clear()
             log.info("websocket") { "authenticated" }
             reconnectAttempt = 0
             lastDeliverySeq = 0
@@ -1217,6 +1343,7 @@ public class WebSocketManager internal constructor(
         pathRefs.keys.forEach { path ->
             sendPathWatchLocked(target, path)
         }
+        if (eventTypeRefs.isNotEmpty()) sendEventTypesLocked(target, eventTypeRefs.keys.toList())
         chartHistoryWatches.forEach { (watchId, req) ->
             sendMessage(target, watchChartHistoryMsg(watchId, req.target, req.kind, req.objectId))
         }
@@ -1481,6 +1608,12 @@ public class WebSocketManager internal constructor(
             // Restart payload recovery on the new connection; pong carries no snapshot.
             pathSnapshotWaiters.values.map { it.first }.toSet().forEach { sendPathWatchLocked(socket, it) }
             pathWatchRequests.keys.retainAll(setOf(socket))
+            // Same barrier for type subscriptions: the warming batch's are
+            // proven registered by the pong; any taken after it need their own.
+            val (warmedTypes, unwarmedTypes) = eventTypeRefs.keys.partition { eventTypeRequests[socket]?.containsKey(it) == true }
+            if (warmedTypes.isNotEmpty()) acknowledgeEventTypesLocked(warmedTypes)
+            if (unwarmedTypes.isNotEmpty()) sendEventTypesLocked(socket, unwarmedTypes)
+            eventTypeRequests.keys.retainAll(setOf(socket))
             // New connection, new sequence space.
             lastDeliverySeq = 0
             lastMessageAtMs = System.currentTimeMillis()

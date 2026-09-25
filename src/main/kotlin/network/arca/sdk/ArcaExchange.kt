@@ -985,11 +985,16 @@ private fun Arca.makeOrderHandleDeps(capture: OrderEventCapture? = null,
             val auth = self.ws.onAuthenticated { trySend(Unit) }
             awaitClose { self.ws.removeGapHandler(gap); self.ws.removeAuthenticatedHandler(auth) }
         } },
-        recoverExecutionReady = { self.ws.recoverPathReady("/") },
+        recoverExecutionReady = { self.ws.recoverEventTypesReady(OrderEventCapture.EXECUTION_TYPES) },
         recordedFillEvents = { self.ws.fillRecordedEvents() },
-        // Ref-counted with every other owner of `/`, so `fill.recorded` frames
-        // reach this socket for the duration of an accounted() wait.
-        holdAccountWatch = { self.ws.watchPath("/"); { self.ws.unwatchPath("/") } },
+        // A `fill.recorded` type subscription for the duration of an
+        // accounted() wait. Type-routed on purpose: a realm-root watch would
+        // also assemble a full-realm snapshot and deliver every realm event.
+        holdAccountWatch = {
+            val types = listOf("fill.recorded")
+            self.ws.acquireEventTypes(types);
+            { self.ws.releaseEventTypes(types) }
+        },
         exchangeStateChanged = { objectId -> self.refreshExchangeStateWatches(objectId) },
     )
 }

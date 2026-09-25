@@ -35,8 +35,8 @@ internal class OrderEventCapture(scope: CoroutineScope, private val ws: WebSocke
         }
     }
     init {
-        ws.watchPath("/")
-        consumer.invokeOnCompletion { ws.unwatchPath("/") }
+        ws.acquireEventTypes(EXECUTION_TYPES)
+        consumer.invokeOnCompletion { ws.releaseEventTypes(EXECUTION_TYPES) }
     }
     suspend fun submit(objectId: String, action: suspend () -> OrderOperationResponse): OrderOperationResponse = try {
         action().also { submitted(it.operation, objectId) }
@@ -85,12 +85,22 @@ internal class OrderEventCapture(scope: CoroutineScope, private val ws: WebSocke
     }
     fun fillEvents() = channelFlow {
         val live = launch(start = CoroutineStart.UNDISPATCHED) { ws.fillEvents().collect { send(it) } }
-        ws.watchPath("/")
+        ws.acquireEventTypes(FILL_TYPES)
         try {
             for (event in events.replayCache) event.executionFill?.let { send(it to event) }
             awaitCancellation()
-        } finally { live.cancel(); ws.unwatchPath("/") }
+        } finally { live.cancel(); ws.releaseEventTypes(FILL_TYPES) }
     }
-    suspend fun awaitReady() { ws.awaitPathReady("/") }
+    suspend fun awaitReady() { ws.awaitEventTypesReady(EXECUTION_TYPES) }
     fun stop() { consumer.cancel() }
+
+    internal companion object {
+        /**
+         * The types the capture consumes, subscribed by type: a realm-root
+         * watch would also assemble a full-realm snapshot and put every realm
+         * event on the socket for each order in flight.
+         */
+        val EXECUTION_TYPES = listOf("order.updated", "operation.updated", "fill.previewed", "fill.recorded")
+        val FILL_TYPES = listOf("fill.previewed", "fill.recorded")
+    }
 }

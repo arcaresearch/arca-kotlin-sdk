@@ -123,7 +123,9 @@ internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds:
                         }
                     }.operation!!
                 }
-                ws.watchPath("/"); acquired = true; recover()
+                // Type routing, not a realm-root watch: the root watch assembled
+                // a full-realm snapshot and put every realm event on this socket.
+                ws.acquireEventTypes(OPERATION_EVENT_TYPES); acquired = true; recover()
                 val snapshots = async<Operation> {
                     var completed = 0L
                     for (requested in requests) {
@@ -133,9 +135,11 @@ internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds:
                         for (attempt in 0 until 3) {
                             var acknowledged = false
                             try {
-                                val operations = kotlinx.coroutines.withTimeout(1000) { ws.recoverPathSnapshotOperations("/") }
+                                // Once the subscription is acknowledged every later
+                                // operation event reaches this socket, so the read
+                                // below covers the window the stream could not.
+                                kotlinx.coroutines.withTimeout(1000) { ws.recoverEventTypesReady(OPERATION_EVENT_TYPES) }
                                 acknowledged = true
-                                operations.firstOrNull { it.id.value == operationId && it.state.isTerminal }?.let { return@async it }
                             }
                             catch (_: kotlinx.coroutines.TimeoutCancellationException) { /* bounded ACK failure */ }
                             catch (e: CancellationException) { throw e }
@@ -165,9 +169,11 @@ internal suspend fun Arca.waitForSettlement(operationId: String, timeoutSeconds:
         requests.close()
         ws.removeGapHandler(gap); ws.removeAuthenticatedHandler(auth); ws.removeRotatedHandler(rotated)
         ws.removeOperationSnapshotHandler(snapshotObserver); snapshotTerminal.cancel()
-        if (acquired) ws.unwatchPath("/")
+        if (acquired) ws.releaseEventTypes(OPERATION_EVENT_TYPES)
     }
 }
+
+private val OPERATION_EVENT_TYPES = listOf("operation.created", "operation.updated")
 
 /** Throws [ArcaException.OperationFailed] when the operation reached a non-success terminal state. */
 internal fun throwIfOperationFailed(operation: Operation) {
