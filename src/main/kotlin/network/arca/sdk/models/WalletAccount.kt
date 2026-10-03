@@ -78,6 +78,12 @@ public data class WalletOperation(
     val startedAt: String,
     val updatedAt: String,
     val canRetry: Boolean,
+    /** The Cash propose route's idempotency key (Cash-route operations only). */
+    val requestId: String? = null,
+    /** The action proposal whose accepted attempt created the operation. */
+    val actionProposalId: String? = null,
+    /** The opaque reference the send was requested with, echoed as-is. */
+    val reference: String? = null,
 ) {
     val typedState: WalletOperationState? get() = WalletOperationState.fromWire(state)
     val typedReason: WalletFailureReason? get() = reason?.let(WalletFailureReason::fromWire)
