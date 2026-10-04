@@ -142,6 +142,103 @@ public class WebSocketManager internal constructor(
     // long as it stays quiet. [midsEvents] replays this map to each new
     // collector as its first element.
     private var retainedMids: Map<String, String>? = null
+    private val pendingPublicPrices = mutableMapOf<String, String>()
+    private var publicFlushJob: Job? = null
+    private var lastPublicFlushNs = 0L
+    private var publicBatchEpoch = 0L
+    private fun clearPublicPrices() { ++publicBatchEpoch; publicFlushJob?.cancel(); publicFlushJob = null; pendingPublicPrices.clear() }
+    private fun queuePublicPrices(mids: Map<String, String>) {
+        mids.forEach { (market, price) ->
+            if (price != (pendingPublicPrices[market] ?: retainedMids?.get(market))) pendingPublicPrices[market] = price
+        }
+        if (pendingPublicPrices.isEmpty()) return
+        val waitNs = 100_000_000L - (System.nanoTime() - lastPublicFlushNs)
+        if (waitNs <= 0) flushPublicPrices()
+        else if (publicFlushJob == null) {
+            val epoch = publicBatchEpoch
+            publicFlushJob = scope.launch {
+                delay((waitNs + 999_999) / 1_000_000)
+                lock.withLock { if (epoch == publicBatchEpoch) flushPublicPrices() }
+            }
+        }
+    }
+    internal fun flushPublicPrices() = lock.withLock {
+        publicFlushJob?.cancel(); publicFlushJob = null
+        ++publicBatchEpoch
+        val mids = pendingPublicPrices.filter { (market, price) -> retainedMids?.get(market) != price }; pendingPublicPrices.clear()
+        if (mids.isNotEmpty()) {
+            lastPublicFlushNs = System.nanoTime()
+            retainedMids = (retainedMids ?: emptyMap()) + mids
+            emit(RealmEvent(type = "mids.updated", mids = mids))
+        }
+    }
+    private val marketDataRouter = MarketDataRouter()
+    private var publicSource: PublicMarketSource? = null
+    private var publicSourceEpoch = 0L
+    private var publicConnectionEpoch = 0L
+    private var marketDataConfigurationEpoch = 0L
+    private var publicNetwork = HyperliquidNetwork.MAINNET
+    private var publicSuspended = false
+    internal var publicSourceFactory: (String, (Long, PublicMarketUpdate) -> Unit) -> PublicMarketSource =
+        { url, receive -> HyperliquidMarketSource(url, receive) }
+
+    internal fun beginMarketDataConfiguration(): Long = lock.withLock {
+        stopPublicSourceLocked()
+        marketDataRouter.configure(MarketDataPreference.ARCA, emptyList())
+        ++marketDataConfigurationEpoch
+    }
+    internal fun configureMarketData(epoch: Long, preference: MarketDataPreference, network: HyperliquidNetwork, markets: Collection<network.arca.sdk.models.Market>) = lock.withLock {
+        if (epoch != marketDataConfigurationEpoch) return@withLock
+        publicNetwork = network
+        marketDataRouter.configure(preference, markets)
+        syncPublicSourceLocked()
+    }
+    public val marketDataSourceStatus: MarketDataSourceStatus get() = lock.withLock { marketDataRouter.status() }
+    internal fun registerPriceMarkets(): String = lock.withLock {
+        UUID.randomUUID().toString().also { marketDataRouter.register(it) }
+    }
+    internal fun updatePriceMarkets(owner: String, markets: Set<String>, revision: Long = 0) = lock.withLock {
+        marketDataRouter.update(owner, markets, revision); syncPublicSourceLocked()
+    }
+    internal fun releasePriceMarkets(owner: String) = lock.withLock {
+        marketDataRouter.release(owner); syncPublicSourceLocked()
+    }
+    private fun stopPublicSourceLocked() {
+        clearPublicPrices(); lastPublicFlushNs = 0
+        ++publicSourceEpoch; publicConnectionEpoch = 0
+        publicSource?.close(); publicSource = null
+        marketDataRouter.unavailable(null)
+    }
+    private fun syncPublicSourceLocked() {
+        val subscriptions = marketDataRouter.subscriptions
+        pendingPublicPrices.keys.retainAll(subscriptions.filter { it.interval == null }.map { it.market }.toSet())
+        if (publicSuspended || subscriptions.isEmpty()) { stopPublicSourceLocked(); return }
+        if (publicSource == null) {
+            val epoch = ++publicSourceEpoch
+            publicSource = publicSourceFactory(publicNetwork.websocketUrl) { connection, update ->
+                lock.withLock {
+                    if (epoch != publicSourceEpoch || connection < publicConnectionEpoch) return@withLock
+                    publicConnectionEpoch = connection
+                    if (update is PublicMarketUpdate.Unavailable) {
+                        clearPublicPrices()
+                        log.warning("market-data") { update.reason }
+                    }
+                    marketDataRouter.direct(update, System.currentTimeMillis())?.let { event ->
+                        if (event.mids != null) queuePublicPrices(event.mids) else emit(event)
+                    }
+                }
+            }
+        }
+        publicSource?.subscribe(subscriptions)
+    }
+    private fun emitArcaMarketEvent(event: RealmEvent, snapshot: Boolean = false) = lock.withLock {
+        if (event.type == EventType.MIDS_UPDATED.wire && event.mids != null) {
+            val mids = marketDataRouter.arcaPrices(event.mids)
+            retainedMids = if (snapshot) mids + (retainedMids ?: emptyMap()).filterKeys { it in marketDataRouter.status().directPriceMarkets }
+                else (retainedMids ?: emptyMap()) + mids
+            if (snapshot || mids.isNotEmpty()) emit(event.copy(mids = mids))
+        } else if (marketDataRouter.arcaCandle(event)) emit(event)
+    }
     private val candleRefCoins = HashMap<String, MutableSet<String>>()
     private val oiRefCoins = HashMap<String, MutableSet<String>>()
     private val chartHistoryWatches = HashMap<String, ChartWatch>()
@@ -215,6 +312,7 @@ public class WebSocketManager internal constructor(
 
     /** Connect to the WebSocket. */
     public fun connect() {
+        lock.withLock { publicSuspended = hiddenAtMs != null; syncPublicSourceLocked() }
         lock.withLock {
             shouldReconnect = true
             installLifecycleLocked()
@@ -247,6 +345,7 @@ public class WebSocketManager internal constructor(
     public fun disconnect() {
         lock.withLock {
             shouldReconnect = false
+            publicSuspended = true; stopPublicSourceLocked()
             reconnectJob?.cancel(); reconnectJob = null
             resumeProbeJob?.cancel(); resumeProbeJob = null
             cancelRotationLocked()
@@ -558,6 +657,7 @@ public class WebSocketManager internal constructor(
 
     public fun acquireMids(exchange: String) {
         lock.withLock {
+            publicSuspended = hiddenAtMs != null; syncPublicSourceLocked()
             cancelIdleTimerLocked()
             midsExchange = exchange
             midsRefs += 1
@@ -601,6 +701,7 @@ public class WebSocketManager internal constructor(
 
     public fun acquireCandles(coins: List<String>, intervals: List<CandleInterval>) {
         lock.withLock {
+            marketDataRouter.acquireCandles(coins, intervals); syncPublicSourceLocked()
             cancelIdleTimerLocked()
             for (coin in coins) {
                 val set = candleRefCoins.getOrPut(coin) { mutableSetOf() }
@@ -613,9 +714,10 @@ public class WebSocketManager internal constructor(
 
     public fun releaseCandles(coins: List<String>, intervals: List<CandleInterval>) {
         lock.withLock {
+            marketDataRouter.releaseCandles(coins, intervals); syncPublicSourceLocked()
             for (coin in coins) {
                 val ivs = candleRefCoins[coin] ?: continue
-                intervals.forEach { ivs.remove(it.wire) }
+                intervals.filterNot { marketDataRouter.candleRetained(coin, it) }.forEach { ivs.remove(it.wire) }
                 if (ivs.isEmpty()) candleRefCoins.remove(coin)
             }
             unsubJobs["candles"] = scope.launch {
@@ -1128,7 +1230,7 @@ public class WebSocketManager internal constructor(
 
     /** Host hook: notify the manager the app entered the background. */
     public fun handleAppDidEnterBackground() {
-        lock.withLock { hiddenAtMs = System.currentTimeMillis() }
+        lock.withLock { hiddenAtMs = System.currentTimeMillis(); publicSuspended = true; stopPublicSourceLocked() }
     }
 
     /** Host hook: notify the manager the app returned to the foreground. */
@@ -1136,6 +1238,7 @@ public class WebSocketManager internal constructor(
         val hiddenDuration = lock.withLock {
             val hidden = hiddenAtMs ?: return
             hiddenAtMs = null
+            publicSuspended = false; syncPublicSourceLocked()
             (System.currentTimeMillis() - hidden) / 1000.0
         }
         if (hiddenDuration < RESUME_HIDDEN_THRESHOLD_S) return
@@ -1263,8 +1366,7 @@ public class WebSocketManager internal constructor(
                     // A snapshot is the authoritative current state for
                     // whatever the socket is subscribed to, so it replaces the
                     // retained map rather than merging into it.
-                    lock.withLock { retainedMids = mids }
-                    emit(RealmEvent(type = EventType.MIDS_UPDATED.wire, mids = mids))
+                    emitArcaMarketEvent(RealmEvent(type = EventType.MIDS_UPDATED.wire, mids = mids), snapshot = true)
                     return
                 }
                 "candles.updated" -> {
@@ -1278,7 +1380,7 @@ public class WebSocketManager internal constructor(
                         val candle = runCatching {
                             arcaJson.decodeFromJsonElement(Candle.serializer(), candleEl)
                         }.getOrNull() ?: continue
-                        emit(
+                        emitArcaMarketEvent(
                             RealmEvent(
                                 type = EventType.CANDLE_UPDATED.wire,
                                 market = market,
@@ -1299,12 +1401,7 @@ public class WebSocketManager internal constructor(
         }
 
         runCatching { arcaJson.decodeFromString(RealmEvent.serializer(), text) }.getOrNull()?.let { event ->
-            if (event.type == EventType.MIDS_UPDATED.wire) {
-                event.mids?.let { mids ->
-                    lock.withLock { retainedMids = (retainedMids ?: emptyMap()) + mids }
-                }
-            }
-            emit(event)
+            emitArcaMarketEvent(event)
         }
     }
 

@@ -422,3 +422,59 @@ Operation waits register listeners before subscribing. Startup, actual gaps, rea
 
 Operation snapshot evidence: Terminal operations in the initial or buffered subscription snapshot resolve the wait before any HTTP read, including typed failed/expired results. Socket rotation requests fresh operation evidence on the replacement connection; its pong only establishes transport readiness. Stale snapshot request IDs and unrelated operation IDs cannot settle the wait.
 Verified snapshot operations are shared with all live waiters, including results buffered while another caller refreshes the same root watch; each waiter still accepts only its original operation ID.
+
+### Optional direct public market data (2.11.0)
+
+The Swift and Kotlin SDKs keep **Arca as the default**. Opting into Hyperliquid
+changes public midpoint prices and the current open candle only. Choose the
+venue network explicitly; the SDK never infers it from a realm or custody chain.
+Both sources feed the same SDK price stream, including client-priced equity,
+P&L, valuation and sizing. Server-priced states, allocation quotes, limits,
+execution and recorded fills retain their existing authority.
+
+Direct quotes use **BBO midpoint, not Hyperliquid mark or last trade**. Raw
+precision is preserved; round only for presentation. The adapter reads exact
+`Market.venueSymbol` metadata for a canonical market ID. Missing or ambiguous
+metadata, non-Hyperliquid markets, excess interests and 15-second candles stay
+on Arca. `watchPrices()` without a market list does not subscribe the entire
+venue directly. Pass the visible markets and replace them with `setMarkets` as
+visibility changes. Exchange-state watches add their held markets automatically;
+max-order-size watches add their selected market. Always stop unused watches.
+
+One public socket per SDK instance has at most 64 subscriptions (price interests
+first, then candles; each group sorted by canonical ID). It uses a separate
+unauthenticated client, JSON heartbeats, bounded frames, paced subscription
+changes and reconnect backoff. Background/disconnect and zero interests close
+it. These are per-instance limits, not guarantees against shared-IP venue limits.
+
+Direct price changes are merged before financial fan-out: first change immediate,
+then at most one latest batch per 100 ms, with one pending value per market and
+no idle timer. Quantity-only BBO changes do not trigger valuation. Do not add a
+second 100 ms throttle downstream when consuming this path; retain per-field UI
+deduplication and separate slower chart-history work. The scheduler bounds added
+SDK delay under normal execution, not OS stalls or venue update cadence.
+
+Arca stays subscribed. Each market uses Arca until its first valid direct frame;
+on source failure it resumes from the next arriving Arca frame, never an emitted
+cached fallback. Reconnection messages are generation-fenced. The existing Arca
+wire payload lacks the venue event timestamp, so fallback event-time ordering
+and exact end-to-end age cannot be guaranteed. `marketDataSourceStatus` reports
+preference, requested direct subscription count, markets with direct frames, and
+the latest source error; readiness is not a latency or completeness guarantee.
+
+Direct candles update only the current open bucket. Arca finalized bars and
+history/gap recovery remain authoritative; a closed bar cannot be overwritten by
+a late direct open frame. No price or candle polling fallback is introduced.
+Switch preference back to Arca at runtime without replacing watches; a
+configuration-generation guard prevents a late metadata read from re-enabling
+an earlier preference.
+
+```kotlin
+arca.setMarketDataPreference(MarketDataPreference.HYPERLIQUID, HyperliquidNetwork.MAINNET)
+val prices = arca.watchPrices(markets = listOf("hl:0:BTC", "hl:0:ETH"))
+prices.setMarkets(listOf("hl:0:BTC"))
+val source = arca.marketDataSourceStatus
+// Reversible, including existing account/valuation watches:
+arca.setMarketDataPreference(MarketDataPreference.ARCA)
+prices.stop()
+```

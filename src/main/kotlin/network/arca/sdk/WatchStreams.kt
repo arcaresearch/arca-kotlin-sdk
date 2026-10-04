@@ -319,6 +319,10 @@ public class ProjectionWatchStream internal constructor(
 
 /** A stream of real-time mid prices. */
 public class MarketPriceStream internal constructor() : BaseWatchStream() {
+    internal var updateMarketsAction: (List<String>) -> Unit = {}
+    /** Replace this watch's direct-price interests without reopening the stream. Empty keeps Arca prices. */
+    public fun setMarkets(markets: List<String>) { updateMarketsAction(markets) }
+
     internal val pricesMut: MutableStateFlow<Map<String, String>> = MutableStateFlow(emptyMap())
     internal val updatesMut: MutableSharedFlow<Map<String, String>> = snapshotUpdatesFlow()
 

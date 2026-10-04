@@ -435,6 +435,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     val detail = getObjectDetail(objectId)
     val objectPath = detail.`object`.path
 
+    val priceInterest = ws.registerPriceMarkets()
     val stream = ExchangeStateWatchStream()
     val visible = positionView(objectId)
     val structural = MutableStateFlow<ExchangeState?>(null)
@@ -519,6 +520,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
             if (epoch == observationEpoch && armExpiry(state, ++observationEpoch)) {
                 clearRecovery()
                 structural.value = state
+                ws.updatePriceMarkets(priceInterest, state.positions.map { it.market }.toSet(), observationEpoch)
                 val cur = mids.value
                 stream.setState(WatchStreamState.CONNECTED)
                 val value = if (cur.isEmpty()) state else state.revalued(cur)
@@ -576,9 +578,13 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         }
     }
 
-    val initial = getExchangeState(objectId)
+    val initial = try { getExchangeState(objectId) } catch (error: Throwable) {
+        ws.releasePriceMarkets(priceInterest)
+        throw error
+    }
     if (armExpiry(initial, 0)) {
         structural.value = initial
+        ws.updatePriceMarkets(priceInterest, initial.positions.map { it.market }.toSet(), observationEpoch)
         stream.exchangeStateMut.value = initial
         visible.observe(initial)
         stream.setState(WatchStreamState.CONNECTED)
@@ -663,6 +669,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         ws.removeGapHandler(gapId)
         unregisterExchangeStateRefresher(objectId, refresherId)
         ws.unwatchPath(objectPath)
+        ws.releasePriceMarkets(priceInterest)
         ws.releaseMids()
     }
     return stream
@@ -929,10 +936,16 @@ public suspend fun Arca.watchOI(
  * (the subscription is ref-counted, so the server only sends a snapshot per
  * subscribe). Call [MarketPriceStream.stop] when done.
  */
-public suspend fun Arca.watchPrices(exchange: String = "sim"): MarketPriceStream {
+public suspend fun Arca.watchPrices(exchange: String = "sim"): MarketPriceStream = watchPrices(exchange, emptyList())
+
+/** Watch the full selected price map and register explicit direct-source interests. */
+public suspend fun Arca.watchPrices(exchange: String = "sim", markets: List<String>): MarketPriceStream {
+    val priceInterest = ws.registerPriceMarkets()
+    ws.updatePriceMarkets(priceInterest, markets.toSet())
     ws.ensureConnected()
 
     val stream = MarketPriceStream()
+    stream.updateMarketsAction = { ws.updatePriceMarkets(priceInterest, it.toSet()) }
     val jobs = mutableListOf<Job>()
 
     jobs += scope.launch {
@@ -956,9 +969,10 @@ public suspend fun Arca.watchPrices(exchange: String = "sim"): MarketPriceStream
 
     stream.stopAction = {
         jobs.forEach { it.cancel() }
+        ws.releasePriceMarkets(priceInterest)
         ws.releaseMids()
     }
-    stream.ready()
+    try { stream.ready() } catch (error: Throwable) { stream.stop(); throw error }
     return stream
 }
 
@@ -982,7 +996,7 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     ws.ensureConnected()
 
     val stream = MaxOrderSizeWatchStream()
-    val priceStream = watchPrices()
+    val priceStream = watchPrices(markets = listOf(options.market))
 
     val initialExchangeState: ExchangeState = try {
         getExchangeState(options.objectId)
