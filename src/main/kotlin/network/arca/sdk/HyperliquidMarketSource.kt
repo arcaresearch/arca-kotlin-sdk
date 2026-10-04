@@ -68,6 +68,7 @@ internal class HyperliquidMarketSource(
                     lastReceivedNs = System.nanoTime()
                     sent
                 }
+                receive(epoch, PublicMarketUpdate.Traffic(text.toByteArray(Charsets.UTF_8).size))
                 if (text.length > 262_144) { fail(epoch, "Hyperliquid frame exceeded size budget"); return }
                 val json = runCatching { arcaJson.parseToJsonElement(text).jsonObject }.getOrNull() ?: return
                 if ((json["channel"] as? JsonPrimitive)?.contentOrNull == "error") {

@@ -169,8 +169,25 @@ public class WebSocketManager internal constructor(
         if (mids.isNotEmpty()) {
             lastPublicFlushNs = System.nanoTime()
             retainedMids = (retainedMids ?: emptyMap()) + mids
+            marketDataRecorder.prices(mids, true, marketDataRouter.priceInterestMarkets)
+            publishMarketDiagnostics()
             emit(RealmEvent(type = "mids.updated", mids = mids))
         }
+    }
+    private val marketDataRecorder = MarketDataDiagnosticsRecorder()
+    private val diagnosticUpdates = MutableStateFlow(MarketDataDiagnostics())
+    private var lastDiagnosticNs = 0L
+    public val marketDataDiagnostics: MarketDataDiagnostics get() = lock.withLock { marketDataRecorder.snapshot(marketDataRouter) }
+    public fun watchMarketDataDiagnostics(): StateFlow<MarketDataDiagnostics> = lock.withLock {
+        diagnosticUpdates.value = marketDataRecorder.snapshot(marketDataRouter)
+        diagnosticUpdates.asStateFlow()
+    }
+    private fun publishMarketDiagnostics(force: Boolean = false) {
+        if (diagnosticUpdates.subscriptionCount.value == 0) return
+        val now = System.nanoTime()
+        if (!force && now - lastDiagnosticNs < 1_000_000_000) return
+        lastDiagnosticNs = now
+        diagnosticUpdates.value = marketDataRecorder.snapshot(marketDataRouter)
     }
     private val marketDataRouter = MarketDataRouter()
     private var publicSource: PublicMarketSource? = null
@@ -208,8 +225,11 @@ public class WebSocketManager internal constructor(
         ++publicSourceEpoch; publicConnectionEpoch = 0
         publicSource?.close(); publicSource = null
         marketDataRouter.unavailable(null)
+        marketDataRecorder.suspend()
+        publishMarketDiagnostics(true)
     }
     private fun syncPublicSourceLocked() {
+        marketDataRecorder.retain(marketDataRouter.priceInterestMarkets)
         val subscriptions = marketDataRouter.subscriptions
         pendingPublicPrices.keys.retainAll(subscriptions.filter { it.interval == null }.map { it.market }.toSet())
         if (publicSuspended || subscriptions.isEmpty()) { stopPublicSourceLocked(); return }
@@ -219,25 +239,40 @@ public class WebSocketManager internal constructor(
                 lock.withLock {
                     if (epoch != publicSourceEpoch || connection < publicConnectionEpoch) return@withLock
                     publicConnectionEpoch = connection
+                    if (update is PublicMarketUpdate.Traffic) {
+                        marketDataRecorder.bytes(update.bytes, true); publishMarketDiagnostics(); return@withLock
+                    }
                     if (update is PublicMarketUpdate.Unavailable) {
+                        marketDataRecorder.failure()
                         clearPublicPrices()
                         log.warning("market-data") { update.reason }
                     }
                     marketDataRouter.direct(update, System.currentTimeMillis())?.let { event ->
-                        if (event.mids != null) queuePublicPrices(event.mids) else emit(event)
+                        marketDataRecorder.recovered()
+                        if (event.mids != null) queuePublicPrices(event.mids) else { marketDataRecorder.candle(true); emit(event) }
                     }
+                    publishMarketDiagnostics(update is PublicMarketUpdate.Unavailable)
                 }
             }
         }
         publicSource?.subscribe(subscriptions)
+        publishMarketDiagnostics(true)
     }
     private fun emitArcaMarketEvent(event: RealmEvent, snapshot: Boolean = false) = lock.withLock {
         if (event.type == EventType.MIDS_UPDATED.wire && event.mids != null) {
             val mids = marketDataRouter.arcaPrices(event.mids)
             retainedMids = if (snapshot) mids + (retainedMids ?: emptyMap()).filterKeys { it in marketDataRouter.status().directPriceMarkets }
                 else (retainedMids ?: emptyMap()) + mids
-            if (snapshot || mids.isNotEmpty()) emit(event.copy(mids = mids))
-        } else if (marketDataRouter.arcaCandle(event)) emit(event)
+            if (snapshot || mids.isNotEmpty()) {
+                marketDataRecorder.prices(mids, false, marketDataRouter.priceInterestMarkets)
+                publishMarketDiagnostics()
+                emit(event.copy(mids = mids))
+            }
+        } else if (marketDataRouter.arcaCandle(event)) {
+            if (event.type == "candle.updated" || event.type == "candle.closed") marketDataRecorder.candle(false)
+            publishMarketDiagnostics()
+            emit(event)
+        }
     }
     private val candleRefCoins = HashMap<String, MutableSet<String>>()
     private val oiRefCoins = HashMap<String, MutableSet<String>>()
@@ -1334,6 +1369,7 @@ public class WebSocketManager internal constructor(
     }
 
     private fun handleMessage(text: String) {
+        lock.withLock { marketDataRecorder.bytes(text.toByteArray(Charsets.UTF_8).size, false); publishMarketDiagnostics() }
         lastMessageAtMs = System.currentTimeMillis()
         val obj = runCatching { arcaJson.parseToJsonElement(text).jsonObject }.getOrNull()
 
@@ -1836,6 +1872,8 @@ public class WebSocketManager internal constructor(
         if (newStatus == statusFlow.value) return
         log.debug("websocket", metadata = mapOf("from" to statusFlow.value.name, "to" to newStatus.name)) { "status" }
         statusFlow.value = newStatus
+        marketDataRecorder.connected(newStatus == ConnectionStatus.CONNECTED)
+        publishMarketDiagnostics(true)
     }
 
     /** Inject a raw WebSocket message for testing. Not for production use. */

@@ -478,3 +478,25 @@ val source = arca.marketDataSourceStatus
 arca.setMarketDataPreference(MarketDataPreference.ARCA)
 prices.stop()
 ```
+
+## Market data diagnostics (2.12.0)
+
+`watchMarketDataDiagnostics()` observes a conflated cumulative `MarketDataDiagnostics`
+snapshot: Swift returns an AsyncStream (await it); Kotlin returns a StateFlow.
+`marketDataDiagnostics` reads the current snapshot (await in Swift). Observation
+adds no socket, subscription or polling timer. Updates accompany traffic at most
+once a second plus source/interest/connection transitions. Cancel observation to
+release it. Use foreground-window deltas, not number of diagnostic callbacks.
+
+Fields: elapsedMs, preference, requestedPriceMarkets, directSubscriptions,
+arcaServingMarkets/hyperliquidServingMarkets (last routed quote source),
+arcaPriceValues/hyperliquidPriceValues, arcaCandleFrames/hyperliquidCandleFrames,
+hyperliquidFailures/hyperliquidRecoveries/hyperliquidRecoveryMs,
+arcaConnected/arcaDisconnects, arcaPayloadBytes/hyperliquidPayloadBytes, firstPriceMs.
+Counters last for one SDK client and include reconnects. Deliberate disconnects
+can increment Arca disconnects; split lifecycle windows. Intentional suspension
+cancels a pending direct-recovery duration. All bytes are incoming application
+payloads, excluding framing/TLS; Arca's count includes its shared account socket.
+The first price delay starts at socket-manager creation and concerns the first
+routed interested price. It is not venue latency. Quiet prices are not failures,
+no exchange timestamp is invented, and Arca still owns finalized candles.

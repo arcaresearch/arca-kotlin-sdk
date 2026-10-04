@@ -27,6 +27,7 @@ internal sealed interface PublicMarketUpdate {
     data class Quote(val market: String, val price: String, val timeMs: Long) : PublicMarketUpdate
     data class Bar(val market: String, val interval: CandleInterval, val candle: Candle) : PublicMarketUpdate
     data class Unavailable(val reason: String) : PublicMarketUpdate
+    data class Traffic(val bytes: Int) : PublicMarketUpdate
 }
 
 /** Provider boundary: implementations know wire formats/reconnection; the router knows preference. */
@@ -41,6 +42,7 @@ internal class MarketDataRouter {
     private var mapping = emptyMap<String, String>()
     private data class Interest(val revision: Long, val markets: Set<String>)
     private val interests = linkedMapOf<String, Interest>()
+    val priceInterestMarkets: Set<String> get() = interests.values.flatMap { it.markets }.toSet()
     private val candles = linkedMapOf<Pair<String, CandleInterval>, Int>()
     private val quoteTimes = mutableMapOf<String, Long>()
     private val bars = mutableMapOf<Pair<String, CandleInterval>, Candle>()
@@ -110,6 +112,7 @@ internal class MarketDataRouter {
         return incoming.t > direct.t // do not replay an older open frame over the selected live bar
     }
     fun direct(update: PublicMarketUpdate, nowMs: Long): RealmEvent? = when (update) {
+        is PublicMarketUpdate.Traffic -> null
         is PublicMarketUpdate.Unavailable -> { unavailable(update.reason); null }
         is PublicMarketUpdate.Quote -> {
             if (subscriptions.none { it.market == update.market && it.interval == null } ||

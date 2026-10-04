@@ -127,6 +127,10 @@ class MarketDataRoutingTest {
         manager.beginMarketDataConfiguration(); receive(3, PublicMarketUpdate.Quote("hl:0:BTC", "999", now + 2)); arca("107")
         withTimeout(2000) { while (values.size < 5) delay(5) }
         assertEquals(listOf("100", "101", "103", "105", "107"), values.toList())
+        val diagnostics = manager.marketDataDiagnostics
+        assertEquals(3L, diagnostics.arcaPriceValues); assertEquals(2L, diagnostics.hyperliquidPriceValues)
+        assertEquals(1L, diagnostics.hyperliquidFailures); assertEquals(1L, diagnostics.hyperliquidRecoveries)
+        assertEquals(1, diagnostics.arcaServingMarkets); assertEquals(0, diagnostics.hyperliquidServingMarkets)
         assertTrue(closed)
         assertEquals("107", withTimeout(2000) { manager.midsEvents().first() }["hl:0:BTC"])
         val base = arcaJson.decodeFromString<ExchangeState>("""{"account":{"id":"a1","realmId":"r1","name":"main","createdAt":"2026-09-06","updatedAt":"2026-09-06"},"marginSummary":{"equity":"1000","initialMarginUsed":"50","maintenanceMarginRequired":"0","availableToWithdraw":"950","totalNtlPos":"1000","totalUnrealizedPnl":"0","totalRawUsd":"1000"},"positions":[{"id":"p1","market":"hl:0:BTC","side":"long","size":"10","entryPrice":"100","leverage":20,"marginUsed":"50","positionValue":"1000","unrealizedPnl":"0"}],"openOrders":[]}""")
