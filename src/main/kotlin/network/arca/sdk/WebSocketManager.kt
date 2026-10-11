@@ -35,11 +35,14 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import network.arca.sdk.internal.arcaJson
 import network.arca.sdk.models.executionFill
+import network.arca.sdk.models.AggregationSource
+import network.arca.sdk.models.AggregationSourceType
 import network.arca.sdk.models.Candle
 import network.arca.sdk.models.CandleEvent
 import network.arca.sdk.models.CandleInterval
 import network.arca.sdk.models.OIEvent
 import network.arca.sdk.models.ConnectionStatus
+import network.arca.sdk.models.CreateWatchResponse
 import network.arca.sdk.models.EventType
 import network.arca.sdk.models.ExchangeState
 import network.arca.sdk.models.Fill
@@ -117,6 +120,7 @@ public class WebSocketManager internal constructor(
 
     /** The replacement being warmed up alongside [webSocket] during a rotation. */
     @Volatile private var handoffWebSocket: WebSocket? = null
+    private var handoffAuthenticated = false
 
     private var subscribedMids: Pair<String, List<String>>? = null
     private var subscribedCandles: Pair<List<String>, List<CandleInterval>>? = null
@@ -124,6 +128,7 @@ public class WebSocketManager internal constructor(
     private var shouldReconnect = false
     private var reconnectAttempt = 0
     private var reconnectJob: Job? = null
+    private var stableJob: Job? = null
     private var rotationJob: Job? = null
     private var handoffTimeoutJob: Job? = null
     private var serverLifetimeMs: Long? = null
@@ -280,9 +285,24 @@ public class WebSocketManager internal constructor(
 
     // Watches created out-of-band (REST POST /aggregations/watch) that this
     // socket registered for delivery. Delivery is ownership-gated
-    // server-side, so these must be re-attached on every reconnect or the
-    // watch goes silent.
+    // server-side, so these are re-attached on every reconnect. The server
+    // destroys a watch with the connection that registered it, so a
+    // re-attach usually answers "unknown watch"; that answer is scoped to
+    // the attach request and drops the id here.
     private val attachedWatches = LinkedHashSet<String>()
+    private val attachRequests = HashMap<String, String>()
+
+    // Aggregation watches created over the socket, by requestId. A request
+    // parked while disconnected, or in flight on a socket that went away, is
+    // (re)sent on the next live socket: the caller wants a watch on whichever
+    // socket is current, and one created on a dead socket died with it.
+    private class AggregationCreateRequest(
+        val message: JsonObject,
+        val deferred: CompletableDeferred<CreateWatchResponse>,
+        var sentOn: WebSocket? = null,
+    )
+    private val aggregationCreateRequests = LinkedHashMap<String, AggregationCreateRequest>()
+    private var nextRequestId = 0
 
     // Projection watch request/reply state. Replies are matched to callers by
     // requestId; a request issued while disconnected parks in
@@ -355,14 +375,9 @@ public class WebSocketManager internal constructor(
         }
     }
 
-    /** Connect only if not already connected or connecting. */
+    /** Connect only if not already connected, connecting, or waiting out a reconnect backoff. */
     public fun ensureConnected() {
-        lock.withLock {
-            if (webSocket != null) return
-            shouldReconnect = true
-            installLifecycleLocked()
-            doConnectLocked()
-        }
+        lock.withLock { ensureConnectedLocked() }
     }
 
     /** Force the WebSocket to disconnect and immediately reconnect. */
@@ -382,6 +397,8 @@ public class WebSocketManager internal constructor(
             shouldReconnect = false
             publicSuspended = true; stopPublicSourceLocked()
             reconnectJob?.cancel(); reconnectJob = null
+            stableJob?.cancel(); stableJob = null
+            reconnectAttempt = 0
             resumeProbeJob?.cancel(); resumeProbeJob = null
             cancelRotationLocked()
             abortHandoffLocked()
@@ -914,8 +931,79 @@ public class WebSocketManager internal constructor(
             cancelIdleTimerLocked()
             attachedWatches.add(watchId)
             ensureConnectedLocked()
-            sendMessage(attachAggregationWatchMsg(watchId))
+            // Before auth the server answers "not authenticated" with no
+            // requestId, which reads as a connection-level failure. Auth
+            // attaches every registered watch, so nothing is lost by waiting.
+            if (statusFlow.value == ConnectionStatus.CONNECTED) sendAttachLocked(webSocket, watchId)
         }
+    }
+
+    /**
+     * Create a standalone aggregation watch on this socket and suspend until
+     * the server replies with the initial aggregation.
+     *
+     * The watch registry is per pod and a socket only receives updates for
+     * watches on its own pod, so a watch created here is always deliverable,
+     * where a REST-created one is silent whenever the REST call and the socket
+     * land on different pods. The watch is connection-scoped: the server
+     * destroys it when the socket closes, so callers re-create it on reconnect
+     * or rotation (see [rotatedStream]).
+     */
+    internal suspend fun createAggregationWatch(
+        sources: List<AggregationSource>,
+        flowsSince: String? = null,
+    ): CreateWatchResponse {
+        val deferred = CompletableDeferred<CreateWatchResponse>()
+        val requestId = lock.withLock {
+            cancelIdleTimerLocked()
+            ensureConnectedLocked()
+            nextRequestId += 1
+            val id = "agg-req-$nextRequestId"
+            val request = AggregationCreateRequest(createAggregationWatchMsg(sources, flowsSince, id), deferred)
+            aggregationCreateRequests[id] = request
+            if (statusFlow.value == ConnectionStatus.CONNECTED) sendAggregationCreateLocked(webSocket, request)
+            id
+        }
+        try {
+            return withTimeout(AGGREGATION_REQUEST_TIMEOUT_MS) { deferred.await() }
+        } catch (e: TimeoutCancellationException) {
+            throw ArcaException.Unknown(
+                "WS_REQUEST_TIMEOUT",
+                "create_aggregation_watch: timed out waiting for the server reply",
+            )
+        } finally {
+            lock.withLock { aggregationCreateRequests.remove(requestId) }
+        }
+    }
+
+    /** Tear down a watch made by [createAggregationWatch]. Best-effort; a no-op while disconnected. */
+    internal fun destroyAggregationWatch(watchId: String) {
+        if (watchId.isEmpty()) return
+        lock.withLock {
+            // A disconnected socket already took the watch with it.
+            if (statusFlow.value == ConnectionStatus.CONNECTED) {
+                sendMessage(buildJsonObject { put("action", "destroy_aggregation_watch"); put("watchId", watchId) })
+            }
+            maybeStartIdleTimerLocked()
+        }
+    }
+
+    private fun sendAttachLocked(target: WebSocket?, watchId: String) {
+        nextRequestId += 1
+        val id = "attach-req-$nextRequestId"
+        attachRequests[id] = watchId
+        sendMessage(target, attachAggregationWatchMsg(watchId, id))
+    }
+
+    private fun sendAggregationCreateLocked(target: WebSocket?, request: AggregationCreateRequest) {
+        if (target == null) return
+        request.sentOn = target
+        sendMessage(target, request.message)
+    }
+
+    /** Send every create request not yet sent on [target], the newly live socket. */
+    private fun flushAggregationCreatesLocked(target: WebSocket?) {
+        aggregationCreateRequests.values.forEach { if (it.sentOn !== target) sendAggregationCreateLocked(target, it) }
     }
 
     /** Stop delivery of a watch on this socket without destroying it. */
@@ -1274,6 +1362,10 @@ public class WebSocketManager internal constructor(
             val hidden = hiddenAtMs ?: return
             hiddenAtMs = null
             publicSuspended = false; syncPublicSourceLocked()
+            // A user returning to the app should not wait out a backoff that
+            // grew while it was hidden. The attempt count is kept, so a
+            // connect that fails again still backs off.
+            if (shouldReconnect && webSocket == null && reconnectJob != null) doConnectLocked()
             (System.currentTimeMillis() - hidden) / 1000.0
         }
         if (hiddenDuration < RESUME_HIDDEN_THRESHOLD_S) return
@@ -1321,13 +1413,18 @@ public class WebSocketManager internal constructor(
     // MARK: - Connection internals
 
     private fun ensureConnectedLocked() {
-        if (webSocket != null) return
+        // A scheduled reconnect is already connecting; jumping it would undo the backoff.
+        if (webSocket != null || reconnectJob != null) return
         shouldReconnect = true
         installLifecycleLocked()
         doConnectLocked()
     }
 
     private fun doConnectLocked() {
+        // A scheduled reconnect firing after this would replace the socket
+        // opened here, possibly mid-auth.
+        reconnectJob?.cancel()
+        reconnectJob = null
         cancelRotationLocked()
         // A warming replacement for a socket we are about to replace outright
         // is moot; the connect below supersedes it.
@@ -1395,6 +1492,11 @@ public class WebSocketManager internal constructor(
                 "authenticated" -> { handleAuthenticated(obj); return }
                 "events_subscribed" -> { handleEventsSubscribed(obj); return }
                 "projection_watch_created" -> { handleProjectionWatchCreated(obj); return }
+                "aggregation_watch_created" -> { handleAggregationWatchCreated(obj); return }
+                "aggregation_watch_attached" -> {
+                    obj["requestId"]?.jsonPrimitive?.contentOrNull?.let { id -> lock.withLock { attachRequests.remove(id) } }
+                    return
+                }
                 "error" -> { handleServerError(obj); return }
                 "mids.snapshot" -> {
                     val midsRaw = obj["mids"]?.jsonObject ?: return
@@ -1447,12 +1549,14 @@ public class WebSocketManager internal constructor(
             pathWatchRequests.clear()
             acknowledgedEventTypes.clear(); eventTypeRequests.clear()
             log.info("websocket") { "authenticated" }
-            reconnectAttempt = 0
+            scheduleBackoffResetLocked()
             lastDeliverySeq = 0
+            attachRequests.clear()
             if (obj != null) readServerLifetimeLocked(obj)
             setStatusLocked(ConnectionStatus.CONNECTED)
             startHeartbeatLocked()
             resubscribeAllLocked(webSocket)
+            flushAggregationCreatesLocked(webSocket)
             scheduleRotationLocked()
         }
         // Notify subscribers AFTER all subscriptions are re-issued.
@@ -1480,12 +1584,9 @@ public class WebSocketManager internal constructor(
         chartHistoryWatches.forEach { (watchId, req) ->
             sendMessage(target, watchChartHistoryMsg(watchId, req.target, req.kind, req.objectId))
         }
-        // Re-register REST-created watches. The registry is per-pod, so a
-        // reconnect landing elsewhere answers "unknown watch" — the watch is
-        // genuinely gone there and the stream recreates it.
-        attachedWatches.forEach { watchId ->
-            sendMessage(target, attachAggregationWatchMsg(watchId))
-        }
+        // Re-register REST-created watches. Each attach carries a requestId,
+        // so an "unknown watch" answer drops that watch instead of the socket.
+        attachedWatches.forEach { watchId -> sendAttachLocked(target, watchId) }
         // Projection watch requests parked while disconnected go out now that
         // auth completed; the replies resolve the callers' pending requests.
         if (pendingProjectionSends.isNotEmpty()) {
@@ -1499,22 +1600,25 @@ public class WebSocketManager internal constructor(
     private fun handleServerError(obj: JsonObject) {
         val message = obj["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown WebSocket error"
 
-        // An error carrying a requestId is scoped to that request (e.g. a
-        // watch_projection the caller isn't authorized for): reject only the
-        // matching pending request and leave the connection serving.
+        // An error carrying a requestId is scoped to that request (a
+        // watch_projection the caller isn't authorized for, an attach for a
+        // watch that no longer exists) and leaves the connection serving,
+        // even when the request is one this client no longer tracks.
+        // Dropping the socket for it reconnected straight into the same
+        // error, every second, for as long as the screen stayed open.
         val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull
         if (requestId != null) {
-            val deferred = lock.withLock {
-                pendingProjectionSends.remove(requestId)
-                pendingProjectionRequests.remove(requestId)
-            }
-            if (deferred != null) {
-                log.warning("websocket", metadata = mapOf("message" to message, "requestId" to requestId)) {
-                    "projection watch request rejected"
-                }
-                deferred.completeExceptionally(ArcaException.Unknown("WS_REQUEST_ERROR", message))
-                return
-            }
+            handleRequestError(requestId, message)
+            return
+        }
+
+        // After authentication every error answers one request (a
+        // non-canonical market id, a path outside the credential's scope).
+        // The connection is fine, and a reconnect would replay that request
+        // straight into the same error.
+        if (statusFlow.value == ConnectionStatus.CONNECTED) {
+            log.warning("websocket", metadata = mapOf("message" to message)) { "request rejected" }
+            return
         }
 
         log.error("websocket", metadata = mapOf("message" to message)) { "server error" }
@@ -1523,6 +1627,51 @@ public class WebSocketManager internal constructor(
             webSocket = null
             dropLiveSocketLocked()
         }
+    }
+
+    private fun handleRequestError(requestId: String, message: String) {
+        val meta = mapOf("message" to message, "requestId" to requestId)
+        val projection = lock.withLock {
+            pendingProjectionSends.remove(requestId)
+            pendingProjectionRequests.remove(requestId)
+        }
+        if (projection != null) {
+            log.warning("websocket", metadata = meta) { "projection watch request rejected" }
+            projection.completeExceptionally(ArcaException.Unknown("WS_REQUEST_ERROR", message))
+            return
+        }
+        val create = lock.withLock { aggregationCreateRequests.remove(requestId) }
+        if (create != null) {
+            log.warning("websocket", metadata = meta) { "aggregation watch request rejected" }
+            create.deferred.completeExceptionally(ArcaException.Unknown("WS_REQUEST_ERROR", message))
+            return
+        }
+        val attached = lock.withLock {
+            attachRequests.remove(requestId)?.also { attachedWatches.remove(it); maybeStartIdleTimerLocked() }
+        }
+        if (attached != null) {
+            log.warning("websocket", metadata = meta + ("watchId" to attached)) {
+                "aggregation watch attach rejected; the watch has to be re-created"
+            }
+            return
+        }
+        log.warning("websocket", metadata = meta) { "request rejected" }
+    }
+
+    private fun handleAggregationWatchCreated(obj: JsonObject) {
+        val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull ?: return
+        val request = lock.withLock { aggregationCreateRequests.remove(requestId) } ?: return
+        val watchId = obj["watchId"]?.jsonPrimitive?.contentOrNull
+        val aggregation = obj["aggregation"]?.let { el ->
+            runCatching { arcaJson.decodeFromJsonElement(PathAggregation.serializer(), el) }.getOrNull()
+        }
+        if (watchId.isNullOrEmpty() || aggregation == null) {
+            request.deferred.completeExceptionally(
+                ArcaException.Unknown("WS_REQUEST_ERROR", "create_aggregation_watch: reply carried no watch or aggregation"),
+            )
+            return
+        }
+        request.deferred.complete(CreateWatchResponse(watchId = WatchId(watchId), aggregation = aggregation))
     }
 
     private fun handleProjectionWatchCreated(obj: JsonObject) {
@@ -1591,12 +1740,30 @@ public class WebSocketManager internal constructor(
             "websocket",
             metadata = mapOf("attempt" to reconnectAttempt.toString(), "delaySeconds" to String.format("%.1f", delaySeconds)),
         ) { "scheduling reconnect" }
-        reconnectJob = scope.launch {
+        lateinit var job: Job
+        job = scope.launch {
             delay((delaySeconds * 1000).toLong())
             if (!isActive) return@launch
             lock.withLock {
+                // A direct connect in the meantime superseded this one.
+                if (reconnectJob !== job) return@withLock
                 reconnectJob = null
                 doConnectLocked()
+            }
+        }
+        reconnectJob = job
+    }
+
+    /** Reset the backoff once the live socket has stayed up for [STABLE_CONNECTION_MS]. */
+    private fun scheduleBackoffResetLocked() {
+        stableJob?.cancel()
+        val live = webSocket
+        stableJob = scope.launch {
+            delay(STABLE_CONNECTION_MS)
+            if (!isActive) return@launch
+            lock.withLock {
+                if (live != null && webSocket === live) reconnectAttempt = 0
+                stableJob = null
             }
         }
     }
@@ -1665,6 +1832,7 @@ public class WebSocketManager internal constructor(
         armHandoffTimeoutLocked()
         val ws = openSocketLocked()
         handoffWebSocket = ws
+        handoffAuthenticated = false
         authenticateLocked(ws)
         true
     }
@@ -1679,6 +1847,19 @@ public class WebSocketManager internal constructor(
         when (obj["type"]?.jsonPrimitive?.contentOrNull ?: "") {
             "error" -> {
                 val message = obj["message"]?.jsonPrimitive?.contentOrNull ?: "Unknown WebSocket error"
+                // A rejected resubscribe request (an attach for a watch that
+                // lives on the retiring connection's pod) doesn't make the
+                // replacement unusable.
+                val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull
+                if (requestId != null) {
+                    handleRequestError(requestId, message)
+                    return
+                }
+                // Once authenticated, an error answers one resubscribe request.
+                if (lock.withLock { handoffWebSocket === socket && handoffAuthenticated }) {
+                    log.warning("websocket", metadata = mapOf("message" to message)) { "request rejected" }
+                    return
+                }
                 log.warning("websocket", metadata = mapOf("message" to message)) { "handoff rejected by server" }
                 lock.withLock {
                     abortHandoffLocked()
@@ -1698,6 +1879,7 @@ public class WebSocketManager internal constructor(
     private fun handleWarmingAuthenticated(socket: WebSocket, obj: JsonObject) {
         lock.withLock {
             if (handoffWebSocket !== socket) return
+            handoffAuthenticated = true
             readServerLifetimeLocked(obj)
             resubscribeAllLocked(socket)
             // Queued behind the batch above; its reply is the barrier this
@@ -1747,6 +1929,9 @@ public class WebSocketManager internal constructor(
             if (warmedTypes.isNotEmpty()) acknowledgeEventTypesLocked(warmedTypes)
             if (unwarmedTypes.isNotEmpty()) sendEventTypesLocked(socket, unwarmedTypes)
             eventTypeRequests.keys.retainAll(setOf(socket))
+            // A create still in flight on the retiring socket would answer
+            // there, where nothing listens any more.
+            flushAggregationCreatesLocked(socket)
             // New connection, new sequence space.
             lastDeliverySeq = 0
             lastMessageAtMs = System.currentTimeMillis()
@@ -1921,10 +2106,32 @@ public class WebSocketManager internal constructor(
         put("requestId", requestId)
     }
 
-    private fun attachAggregationWatchMsg(watchId: String): JsonObject = buildJsonObject {
+    private fun attachAggregationWatchMsg(watchId: String, requestId: String): JsonObject = buildJsonObject {
         put("action", "attach_aggregation_watch")
         put("watchId", watchId)
+        put("requestId", requestId)
     }
+
+    // The socket handler reads a `paths` source's paths from an array, where
+    // REST takes the single path in `value`.
+    private fun createAggregationWatchMsg(sources: List<AggregationSource>, flowsSince: String?, requestId: String): JsonObject =
+        buildJsonObject {
+            put("action", "create_aggregation_watch")
+            put("sources", buildJsonArray {
+                sources.forEach { source ->
+                    add(buildJsonObject {
+                        put("type", source.type.wire)
+                        if (source.type == AggregationSourceType.PATHS) {
+                            put("paths", buildJsonArray { add(source.value) })
+                        } else {
+                            put("value", source.value)
+                        }
+                    })
+                }
+            })
+            if (flowsSince != null) put("flowsSince", flowsSince)
+            put("requestId", requestId)
+        }
 
     private fun watchChartHistoryMsg(watchId: String, target: String, kind: String, objectId: String?): JsonObject =
         buildJsonObject {
@@ -2028,6 +2235,15 @@ public class WebSocketManager internal constructor(
 
         // Budget for the server to answer a watch_projection request.
         const val PROJECTION_REQUEST_TIMEOUT_MS = 10_000L
+
+        // Budget for a create_aggregation_watch reply, including any wait for
+        // the socket to authenticate.
+        const val AGGREGATION_REQUEST_TIMEOUT_MS = 10_000L
+
+        // A connection must stay up this long before the reconnect backoff
+        // resets. Resetting at auth let a socket that authenticated and then
+        // failed reconnect every second indefinitely.
+        const val STABLE_CONNECTION_MS = 30_000L
     }
 }
 

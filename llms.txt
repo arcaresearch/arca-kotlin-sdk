@@ -292,6 +292,18 @@ server holds per-connection and so cannot survive the swap; the SDK re-issues
 mids, candles, OI, path watches, and chart-history watches itself, and uses
 this hook internally to re-create standalone aggregation watches.
 
+`watchAggregation` creates its watch on the socket (`create_aggregation_watch`),
+not over REST. The server destroys that watch with the connection, so the SDK
+re-creates it after every reconnect or rotation; the stream keeps its last
+value meanwhile and retries a failed re-create with backoff. Once a connection
+has authenticated, a server error rejects one request (a non-canonical market
+id, a path outside the credential's scope) and never closes the socket; an
+error that names a `requestId` fails only that request. The reconnect backoff
+(1 s doubling to 30 s) resets only after a
+connection has stayed up for 30 s, `ws.ensureConnected()` does not cut a
+pending backoff short, and returning to the foreground reconnects at once
+without resetting the backoff.
+
 `watchCandleChart` self-heals: it refetches recent candles on every WS re-auth
 and app-foreground, and additionally detects seams in the live candle data
 itself — a live candle whose bucket skips past the last held bucket, or a WS

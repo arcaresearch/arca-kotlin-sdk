@@ -8,7 +8,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import network.arca.sdk.internal.arcaJson
 import network.arca.sdk.models.OrderSide
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -297,6 +302,17 @@ private class MaxOrderSizeDispatcher : Dispatcher() {
     val activeAssetDataRequestCount: Int get() = aadCount.get()
 
     override fun dispatch(request: RecordedRequest): MockResponse {
+        if (request.getHeader("Upgrade")?.equals("websocket", true) == true) {
+            return MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val json = arcaJson.parseToJsonElement(text).jsonObject
+                    when (json["action"]?.jsonPrimitive?.content) {
+                        "auth" -> webSocket.send("""{"type":"authenticated"}""")
+                        "watch" -> webSocket.send("""{"type":"watch_snapshot","path":${json["path"]},"requestId":${json["requestId"]}}""")
+                    }
+                }
+            })
+        }
         val path = (request.path ?: "").substringBefore("?")
         return when {
             path.endsWith("/exchange/state") -> json(stateBody())

@@ -1,5 +1,6 @@
 package network.arca.sdk
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlin.coroutines.coroutineContext
@@ -324,52 +325,78 @@ public suspend fun Arca.watchAggregation(
 ): AggregationWatchStream {
     ws.ensureConnected()
 
-    val watchResponse = createAggregationWatch(sources, flowsSince)
+    // Created on the socket rather than over REST: the watch registry is per
+    // pod, so a REST-created watch is silent whenever the REST call and the
+    // socket land on different pods.
+    val watchResponse = ws.createAggregationWatch(sources, flowsSince)
     val stream = AggregationWatchStream(watchResponse.watchId.value)
     val mids = MutableStateFlow<Map<String, String>>(emptyMap())
     val structural = MutableStateFlow(watchResponse.aggregation)
     val widBox = MutableStateFlow(watchResponse.watchId.value)
     val stopped = AtomicBoolean(false)
     val refreshing = AtomicBoolean(false)
+    val recreatePending = AtomicBoolean(false)
+    // Set while the socket the watch lives on is gone and its replacement
+    // has not authenticated yet; that authentication requests the re-create.
+    val socketLost = AtomicBoolean(false)
     val jobs = mutableListOf<Job>()
 
     stream.aggregationMut.value = watchResponse.aggregation
 
-    // The watch lives on the server side of a specific connection, so whenever
-    // that connection is replaced it has to be re-created against the new one.
-    // Returns false when the caller should leave stream state alone.
-    suspend fun recreateWatch(): Boolean {
-        if (stopped.get() || !refreshing.compareAndSet(false, true)) return false
-        try {
-            val oldWatchId = widBox.value
-            val newWatch = createAggregationWatch(sources, flowsSince)
-            if (stopped.get()) return false
-            widBox.value = newWatch.watchId.value
+    // The server destroys the watch with the connection it was created on, so
+    // whenever that connection is replaced the watch is re-created on the new
+    // one. A replacement that lands while a re-create is in flight queues
+    // another, so the watch always ends up on the current socket; a failed
+    // re-create retries with backoff.
+    fun requestRecreate() {
+        if (stopped.get()) return
+        recreatePending.set(true)
+        if (!refreshing.compareAndSet(false, true)) return
+        scope.launch {
+            var failures = 0
             try {
-                destroyAggregationWatch(oldWatchId)
-            } catch (e: Throwable) {
-                log.debug("watch", e, mapOf("watchId" to oldWatchId)) {
-                    "destroyAggregationWatch cleanup failed (best-effort)"
+                while (!stopped.get() && recreatePending.getAndSet(false)) {
+                    try {
+                        val oldWatchId = widBox.value
+                        val newWatch = ws.createAggregationWatch(sources, flowsSince)
+                        if (stopped.get()) {
+                            ws.destroyAggregationWatch(newWatch.watchId.value)
+                            return@launch
+                        }
+                        widBox.value = newWatch.watchId.value
+                        ws.destroyAggregationWatch(oldWatchId)
+                        structural.value = newWatch.aggregation
+                        val cur = mids.value
+                        stream.push(if (cur.isEmpty()) newWatch.aggregation else newWatch.aggregation.revalued(cur))
+                        if (!socketLost.get()) stream.setState(WatchStreamState.CONNECTED)
+                        failures = 0
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        failures += 1
+                        log.warning("watch", e, mapOf("attempt" to failures.toString())) {
+                            "aggregation watch re-create failed; retrying"
+                        }
+                        delay(minOf(1_000L shl minOf(failures - 1, 5), 30_000L))
+                        recreatePending.set(true)
+                    }
                 }
+            } finally {
+                refreshing.set(false)
             }
-            structural.value = newWatch.aggregation
-            val cur = mids.value
-            stream.push(if (cur.isEmpty()) newWatch.aggregation else newWatch.aggregation.revalued(cur))
-        } catch (_: Throwable) {
-            // Best effort — keep existing data
-        } finally {
-            refreshing.set(false)
+            // A request that landed after the loop's last check found it still running.
+            if (recreatePending.get()) requestRecreate()
         }
-        return true
     }
 
     jobs += scope.launch {
         ws.statusStream.collect { s ->
-            if (s == ConnectionStatus.DISCONNECTED && stream.state.value != WatchStreamState.LOADING) {
-                stream.setState(WatchStreamState.RECONNECTING)
-            } else if (s == ConnectionStatus.CONNECTED && stream.state.value == WatchStreamState.RECONNECTING) {
-                if (!recreateWatch()) return@collect
-                stream.setState(WatchStreamState.CONNECTED)
+            when (s) {
+                ConnectionStatus.DISCONNECTED, ConnectionStatus.CONNECTING -> {
+                    socketLost.set(true)
+                    if (stream.state.value != WatchStreamState.LOADING) stream.setState(WatchStreamState.RECONNECTING)
+                }
+                ConnectionStatus.CONNECTED -> if (socketLost.getAndSet(false)) requestRecreate()
             }
         }
     }
@@ -379,7 +406,7 @@ public suspend fun Arca.watchAggregation(
     // connection that retired, so without this the stream goes permanently quiet
     // with no error. State stays CONNECTED: nothing was missed.
     jobs += scope.launch {
-        ws.rotatedStream.collect { recreateWatch() }
+        ws.rotatedStream.collect { requestRecreate() }
     }
 
     ws.acquireMids(exchange)
@@ -408,15 +435,7 @@ public suspend fun Arca.watchAggregation(
         stopped.set(true)
         jobs.forEach { it.cancel() }
         ws.releaseMids()
-        scope.launch {
-            try {
-                destroyAggregationWatch(widBox.value)
-            } catch (e: Throwable) {
-                log.debug("watch", e, mapOf("watchId" to widBox.value)) {
-                    "destroyAggregationWatch cleanup failed (best-effort)"
-                }
-            }
-        }
+        ws.destroyAggregationWatch(widBox.value)
     }
     return stream
 }

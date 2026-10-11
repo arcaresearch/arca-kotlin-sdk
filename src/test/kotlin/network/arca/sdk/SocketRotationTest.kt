@@ -14,10 +14,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import okhttp3.mockwebserver.Dispatcher
-import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
-import okhttp3.mockwebserver.RecordedRequest
 import okio.ByteString
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -356,14 +353,8 @@ class SocketRotationTest {
 
     @Test
     fun reCreatesTheAggregationWatchOnRotationWithoutReconnectingState() = runBlocking {
-        val dispatcher = AggregationDispatcher()
-        val server = MockWebServer()
-        server.dispatcher = dispatcher
-        server.start()
-        servers.add(server)
-
         val factory = FakeSocketFactory()
-        val baseUrl = server.url("/").toString().trimEnd('/')
+        val baseUrl = "http://localhost:3052"
         val http = OkHttpClient()
         val ws = WebSocketManager(
             baseUrl = baseUrl,
@@ -386,10 +377,13 @@ class SocketRotationTest {
             httpClient = http,
         )
 
-        val stream = arca.watchAggregation(listOf(AggregationSource(AggregationSourceType.PREFIX, "/users")))
+        val pending = async { arca.watchAggregation(listOf(AggregationSource(AggregationSourceType.PREFIX, "/users"))) }
+        delay(50)
         factory[0].deliver(AUTHENTICATED)
-        delay(80)
-        assertEquals(1, dispatcher.createCount, "initial watch not created")
+        delay(50)
+        assertEquals(1, factory[0].actions().count { it == "create_aggregation_watch" }, "initial watch not created")
+        factory[0].deliver(aggregationWatchCreated(factory[0], "wch_1"))
+        val stream = kotlinx.coroutines.withTimeout(5_000) { pending.await() }
 
         val states = Collections.synchronizedList(mutableListOf<WatchStreamState>())
         val stateJob = launch { stream.state.collect { states.add(it) } }
@@ -403,7 +397,13 @@ class SocketRotationTest {
 
         // The watch is server state on the connection that just retired; without
         // a re-create the stream would go permanently quiet with no error.
-        assertEquals(2, dispatcher.createCount, "aggregation watch not re-created on rotation")
+        assertEquals(
+            1,
+            factory[1].actions().count { it == "create_aggregation_watch" },
+            "aggregation watch not re-created on the replacement socket",
+        )
+        factory[1].deliver(aggregationWatchCreated(factory[1], "wch_2"))
+        delay(50)
         assertFalse(
             states.contains(WatchStreamState.RECONNECTING),
             "a gapless swap must not surface as a reconnect: $states",
@@ -488,6 +488,14 @@ class SocketRotationTest {
 
         fun sequencedEvent(seq: Int): String =
             """{"type":"balance.updated","entityId":"bal_1","deliverySeq":$seq}"""
+
+        /** The server's reply to the last create_aggregation_watch sent on [socket]. */
+        fun aggregationWatchCreated(socket: FakeWebSocket, watchId: String): String {
+            val requestId = socket.sent.map { network.arca.sdk.internal.arcaJson.parseToJsonElement(it).jsonObject }
+                .last { it["action"]?.jsonPrimitive?.content == "create_aggregation_watch" }["requestId"]!!.jsonPrimitive.content
+            return """{"type":"aggregation_watch_created","requestId":"$requestId","watchId":"$watchId",""" +
+                """"aggregation":{"prefix":"/users","totalEquityUsd":"1000","departingUsd":"0","breakdown":[]}}"""
+        }
     }
 }
 
@@ -551,29 +559,4 @@ internal class FakeSocketFactory : WebSocket.Factory {
 
     override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket =
         FakeWebSocket(request, listener).also { created.add(it) }
-}
-
-private class AggregationDispatcher : Dispatcher() {
-    private val creates = AtomicInteger(0)
-    val createCount: Int get() = creates.get()
-
-    override fun dispatch(request: RecordedRequest): MockResponse {
-        val path = (request.path ?: "").substringBefore("?")
-        return when {
-            path.endsWith("/aggregations/watch") && request.method == "POST" -> {
-                val n = creates.incrementAndGet()
-                json("""{"success":true,"data":{"watchId":"wch_$n","aggregation":$AGGREGATION}}""")
-            }
-            path.contains("/aggregations/watch/") -> json("""{"success":true,"data":{}}""")
-            else -> MockResponse().setResponseCode(404)
-        }
-    }
-
-    private fun json(body: String): MockResponse =
-        MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(body)
-
-    private companion object {
-        const val AGGREGATION =
-            """{"prefix":"/users","totalEquityUsd":"1000","departingUsd":"0","breakdown":[]}"""
-    }
 }
