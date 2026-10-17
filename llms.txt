@@ -96,7 +96,7 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Market meta | arca.getMarketMeta() / market(id) / resolveMarkets(symbol, opts) |
 | Mids/tickers/book | arca.getMarketMids / getMarketTickers / getOrderBook |
 | Projection registry | arca.upsertProjection(name, fields, resources) / getProjection / listProjections / deleteProjection — requires arca:ManageProjection; fields from the bounded catalog equity/realizedValue/unrealizedValue/positions; resources are path patterns ("/users/*") |
-| Projection batched read | arca.getProjectionValuations(name, prefix?, path?, cursor?, limit?) -> ProjectionValuationsPage (keyset-paginated ProjectedValuation rows; only registered fields + identity are ever present) — requires arca:ReadProjection on the projection NAME |
+| Projection batched read | arca.getProjectionValuations(name, prefix?, path?, paths?, cursor?, limit?) -> ProjectionValuationsPage (keyset-paginated ProjectedValuation rows; only registered fields + identity are ever present) — requires arca:ReadProjection on the projection NAME |
 | Candles | arca.getCandles(market, interval, options) |
 | OI history | arca.getOIHistory(market, interval, options) -> OHLC open interest + 24h ntlVlm + mark; intervals 1m/5m/1h/1d |
 | Funding history | arca.getFundingHistory(market, startTime?, endTime?) -> SETTLED funding observations {t, fundingRate, premium?, s?}; no interval (event series); default 7d, max 30d; HIP-3 supported; not predicted (use ticker funding/nextFundingTime) |
@@ -141,7 +141,7 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 
 | Method | Snapshot / updates |
 |---|---|
-| arca.watchPrices() | StateFlow<Map<String,String>> prices |
+| arca.watchPrices(markets = listOf(...)) | StateFlow<Map<String,String>> prices — the market list is the stream's interest on BOTH providers (the Arca socket's `subscribe_mids` carries the union of live interests and is re-sent when it changes); `setMarkets` changes it in place; `watchPrices()` with no markets is the one way to ask for every market |
 | arca.watchObject(path) | StateFlow<ObjectValuation?> valuation |
 | arca.watchObjects(paths) | StateFlow<Map<String,ObjectValuation>> valuations |
 | arca.watchOperations(path) | Flow<Pair<Operation, RealmEvent>> |
@@ -154,7 +154,7 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchCandleChart(market, interval, ...) | StateFlow<List<Candle>> + CandleChartUpdate |
 | arca.watchOI(coins, intervals) | Flow<OIEvent> (market, interval, bar, isClosed) |
 | arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> + StateFlow<MaxOrderSizePendingReason?> pendingReason |
-| arca.watchProjection(name) | StateFlow<Map<String,ProjectedValuation>> valuations keyed by path — one batched watch over every object the projection covers. Loads the full initial snapshot (watch reply + REST pages), merges per-account DELTA frames (only changed rows arrive; a `removed` list drops deleted paths), re-marks rows client-side on every mids tick, and re-creates the server-side watch on reconnect/rotation. Requires arca:ReadProjection. |
+| arca.watchProjection(name, paths = listOf(...), prefix = null) | StateFlow<Map<String,ProjectedValuation>> valuations keyed by path — one batched watch over the accounts named (`paths`, max 500, and/or a `prefix` sub-tree; both only narrow the registration). `setPaths(paths)` / `setPrefix(prefix)` replace the scope in place under the same watch id (ack carries the new scope's snapshot, which replaces the rows); `scope` is the current interest set. No paths and no prefix is an EMPTY watch (delivers nothing until setPaths) — never every covered account. Loads the scope's snapshot (watch reply + REST pages for a prefix), merges per-account DELTA frames (only changed rows arrive; a `removed` list drops deleted paths), re-marks rows client-side on every mids tick (subscribing to mids only for the markets its rows hold), and re-creates the server-side watch with the current scope on reconnect/rotation. Requires arca:ReadProjection. |
 
 Buying power is TWO numbers on a venue with a cross-dex reservation (the live
 `hl` venue), not one. The venue-native dex (`hl:0:*`) keeps
@@ -450,8 +450,22 @@ precision is preserved; round only for presentation. The adapter reads exact
 metadata, non-Hyperliquid markets, excess interests and 15-second candles stay
 on Arca. `watchPrices()` without a market list does not subscribe the entire
 venue directly. Pass the visible markets and replace them with `setMarkets` as
-visibility changes. Exchange-state watches add their held markets automatically;
-max-order-size watches add their selected market. Always stop unused watches.
+visibility changes. Exchange-state, object, aggregation and projection watches
+add their held markets automatically; max-order-size watches add their selected
+market. Always stop unused watches.
+
+The same interest set drives the Arca socket (2.13.0): `subscribe_mids` carries
+the union of every live consumer's markets, is re-sent when the union changes
+(widening at once, narrowing after the release debounce), and is replayed on
+reconnect. Only an unscoped `watchPrices()` subscribes to every market. Under
+the hood `acquireMids(exchange, allMarkets = false)` / `releaseMids(allMarkets
+= false)` are the refcounts a consumer that drives the manager directly uses;
+a bare `subscribeMids` / `unsubscribeMids` pair is left alone by the refcounts.
+Measured from 2026-10-17 02:32 UTC on production (payload bytes, 5 min): one
+market 0.02 KiB/s, a 22-market board 1.1 KiB/s (7.8 frames/s), every market
+(567 ids) 6.2 KiB/s, versus Hyperliquid `bbo` on the same 22 markets 7.8 KiB/s
+(57 frames/s) and `allMids` 4.8 KiB/s; `marketDataDiagnostics` reports the same
+per client.
 
 One public socket per SDK instance has at most 64 subscriptions (price interests
 first, then candles; each group sorted by canonical ID). It uses a separate

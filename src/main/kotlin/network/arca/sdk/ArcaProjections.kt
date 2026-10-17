@@ -4,6 +4,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import network.arca.sdk.internal.arcaJson
@@ -13,6 +15,7 @@ import network.arca.sdk.models.ProjectionValuationsPage
 import network.arca.sdk.models.RealmProjection
 import network.arca.sdk.models.revalued
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 // MARK: - Projection registry (CRUD)
 
@@ -98,48 +101,77 @@ public suspend fun Arca.getProjectionValuations(
 // MARK: - watchProjection
 
 /**
- * Subscribe to a registered projection: a single batched watch covering every
- * object the projection's resources match, delivering per-object REDACTED
- * valuation deltas keyed by path. Between server deltas, rows re-mark
- * client-side against the mids feed — so a leaderboard ticks with the market
- * without any extra server traffic.
+ * Subscribe to a registered projection for a chosen set of accounts: one
+ * batched watch delivering per-object REDACTED valuation deltas keyed by
+ * path, for the [paths] (max 500) and/or [prefix] you name. Between server
+ * deltas, rows re-mark client-side against the mids feed — and the stream
+ * subscribes to mids only for the markets its rows hold positions in — so a
+ * leaderboard ticks with the market at the cost of its own rows, not the
+ * realm's.
  *
- * The initial snapshot is paginated: the watch reply carries the first page
- * and this method fetches the remaining pages over REST before the stream
- * connects, so [ProjectionWatchStream.valuations] starts complete.
+ * The scope only narrows the projection's registered resources: a path
+ * outside them is dropped, a prefix is intersected with them. No scope at
+ * all is an EMPTY watch that delivers nothing until
+ * [ProjectionWatchStream.setPaths] names one; it never means every covered
+ * account. Change the roster with `setPaths` / `setPrefix` without
+ * re-subscribing.
+ *
+ * A path set comes back whole in the watch reply. A prefix scope is
+ * paginated: the reply carries the first page and this method fetches the
+ * rest over REST before the stream connects, so
+ * [ProjectionWatchStream.valuations] starts complete.
  *
  * Server frames are deltas: only changed rows arrive, and deleted objects are
  * named in a `removed` list. The stream merges both into its map — consumers
  * always see the full current picture. The server-side watch dies with its
- * connection; re-creation on reconnect and rotation is automatic. Call
- * [ProjectionWatchStream.stop] when done.
+ * connection; re-creation on reconnect and rotation, with the current scope,
+ * is automatic. Call [ProjectionWatchStream.stop] when done.
  */
-public suspend fun Arca.watchProjection(name: String, exchange: String = "sim"): ProjectionWatchStream {
+public suspend fun Arca.watchProjection(
+    name: String,
+    paths: List<String> = emptyList(),
+    prefix: String? = null,
+    exchange: String = "sim",
+): ProjectionWatchStream {
     ws.ensureConnected()
+    val initialScope = ProjectionWatchScope(paths, prefix)
 
-    suspend fun fetchAllValuations(created: ProjectionWatchCreated): List<ProjectedValuation> {
-        val all = created.valuations.toMutableList()
-        var next = created.cursor
+    suspend fun fetchAllValuations(reply: ProjectionWatchCreated, scope: ProjectionWatchScope): List<ProjectedValuation> {
+        val all = reply.valuations.toMutableList()
+        var next = reply.cursor
         while (next != null) {
-            val page = getProjectionValuations(name, cursor = next)
+            val page = getProjectionValuations(name, prefix = scope.prefix?.takeIf { it.isNotEmpty() }, cursor = next)
             all += page.valuations
             next = page.cursor
         }
         return all
     }
 
-    val created = ws.createProjectionWatch(name)
-    val initial = fetchAllValuations(created).associateBy { it.path }
+    val created = ws.createProjectionWatch(name, initialScope)
+    val initial = fetchAllValuations(created, initialScope).associateBy { it.path }
 
     val stream = ProjectionWatchStream(name, created.fields)
     val structural = MutableStateFlow(initial)
     val mids = MutableStateFlow<Map<String, String>>(emptyMap())
     val widBox = MutableStateFlow(created.watchId)
+    val scopeBox = MutableStateFlow(initialScope)
     val stopped = AtomicBoolean(false)
     val refreshing = AtomicBoolean(false)
     val jobs = mutableListOf<Job>()
 
     stream.watchIdMut.value = created.watchId
+    stream.scopeMut.value = initialScope
+
+    // The stream's mids interest is the union of its rows' position
+    // markets: the manager subscribes the Arca socket to that union (and
+    // the direct provider, when preferred), never to every market.
+    val priceInterest = ws.registerPriceMarkets()
+    val interestRevision = AtomicLong(0)
+    fun syncInterest() {
+        val markets = structural.value.values.flatMap { v -> v.positions.orEmpty().map { it.market } }.toSet()
+        ws.updatePriceMarkets(priceInterest, markets, interestRevision.incrementAndGet())
+    }
+    syncInterest()
 
     fun emit() {
         val cur = mids.value
@@ -148,14 +180,16 @@ public suspend fun Arca.watchProjection(name: String, exchange: String = "sim"):
     }
 
     // The watch lives on the server side of a specific connection, so whenever
-    // that connection is replaced it has to be re-created against the new one.
-    // Returns false when the caller should leave stream state alone.
+    // that connection is replaced it has to be re-created against the new one,
+    // with the CURRENT scope. Returns false when the caller should leave
+    // stream state alone.
     suspend fun recreateWatch(): Boolean {
         if (stopped.get() || !refreshing.compareAndSet(false, true)) return false
         try {
             val oldWatchId = widBox.value
-            val newWatch = ws.createProjectionWatch(name)
-            val vals = fetchAllValuations(newWatch)
+            val scope = scopeBox.value
+            val newWatch = ws.createProjectionWatch(name, scope)
+            val vals = fetchAllValuations(newWatch, scope)
             if (stopped.get()) {
                 ws.destroyProjectionWatch(newWatch.watchId)
                 return false
@@ -164,6 +198,7 @@ public suspend fun Arca.watchProjection(name: String, exchange: String = "sim"):
             stream.watchIdMut.value = newWatch.watchId
             ws.destroyProjectionWatch(oldWatchId)
             structural.value = vals.associateBy { it.path }
+            syncInterest()
             emit()
         } catch (e: Throwable) {
             log.warning("watch", e, mapOf("projection" to name)) {
@@ -193,7 +228,7 @@ public suspend fun Arca.watchProjection(name: String, exchange: String = "sim"):
         ws.rotatedStream.collect { recreateWatch() }
     }
 
-    ws.acquireMids(exchange)
+    ws.acquireMids(exchange, allMarkets = false)
 
     jobs += scope.launch {
         ws.projectionValuationEvents().collect { evt ->
@@ -205,6 +240,7 @@ public suspend fun Arca.watchProjection(name: String, exchange: String = "sim"):
                 next
             }
             stream.setState(WatchStreamState.CONNECTED)
+            syncInterest()
             emit()
         }
     }
@@ -216,13 +252,33 @@ public suspend fun Arca.watchProjection(name: String, exchange: String = "sim"):
         }
     }
 
+    // Scope changes are serialized so a later setPaths always wins; the
+    // reply is the full snapshot of the new scope and replaces the rows.
+    val scopeMutex = Mutex()
+    stream.updateScopeAction = { newScope ->
+        scopeMutex.withLock {
+            if (!stopped.get()) {
+                scopeBox.value = newScope
+                stream.scopeMut.value = newScope
+                val reply = ws.updateProjectionWatch(widBox.value, newScope)
+                val vals = fetchAllValuations(reply, newScope)
+                if (!stopped.get() && scopeBox.value == newScope) {
+                    structural.value = vals.associateBy { it.path }
+                    syncInterest()
+                    emit()
+                }
+            }
+        }
+    }
+
     emit()
     stream.setState(WatchStreamState.CONNECTED)
 
     stream.stopAction = {
         stopped.set(true)
         jobs.forEach { it.cancel() }
-        ws.releaseMids()
+        ws.releasePriceMarkets(priceInterest)
+        ws.releaseMids(allMarkets = false)
         ws.destroyProjectionWatch(widBox.value)
     }
     return stream

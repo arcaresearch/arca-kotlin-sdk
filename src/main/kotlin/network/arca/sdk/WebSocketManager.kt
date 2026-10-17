@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -135,6 +136,10 @@ public class WebSocketManager internal constructor(
 
     private val pathRefs = HashMap<String, Int>()
     private var midsRefs = 0
+    // Consumers holding an all-markets interest (acquireMids(allMarkets =
+    // true)). While non-zero the Arca socket subscribes to every market;
+    // otherwise it subscribes to the union of declared price interests.
+    private var midsAllRefs = 0
     private var midsExchange = "sim"
 
     // Latest merged mid prices, held while the mids subscription is live.
@@ -222,8 +227,13 @@ public class WebSocketManager internal constructor(
     internal fun updatePriceMarkets(owner: String, markets: Set<String>, revision: Long = 0) = lock.withLock {
         marketDataRouter.update(owner, markets, revision); syncPublicSourceLocked()
     }
+    /**
+     * Dropping an owner can only narrow the Arca subscription, so the socket
+     * side waits out the release debounce like [releaseMids] does; the direct
+     * provider diffs its own subscriptions at once.
+     */
     internal fun releasePriceMarkets(owner: String) = lock.withLock {
-        marketDataRouter.release(owner); syncPublicSourceLocked()
+        marketDataRouter.release(owner); syncPublicSourceLocked(arca = false); scheduleMidsNarrowingLocked()
     }
     private fun stopPublicSourceLocked() {
         clearPublicPrices(); lastPublicFlushNs = 0
@@ -233,7 +243,14 @@ public class WebSocketManager internal constructor(
         marketDataRecorder.suspend()
         publishMarketDiagnostics(true)
     }
-    private fun syncPublicSourceLocked() {
+    /**
+     * Pushes the current interest set to both providers: the direct
+     * Hyperliquid source (per-coin subscriptions) and, unless `arca` is
+     * false, the Arca socket (`subscribe_mids` with the union of declared
+     * markets). Every interest change passes through here.
+     */
+    private fun syncPublicSourceLocked(arca: Boolean = true) {
+        if (arca) syncArcaMidsLocked()
         marketDataRecorder.retain(marketDataRouter.priceInterestMarkets)
         val subscriptions = marketDataRouter.subscriptions
         pendingPublicPrices.keys.retainAll(subscriptions.filter { it.interval == null }.map { it.market }.toSet())
@@ -308,7 +325,7 @@ public class WebSocketManager internal constructor(
     // requestId; a request issued while disconnected parks in
     // [pendingProjectionSends] until the next successful auth flushes it.
     private val pendingProjectionRequests = HashMap<String, CompletableDeferred<ProjectionWatchCreated>>()
-    private val pendingProjectionSends = HashMap<String, String>()
+    private val pendingProjectionSends = HashMap<String, JsonObject>()
     private var nextProjectionRequestId = 0
 
     private val unsubJobs = HashMap<String, Job>()
@@ -707,35 +724,55 @@ public class WebSocketManager internal constructor(
         }
     }
 
-    public fun acquireMids(exchange: String) {
+    /**
+     * Acquire interest in mid price updates.
+     *
+     * The Arca socket subscribes only to the markets its consumers have
+     * declared through [registerPriceMarkets] / [updatePriceMarkets] — the
+     * same interest set the direct Hyperliquid provider already subscribes
+     * per coin — so a phone pays for the markets on its screen, not for
+     * every market on the venue. `allMarkets = true` (the pre-existing
+     * meaning of a bare `acquireMids`) is for a consumer that cannot name
+     * its markets and genuinely wants every mid; while any such consumer is
+     * live the socket subscribes to everything. Consumers that know their
+     * markets (a price watch with a market list, an account watch with
+     * positions, a projection watch with rows) pass `false` and keep their
+     * interest owner current.
+     */
+    public fun acquireMids(exchange: String, allMarkets: Boolean = true) {
         lock.withLock {
-            publicSuspended = hiddenAtMs != null; syncPublicSourceLocked()
+            publicSuspended = hiddenAtMs != null
             cancelIdleTimerLocked()
             midsExchange = exchange
             midsRefs += 1
-            if (midsRefs == 1) {
-                val pending = unsubJobs.remove("mids")
-                if (pending != null) {
-                    pending.cancel()
-                } else {
-                    ensureConnectedLocked()
-                    subscribedMids = exchange to emptyList()
-                    sendMessage(authlessSubscribeMids(exchange, emptyList()))
-                }
-            }
+            if (allMarkets) midsAllRefs += 1
+            unsubJobs.remove("mids")?.cancel()
+            ensureConnectedLocked()
+            syncPublicSourceLocked()
         }
     }
 
-    public fun releaseMids() {
+    /** Release interest in mid price updates. `allMarkets` must match the value passed to [acquireMids]. */
+    public fun releaseMids(allMarkets: Boolean = true) {
         lock.withLock {
             midsRefs = maxOf(0, midsRefs - 1)
-            if (midsRefs == 0) {
-                unsubJobs["mids"] = scope.launch {
-                    delay(UNSUB_DEBOUNCE_MS)
-                    if (!isActive) return@launch
-                    finishMidsRelease()
-                }
-            }
+            if (allMarkets) midsAllRefs = maxOf(0, midsAllRefs - 1)
+            scheduleMidsNarrowingLocked()
+        }
+    }
+
+    /**
+     * Narrowing (or dropping) the Arca mids subscription is debounced so a
+     * screen that releases and re-acquires within a frame does not churn a
+     * subscribe/unsubscribe pair and its snapshot. Widening is never
+     * debounced: a consumer that just declared a market needs its price.
+     */
+    private fun scheduleMidsNarrowingLocked() {
+        unsubJobs.remove("mids")?.cancel()
+        unsubJobs["mids"] = scope.launch {
+            delay(UNSUB_DEBOUNCE_MS)
+            if (!isActive) return@launch
+            finishMidsRelease()
         }
     }
 
@@ -743,11 +780,57 @@ public class WebSocketManager internal constructor(
         lock.withLock {
             unsubJobs.remove("mids")
             if (midsRefs == 0) {
+                if (subscribedMids != null) {
+                    subscribedMids = null
+                    retainedMids = null
+                    sendMessage(buildJsonObject { put("action", "unsubscribe_mids") })
+                }
+            } else {
+                syncArcaMidsLocked()
+            }
+            maybeStartIdleTimerLocked()
+        }
+    }
+
+    /**
+     * The coin set the Arca socket should hold right now: null when no
+     * consumer needs mids (or none has declared a market yet), an empty
+     * list for every market while an all-markets consumer is live,
+     * otherwise the sorted union of declared interests.
+     */
+    private fun desiredArcaMidsLocked(): List<String>? {
+        if (midsRefs <= 0) return null
+        if (midsAllRefs > 0) return emptyList()
+        val markets = marketDataRouter.priceInterestMarkets
+        if (markets.isEmpty()) return null
+        return markets.sorted()
+    }
+
+    /**
+     * Reconciles the Arca mids subscription with the desired coin set,
+     * sending `subscribe_mids` only when the set actually changed. The
+     * server treats a repeated `subscribe_mids` as a replacement and
+     * answers it with a snapshot of the new set, which seeds any market
+     * that was just added. A subscription made directly through
+     * [subscribeMids] (no consumer refs) is left alone: [unsubscribeMids]
+     * is its counterpart.
+     */
+    private fun syncArcaMidsLocked() {
+        if (midsRefs <= 0) return
+        val desired = desiredArcaMidsLocked()
+        val current = subscribedMids
+        when {
+            desired == null && current == null -> return
+            desired == null -> {
                 subscribedMids = null
                 retainedMids = null
                 sendMessage(buildJsonObject { put("action", "unsubscribe_mids") })
             }
-            maybeStartIdleTimerLocked()
+            current != null && current.first == midsExchange && current.second == desired -> return
+            else -> {
+                subscribedMids = midsExchange to desired
+                sendMessage(authlessSubscribeMids(midsExchange, desired))
+            }
         }
     }
 
@@ -854,23 +937,37 @@ public class WebSocketManager internal constructor(
     // MARK: - Projection watches
 
     /**
-     * Create a server-side projection watch and suspend until the server
-     * replies with the initial snapshot. The watch is connection-scoped: it
-     * dies with the socket and callers must re-create it on reconnect or
-     * rotation (see [rotatedStream]).
+     * Create a server-side projection watch for the accounts in [scope] and
+     * suspend until the server replies with the snapshot of that scope. The
+     * scope only narrows the projection's registration; an empty scope is
+     * an empty watch. The watch is connection-scoped: it dies with the
+     * socket and callers must re-create it on reconnect or rotation (see
+     * [rotatedStream]).
      */
-    public suspend fun createProjectionWatch(projection: String): ProjectionWatchCreated {
+    public suspend fun createProjectionWatch(projection: String, scope: ProjectionWatchScope = ProjectionWatchScope()): ProjectionWatchCreated =
+        projectionRequest("watch_projection '$projection'") { id -> watchProjectionMsg(projection, scope, id) }
+
+    /**
+     * Replace a live projection watch's interest set in place and suspend
+     * until the server replies with the snapshot of the NEW scope. The
+     * watch keeps its ID; the caller swaps the rows wholesale.
+     */
+    public suspend fun updateProjectionWatch(watchId: String, scope: ProjectionWatchScope): ProjectionWatchCreated =
+        projectionRequest("update_projection_watch '$watchId'") { id -> updateProjectionWatchMsg(watchId, scope, id) }
+
+    private suspend fun projectionRequest(label: String, build: (String) -> JsonObject): ProjectionWatchCreated {
         val deferred = CompletableDeferred<ProjectionWatchCreated>()
         val requestId = lock.withLock {
             cancelIdleTimerLocked()
             ensureConnectedLocked()
             nextProjectionRequestId += 1
             val id = "proj-req-$nextProjectionRequestId"
+            val message = build(id)
             pendingProjectionRequests[id] = deferred
             if (statusFlow.value == ConnectionStatus.CONNECTED) {
-                sendMessage(watchProjectionMsg(projection, id))
+                sendMessage(message)
             } else {
-                pendingProjectionSends[id] = projection
+                pendingProjectionSends[id] = message
             }
             id
         }
@@ -883,7 +980,7 @@ public class WebSocketManager internal constructor(
             }
             throw ArcaException.Unknown(
                 "WS_REQUEST_TIMEOUT",
-                "watch_projection '$projection': timed out waiting for the server reply",
+                "$label: timed out waiting for the server reply",
             )
         }
     }
@@ -1491,7 +1588,7 @@ public class WebSocketManager internal constructor(
                 }
                 "authenticated" -> { handleAuthenticated(obj); return }
                 "events_subscribed" -> { handleEventsSubscribed(obj); return }
-                "projection_watch_created" -> { handleProjectionWatchCreated(obj); return }
+                "projection_watch_created", "projection_watch_updated" -> { handleProjectionWatchCreated(obj); return }
                 "aggregation_watch_created" -> { handleAggregationWatchCreated(obj); return }
                 "aggregation_watch_attached" -> {
                     obj["requestId"]?.jsonPrimitive?.contentOrNull?.let { id -> lock.withLock { attachRequests.remove(id) } }
@@ -1565,12 +1662,18 @@ public class WebSocketManager internal constructor(
     }
 
     private fun resubscribeAllLocked(target: WebSocket?) {
-        subscribedMids?.let { sendMessage(target, authlessSubscribeMids(it.first, it.second)) }
+        // The mids subscription is re-derived from the live consumers'
+        // interests rather than replayed from the last set sent, so a
+        // socket that comes up mid-change subscribes to what is wanted now.
+        val desiredMids = desiredArcaMidsLocked()
+        if (desiredMids != null) {
+            subscribedMids = midsExchange to desiredMids
+            sendMessage(target, authlessSubscribeMids(midsExchange, desiredMids))
+        } else {
+            subscribedMids?.let { sendMessage(target, authlessSubscribeMids(it.first, it.second)) }
+        }
         subscribedCandles?.let { sendMessage(target, subscribeCandlesMsg(it.first, it.second.map { iv -> iv.wire })) }
         subscribedOI?.let { sendMessage(target, subscribeOIMsg(it.first, it.second.map { iv -> iv.wire })) }
-        if (midsRefs > 0 && subscribedMids == null) {
-            sendMessage(target, authlessSubscribeMids(midsExchange, emptyList()))
-        }
         if (candleRefCoins.isNotEmpty() && subscribedCandles == null) {
             syncCandleSubscriptionLocked(target)
         }
@@ -1590,9 +1693,7 @@ public class WebSocketManager internal constructor(
         // Projection watch requests parked while disconnected go out now that
         // auth completed; the replies resolve the callers' pending requests.
         if (pendingProjectionSends.isNotEmpty()) {
-            pendingProjectionSends.forEach { (requestId, projection) ->
-                sendMessage(target, watchProjectionMsg(projection, requestId))
-            }
+            pendingProjectionSends.values.forEach { message -> sendMessage(target, message) }
             pendingProjectionSends.clear()
         }
     }
@@ -2100,10 +2201,24 @@ public class WebSocketManager internal constructor(
         put("intervals", buildJsonArray { intervals.forEach { add(it) } })
     }
 
-    private fun watchProjectionMsg(projection: String, requestId: String): JsonObject = buildJsonObject {
+    private fun watchProjectionMsg(projection: String, scope: ProjectionWatchScope, requestId: String): JsonObject = buildJsonObject {
         put("action", "watch_projection")
         put("projection", projection)
+        putProjectionScope(scope)
         put("requestId", requestId)
+    }
+
+    private fun updateProjectionWatchMsg(watchId: String, scope: ProjectionWatchScope, requestId: String): JsonObject = buildJsonObject {
+        put("action", "update_projection_watch")
+        put("watchId", watchId)
+        putProjectionScope(scope)
+        put("requestId", requestId)
+    }
+
+    /** Scope fields only when present: an empty scope goes over the wire as exactly that. */
+    private fun JsonObjectBuilder.putProjectionScope(scope: ProjectionWatchScope) {
+        if (scope.paths.isNotEmpty()) put("paths", buildJsonArray { scope.paths.forEach { add(it) } })
+        if (!scope.prefix.isNullOrEmpty()) put("prefix", scope.prefix)
     }
 
     private fun attachAggregationWatchMsg(watchId: String, requestId: String): JsonObject = buildJsonObject {
@@ -2247,7 +2362,28 @@ public class WebSocketManager internal constructor(
     }
 }
 
-/** The server's reply to a `watch_projection` request. */
+/**
+ * The interest set of a projection watch: which of the accounts a projection
+ * covers this subscriber wants deltas for. It only ever narrows the
+ * projection's registered resources — a path outside them is dropped, a
+ * prefix is intersected with them, and the two compose as AND. An empty
+ * scope (neither field) is a watch that delivers nothing until
+ * [ProjectionWatchStream.setPaths] names one; it is never "everyone".
+ */
+public data class ProjectionWatchScope(
+    /** Exact object paths to watch (max 500) — a leaderboard roster, a set of followed traders. */
+    public val paths: List<String> = emptyList(),
+    /**
+     * A sub-tree of the projection to watch (`"/users/alice"`). Pass the
+     * projection's own prefix to opt into the whole covered set explicitly;
+     * on a realm-wide projection that is the shape to avoid on a device.
+     */
+    public val prefix: String? = null,
+) {
+    public val isEmpty: Boolean get() = paths.isEmpty() && prefix.isNullOrEmpty()
+}
+
+/** The server's reply to a `watch_projection` or `update_projection_watch` request. */
 public data class ProjectionWatchCreated(
     public val watchId: String,
     public val projection: String,

@@ -37,6 +37,18 @@ internal interface PublicMarketSource {
 }
 
 /** Pure routing state, serialized by the owning WebSocketManager. Both transports enter its event bus. */
+/**
+ * Whether a string has the shape of a canonical market id (`{exchange}:{native}`,
+ * alphabetic exchange prefix) — the only keys a mids map can carry. Used to pick
+ * the market-priced rows out of an aggregate's breakdown when declaring price
+ * interest; never to construct or guess an id.
+ */
+internal fun isCanonicalMarketId(id: String): Boolean {
+    val colon = id.indexOf(':')
+    if (colon <= 0 || colon == id.length - 1) return false
+    return id.substring(0, colon).all { it.isLetter() } && id.none { it.isWhitespace() }
+}
+
 internal class MarketDataRouter {
     var preference = MarketDataPreference.ARCA
     private var mapping = emptyMap<String, String>()

@@ -19,11 +19,13 @@ import network.arca.sdk.models.observedBefore
 import network.arca.sdk.models.Fill
 import network.arca.sdk.models.MarginTier
 import network.arca.sdk.models.ObjectValuation
+import network.arca.sdk.models.PathAggregation
 import network.arca.sdk.models.RealmEvent
 import network.arca.sdk.models.revalued
 import java.time.Instant
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -201,7 +203,16 @@ public suspend fun Arca.watchObject(path: String, exchange: String = "sim"): Obj
         }
     }
 
-    ws.acquireMids(exchange)
+    // The object's mids interest is the markets its positions hold,
+    // refreshed on every server valuation; a cash-only object asks for no
+    // prices at all.
+    val priceInterest = ws.registerPriceMarkets()
+    val interestRevision = AtomicLong(0)
+    fun syncInterest(valuation: ObjectValuation) {
+        val markets = valuation.positions.orEmpty().map { it.market }.toSet()
+        ws.updatePriceMarkets(priceInterest, markets, interestRevision.incrementAndGet())
+    }
+    ws.acquireMids(exchange, allMarkets = false)
 
     jobs += scope.launch {
         ws.objectValuationEvents().collect { evt ->
@@ -212,6 +223,7 @@ public suspend fun Arca.watchObject(path: String, exchange: String = "sim"): Obj
                     "valuation drift corrected; previous value was stale"
                 }
             }
+            syncInterest(evt.valuation)
             val cur = mids.value
             stream.setState(WatchStreamState.CONNECTED)
             stream.push(if (cur.isEmpty()) evt.valuation else evt.valuation.revalued(cur))
@@ -232,7 +244,8 @@ public suspend fun Arca.watchObject(path: String, exchange: String = "sim"): Obj
         stopped.set(true)
         jobs.forEach { it.cancel() }
         ws.removeGapHandler(gapId)
-        ws.releaseMids()
+        ws.releasePriceMarkets(priceInterest)
+        ws.releaseMids(allMarkets = false)
         ws.unwatchPath(path)
     }
     return stream
@@ -409,12 +422,23 @@ public suspend fun Arca.watchAggregation(
         ws.rotatedStream.collect { requestRecreate() }
     }
 
-    ws.acquireMids(exchange)
+    // The aggregate's mids interest is the set of market-priced rows in its
+    // breakdown (the keys `revalued` looks up), refreshed on every server
+    // aggregate.
+    val priceInterest = ws.registerPriceMarkets()
+    val interestRevision = AtomicLong(0)
+    fun syncInterest(agg: PathAggregation) {
+        val markets = agg.breakdown.map { it.asset }.filter(::isCanonicalMarketId).toSet()
+        ws.updatePriceMarkets(priceInterest, markets, interestRevision.incrementAndGet())
+    }
+    structural.value?.let(::syncInterest)
+    ws.acquireMids(exchange, allMarkets = false)
 
     jobs += scope.launch {
         ws.aggregationEvents().collect { (eventWatchId, agg, _) ->
             if (eventWatchId != widBox.value || agg == null) return@collect
             structural.value = agg
+            syncInterest(agg)
             val cur = mids.value
             stream.setState(WatchStreamState.CONNECTED)
             stream.push(if (cur.isEmpty()) agg else agg.revalued(cur))
@@ -434,7 +458,8 @@ public suspend fun Arca.watchAggregation(
     stream.stopAction = {
         stopped.set(true)
         jobs.forEach { it.cancel() }
-        ws.releaseMids()
+        ws.releasePriceMarkets(priceInterest)
+        ws.releaseMids(allMarkets = false)
         ws.destroyAggregationWatch(widBox.value)
     }
     return stream
@@ -630,7 +655,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         if (event.entityId == objectId || event.entityPath == objectPath) visible.observeFill(fill.market, fill.orderOperationId, fill.orderId, fill.createdAt)
     }
 
-    ws.acquireMids(exchange)
+    ws.acquireMids(exchange, allMarkets = false)
     ws.watchPath(objectPath)
 
     jobs += scope.launch {
@@ -689,7 +714,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
         unregisterExchangeStateRefresher(objectId, refresherId)
         ws.unwatchPath(objectPath)
         ws.releasePriceMarkets(priceInterest)
-        ws.releaseMids()
+        ws.releaseMids(allMarkets = false)
     }
     return stream
 }
@@ -947,7 +972,10 @@ public suspend fun Arca.watchOI(
 // MARK: - watchPrices
 
 /**
- * Watch real-time mid prices. Each update is a full snapshot of all known prices.
+ * Watch real-time mid prices for every market. Each update is a full snapshot
+ * of all known prices. Prefer the overload that names the markets a screen
+ * shows: this one is the single way to ask for every market, on both
+ * providers.
  *
  * Returns once prices are available, so [MarketPriceStream.prices] is
  * populated on return — for the first subscriber that is the server's
@@ -957,14 +985,40 @@ public suspend fun Arca.watchOI(
  */
 public suspend fun Arca.watchPrices(exchange: String = "sim"): MarketPriceStream = watchPrices(exchange, emptyList())
 
-/** Watch the full selected price map and register explicit direct-source interests. */
+/**
+ * Watch real-time mid prices for [markets] (canonical ids, `hl:0:BTC`).
+ *
+ * The market list is this stream's price interest on BOTH providers: the
+ * direct Hyperliquid source subscribes one feed per market, and the Arca
+ * socket's `subscribe_mids` carries the union of every consumer's interests,
+ * so a screen reading three markets costs three markets of traffic on either
+ * arm. [MarketPriceStream.setMarkets] changes the set in place; an empty
+ * list means every market. A market no earlier consumer asked for is not in
+ * the retained map yet; it arrives on [MarketPriceStream.updates] with the
+ * snapshot the widened subscription triggers, one round trip later.
+ */
 public suspend fun Arca.watchPrices(exchange: String = "sim", markets: List<String>): MarketPriceStream {
     val priceInterest = ws.registerPriceMarkets()
     ws.updatePriceMarkets(priceInterest, markets.toSet())
     ws.ensureConnected()
 
     val stream = MarketPriceStream()
-    stream.updateMarketsAction = { ws.updatePriceMarkets(priceInterest, it.toSet()) }
+    // An empty market list is an all-markets interest; a named list is served
+    // through the interest owner above. setMarkets can move between the two,
+    // so the all-ref is tracked per current state.
+    val holdsAllRef = AtomicBoolean(markets.isEmpty())
+    stream.updateMarketsAction = { next ->
+        ws.updatePriceMarkets(priceInterest, next.toSet())
+        val wantsAll = next.isEmpty()
+        val hadAll = holdsAllRef.getAndSet(wantsAll)
+        if (wantsAll && !hadAll) {
+            ws.acquireMids(exchange, allMarkets = true)
+            ws.releaseMids(allMarkets = false)
+        } else if (!wantsAll && hadAll) {
+            ws.acquireMids(exchange, allMarkets = false)
+            ws.releaseMids(allMarkets = true)
+        }
+    }
     val jobs = mutableListOf<Job>()
 
     jobs += scope.launch {
@@ -975,7 +1029,7 @@ public suspend fun Arca.watchPrices(exchange: String = "sim", markets: List<Stri
         }
     }
 
-    ws.acquireMids(exchange)
+    ws.acquireMids(exchange, allMarkets = markets.isEmpty())
 
     jobs += scope.launch {
         ws.midsEvents().collect { mids ->
@@ -989,7 +1043,7 @@ public suspend fun Arca.watchPrices(exchange: String = "sim", markets: List<Stri
     stream.stopAction = {
         jobs.forEach { it.cancel() }
         ws.releasePriceMarkets(priceInterest)
-        ws.releaseMids()
+        ws.releaseMids(allMarkets = holdsAllRef.get())
     }
     try { stream.ready() } catch (error: Throwable) { stream.stop(); throw error }
     return stream

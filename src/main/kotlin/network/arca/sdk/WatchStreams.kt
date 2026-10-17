@@ -292,12 +292,27 @@ public class ProjectionWatchStream internal constructor(
     public val fields: List<String>,
 ) : BaseWatchStream() {
     internal val watchIdMut: MutableStateFlow<String> = MutableStateFlow("")
+    internal val scopeMut: MutableStateFlow<ProjectionWatchScope> = MutableStateFlow(ProjectionWatchScope())
     internal val valuationsMut: MutableStateFlow<Map<String, ProjectedValuation>> = MutableStateFlow(emptyMap())
     internal val updatesMut: MutableSharedFlow<Map<String, ProjectedValuation>> = snapshotUpdatesFlow()
     private val callbacks = CallbackRegistry<Map<String, ProjectedValuation>>()
+    internal var updateScopeAction: suspend (ProjectionWatchScope) -> Unit = {}
 
     /** Server watch ID (changes when the watch is re-created after reconnect/rotation). */
     public val watchId: StateFlow<String> get() = watchIdMut.asStateFlow()
+
+    /** The interest set this watch currently covers. */
+    public val scope: StateFlow<ProjectionWatchScope> get() = scopeMut.asStateFlow()
+
+    /**
+     * Replace the watched path set in place (max 500). The watch keeps its
+     * ID; the server answers with the snapshot of the new set, which
+     * replaces the rows wholesale. A later call supersedes an earlier one.
+     */
+    public suspend fun setPaths(paths: List<String>) { updateScopeAction(ProjectionWatchScope(paths = paths)) }
+
+    /** Replace the watched sub-tree in place. See [setPaths]. */
+    public suspend fun setPrefix(prefix: String) { updateScopeAction(ProjectionWatchScope(prefix = prefix)) }
 
     /** Latest projected valuations keyed by object path. */
     public val valuations: StateFlow<Map<String, ProjectedValuation>> get() = valuationsMut.asStateFlow()
