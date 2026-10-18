@@ -20,6 +20,7 @@ import network.arca.sdk.models.Micro
 import network.arca.sdk.models.MoneyChange
 import network.arca.sdk.models.MoneyCounterparty
 import network.arca.sdk.models.MoneyDiagnostic
+import network.arca.sdk.models.MoneyDirection
 import network.arca.sdk.models.MoneyLegStage
 import network.arca.sdk.models.MoneyPrediction
 import network.arca.sdk.models.MoneyRevaluation
@@ -173,6 +174,8 @@ class WalletMoneyTest {
         val failed = WalletMoney.compose(fixture("05-move-failed-before-pnr"), reserved)
         assertEquals("28510000", failed.cash.availableMicro)
         assertTrue(failed.cash.departing.isEmpty() && failed.account(hl1)!!.arriving.isEmpty())
+        assertEquals("failed", failed.cash.change?.operationStatus, "a released reservation is not money sent")
+        assertEquals(MoneyDirection.OUTGOING, failed.cash.change?.retired?.direction)
 
         val compensated = WalletMoney.compose(fixture("06-move-compensated"), inTransit)
         assertEquals("28500000", compensated.cash.settledMicro)
@@ -217,6 +220,9 @@ class WalletMoneyTest {
         assertEquals("3000000", landed.account(hl2)!!.settledMicro)
         assertTrue(landed.account(hl2)!!.arriving.isEmpty())
         assertEquals(MoneyChange.Cause.Operation("opr_dep1", "deposit"), landed.account(hl2)!!.change?.cause)
+        assertEquals("0", landed.total.change?.deltaMicro, "the total was counted as moving already")
+        assertEquals("2000000", landed.total.change?.retired?.amountMicro)
+        assertEquals("succeeded", landed.total.change?.operationStatus)
     }
 
     @Test

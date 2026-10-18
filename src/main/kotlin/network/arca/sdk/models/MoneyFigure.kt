@@ -87,6 +87,14 @@ public data class MoneyChange(
     val deltaMicro: String,
     /** The journal position of the frame that carried the change. */
     val sequence: Long,
+    /**
+     * The leg of the named operation this frame no longer lists (it landed,
+     * left, or was released), so a caption can name the amount even when the
+     * figure itself did not move (the total, when in-transit money lands).
+     */
+    val retired: MoneyLeg? = null,
+    /** The named operation's `status` in this frame (`pending`, `succeeded`, `failed`). */
+    val operationStatus: String? = null,
 ) {
     public sealed class Cause {
         /** An operation touching the figure changed stage, leg or status. */
@@ -463,14 +471,15 @@ public data class WalletMoney(
         }
 
         internal fun change(previous: MoneyFigure?, figure: MoneyFigure, snapshot: WalletSnapshot, previousMoney: WalletMoney, sequence: Long, account: WalletTradingAccount?): MoneyChange? {
+            val moved = operationThatMoved(figure, previous, snapshot, previousMoney)
             val before = previous?.settledMicro
             val after = figure.settledMicro
             val delta = if (before != null && after != null) Micro.difference(after, before) else null
             if (delta == null) {
-                val cause = operationThatMoved(figure, previous, snapshot, previousMoney) ?: return null
-                return MoneyChange(cause, "0", sequence)
+                moved ?: return null
+                return MoneyChange(moved.cause, "0", sequence, moved.retired, moved.status)
             }
-            operationThatMoved(figure, previous, snapshot, previousMoney)?.let { return MoneyChange(it, delta, sequence) }
+            if (moved != null) return MoneyChange(moved.cause, delta, sequence, moved.retired, moved.status)
             if (delta == "0") return null
             if (account != null && account.balances?.typedSource == WalletNativeBalanceSource.HYPERLIQUID_WS) {
                 return MoneyChange(MoneyChange.Cause.Venue, delta, sequence)
@@ -478,13 +487,19 @@ public data class WalletMoney(
             return null
         }
 
+        internal class Moved(val cause: MoneyChange.Cause, val retired: MoneyLeg?, val status: String?)
+
         /** An operation that touches the figure and changed between the frames. */
-        internal fun operationThatMoved(figure: MoneyFigure, previous: MoneyFigure?, snapshot: WalletSnapshot, previousMoney: WalletMoney): MoneyChange.Cause? {
+        internal fun operationThatMoved(figure: MoneyFigure, previous: MoneyFigure?, snapshot: WalletSnapshot, previousMoney: WalletMoney): Moved? {
             val nowLegs = (figure.arriving + figure.departing).associateBy { it.id }
             val beforeLegs = ((previous?.arriving ?: emptyList()) + (previous?.departing ?: emptyList())).associateBy { it.id }
             val touched = mutableListOf<Pair<String, String>>()
+            val retired = HashMap<String, MoneyLeg>()
             for ((id, leg) in nowLegs) if (beforeLegs[id]?.stage != leg.stage) touched += leg.operationId to leg.kind
-            for ((id, leg) in beforeLegs) if (nowLegs[id] == null) touched += leg.operationId to leg.kind
+            for ((id, leg) in beforeLegs) if (nowLegs[id] == null) {
+                touched += leg.operationId to leg.kind
+                retired[leg.operationId] = leg
+            }
             val before = previousMoney.operations.associateBy { it.operationId }
             for (op in snapshot.operations) {
                 if (!touches(op, figure, snapshot)) continue
@@ -493,14 +508,23 @@ public data class WalletMoney(
                     touched += op.operationId to op.kind
                 }
             }
+            val cashStatus = HashMap<String, String>()
             if (figure.kind is MoneyFigureKind.Cash || figure.kind is MoneyFigureKind.Total) {
                 val beforeCash = previousMoney.snapshot.cash.operations.associateBy { it.id }
                 for (op in snapshot.cash.operations) {
-                    if (beforeCash[op.id]?.state != op.state && (op.kind == "send" || figure.kind is MoneyFigureKind.Cash)) touched += op.id to op.kind
+                    if (beforeCash[op.id]?.state != op.state && (op.kind == "send" || figure.kind is MoneyFigureKind.Cash)) {
+                        touched += op.id to op.kind
+                        cashStatus[op.id] = when (op.state) {
+                            WalletOperationState.COMPLETED.wire -> "succeeded"
+                            WalletOperationState.FAILED.wire -> "failed"
+                            else -> "pending"
+                        }
+                    }
                 }
             }
             val (id, kind) = touched.firstOrNull() ?: return null
-            return MoneyChange.Cause.Operation(id, kind)
+            val status = snapshot.operations.firstOrNull { it.operationId == id }?.status ?: cashStatus[id]
+            return Moved(MoneyChange.Cause.Operation(id, kind), retired[id], status)
         }
 
         internal fun touches(op: WalletFundingOperation, figure: MoneyFigure, snapshot: WalletSnapshot): Boolean {
