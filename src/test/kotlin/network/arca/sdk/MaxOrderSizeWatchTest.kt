@@ -277,6 +277,31 @@ class MaxOrderSizeWatchTest {
             stream
         }
 
+    @Test fun structuralModeSwitchDuringBurstRejectsOlderLocalSizingAndStopEndsPrices() = runBlocking {
+        val arca = makeArca()
+        val stream = launchWatch(arca, mmr = null)
+        org.junit.jupiter.api.Assertions.assertNotEquals("0", stream.activeAssetData.value?.maxBuySize)
+        val state = arca.getExchangeState("obj_1")
+        val stateJson = arcaJson.encodeToString(network.arca.sdk.models.ExchangeState.serializer(), state)
+        val body = kotlinx.serialization.json.JsonObject(arcaJson.parseToJsonElement(stateJson).jsonObject +
+            ("pricingMode" to kotlinx.serialization.json.JsonPrimitive("server")))
+        for (i in 1..1000) arca.ws.injectMessage("""{"type":"mids.updated","mids":{"hl:0:BTC":"${80000 + i}"}}""")
+        arca.ws.injectMessage("""{"type":"exchange.updated","entityId":"obj_1","exchangeState":$body}""")
+        withTimeout(2000) { stream.activeAssetData.first { it?.maxBuySize == "0" } }
+        for (i in 1001..2000) arca.ws.injectMessage("""{"type":"mids.updated","mids":{"hl:0:BTC":"${80000 + i}"}}""")
+        assertNull(withTimeoutOrNull(100) { stream.activeAssetData.first { it?.maxBuySize != "0" } })
+        stream.stop()
+        val stoppedPrices = arca.watchPrices(markets = listOf("hl:0:BTC"))
+        val livePrices = arca.watchPrices(markets = listOf("hl:0:BTC"))
+        stoppedPrices.stop()
+        val stoppedValue = stoppedPrices.prices.value
+        arca.ws.injectMessage("""{"type":"mids.updated","mids":{"hl:0:BTC":"99999"}}""")
+        withTimeout(2000) { livePrices.prices.first { it["hl:0:BTC"] == "99999" } }
+        assertEquals(stoppedValue, stoppedPrices.prices.value)
+        livePrices.stop()
+        arca.close()
+    }
+
     private fun makeArca(): Arca = Arca(token = fakeJwt(), baseUrl = server.url("/").toString().trimEnd('/'))
 
     private fun fakeJwt(): String {

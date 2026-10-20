@@ -527,3 +527,42 @@ payloads, excluding framing/TLS; Arca's count includes its shared account socket
 The first price delay starts at socket-manager creation and concerns the first
 routed interested price. It is not venue latency. Quiet prices are not failures,
 no exchange timestamp is invented, and Arca still owns finalized candles.
+
+## Prioritized public quotes (2.15.0)
+
+MarketDataBudget / setMarketDataBudget is opt-in; nil/null restores legacy BBO routing.
+Higher priorities use canonical market IDs, merged by the builder from visible consumers.
+Interests remain owned by existing watchPrices, account, valuation and sizing watches.
+Budget payload bytes/second and receive messages/second independently; message count is
+only a device-work proxy. Coarse allMids coverage may exceed a too-small budget. Candles,
+Arca fallback, TLS and other app traffic are outside this quote target.
+One allMids per needed DEX plus selected BBO, or BBO-only when cheaper and both targets fit.
+Ten-second received-frame cost windows, slow cost decreases and retained-selection tie
+preference stabilize the plan. Builders should delay device/network budget upgrades.
+allMids has no venue timestamp, and a received BBO remains preferred even when quiet.
+One canonical batch per coarse frame; server-priced money/execution authority is unchanged.
+
+arca.setMarketDataBudget(MarketDataBudget(bytesPerSecond = 10_000.0, messagesPerSecond = 12.0,
+    priorities = mapOf("hl:0:BTC" to 100, "hl:1:TSLA" to 60)))
+// Pass null to restore the default BBO policy.
+arca.setMarketDataBudget(null)
+
+## Bounded native price calculations (2.15.0)
+
+`ws.midsEvents()` emits full merged price snapshots, with one newest pending
+snapshot per consumer. Merge happens before conflation: sparse updates for
+separate assets cannot erase each other's latest prices. Equal-price received
+observations remain observable when the low-level consumer keeps up; public
+`watchPrices.updates` still skips unchanged maps. Intermediate ticks may be
+skipped under load. Unsubscription clears replay for a new subscription lifetime.
+Price-driven `watchExchangeState` revaluation uses immutable captured inputs and
+rejects results after structural epoch changes or stop. `watchMaxOrderSize` local
+derivation uses one background worker plus one newest pending input, preserving
+progress during sustained arrivals. Structural acceptance and price publication
+share an epoch fence; server-priced sizing remains server authoritative. Swift
+`watchPrices.stop()` also ends its private updates worker. Kotlin exchange-watch
+startup and initial local sizing derivation explicitly use Dispatchers.Default.
+Order/fill events, critical state transitions and authoritative reconciliation are
+not routed through the replaceable calculation queue. This bounds the selected
+price calculation paths, not every SDK event stream or UI/GPU work. Render the
+last completed snapshot; never await a new calculation during a UI render.

@@ -22,9 +22,11 @@ public data class MarketDataSourceStatus(
     public val lastError: String?,
 )
 
-internal data class PublicMarketSubscription(val market: String, val coin: String, val interval: CandleInterval? = null)
+internal data class PublicMarketSubscription(val market: String, val coin: String, val interval: CandleInterval? = null, val dex: String? = null)
 internal sealed interface PublicMarketUpdate {
     data class Quote(val market: String, val price: String, val timeMs: Long) : PublicMarketUpdate
+    data class Mids(val dex: String, val prices: Map<String, String>) : PublicMarketUpdate
+    data class Cost(val key: String, val bytes: Int) : PublicMarketUpdate
     data class Bar(val market: String, val interval: CandleInterval, val candle: Candle) : PublicMarketUpdate
     data class Unavailable(val reason: String) : PublicMarketUpdate
     data class Traffic(val bytes: Int) : PublicMarketUpdate
@@ -52,6 +54,13 @@ internal fun isCanonicalMarketId(id: String): Boolean {
 internal class MarketDataRouter {
     var preference = MarketDataPreference.ARCA
     private var mapping = emptyMap<String, String>()
+    private var budget: MarketDataBudget? = null
+    private val costs = PublicFeedCosts()
+    private var lastBudgetRefreshMs: Long? = null
+    private val coarseMarkets = mutableSetOf<String>()
+    val directCoverageMarkets: Set<String> get() = subscriptions.filter { it.interval == null && it.dex == null }.map { it.market }.toSet() +
+        mapping.filterValues { coin -> subscriptions.any { it.dex == venueDex(coin) } }.keys
+    fun setBudget(value: MarketDataBudget?) { budget = value; refresh() }
     private data class Interest(val revision: Long, val markets: Set<String>)
     private val interests = linkedMapOf<String, Interest>()
     val priceInterestMarkets: Set<String> get() = interests.values.flatMap { it.markets }.toSet()
@@ -94,20 +103,30 @@ internal class MarketDataRouter {
     fun candleRetained(market: String, interval: CandleInterval): Boolean = (candles[market to interval] ?: 0) > 0
     private fun refresh() {
         val wanted = mutableListOf<PublicMarketSubscription>()
+        val interested = priceInterestMarkets
         if (preference == MarketDataPreference.HYPERLIQUID) {
-            interests.values.flatMap { it.markets }.toSortedSet().forEach { m -> mapping[m]?.let { wanted += PublicMarketSubscription(m, it) } }
-            candles.keys.sortedWith(compareBy({ it.first }, { it.second.wire })).forEach { (m, i) ->
-                if (i != CandleInterval.FIFTEEN_SECONDS) mapping[m]?.let { wanted += PublicMarketSubscription(m, it, i) }
+            val priceMapping = mapping.filterKeys { it in interested }
+            val candleSubscriptions = candles.keys.sortedWith(compareBy({ it.first }, { it.second.wire })).mapNotNull { (m, i) ->
+                if (i == CandleInterval.FIFTEEN_SECONDS) null else mapping[m]?.let { PublicMarketSubscription(m, it, i) }
+            }.take(64)
+            val policy = budget
+            if (policy == null) {
+                priceMapping.toSortedMap().forEach { (m, coin) -> wanted += PublicMarketSubscription(m, coin) }
+                wanted += candleSubscriptions
+            } else {
+                costs.retain(priceMapping.keys + priceMapping.values.map { "@${venueDex(it)}" })
+                wanted += candleSubscriptions
+                wanted += budgetSubscriptions(priceMapping, policy, costs, subscriptions, 64 - wanted.size)
             }
         }
-        // Bound phone receive/decode work and outbound subscription bursts. Overflow stays on Arca.
         subscriptions = wanted.take(64).toSet()
-        quoteTimes.keys.retainAll(subscriptions.filter { it.interval == null }.map { it.market }.toSet())
+        quoteTimes.keys.retainAll(subscriptions.filter { it.interval == null && it.dex == null }.map { it.market }.toSet())
+        coarseMarkets.retainAll(mapping.filter { (market, coin) -> market in interested && subscriptions.any { it.dex == venueDex(coin) } }.keys)
         closedBars.keys.retainAll(candles.keys)
         bars.keys.retainAll(subscriptions.mapNotNull { s -> s.interval?.let { s.market to it } }.toSet())
     }
-    fun unavailable(reason: String?) { quoteTimes.clear(); bars.clear(); lastError = reason }
-    fun arcaPrices(prices: Map<String, String>): Map<String, String> = prices.filterKeys { it !in quoteTimes }
+    fun unavailable(reason: String?) { quoteTimes.clear(); coarseMarkets.clear(); bars.clear(); lastError = reason }
+    fun arcaPrices(prices: Map<String, String>): Map<String, String> = prices.filterKeys { it !in quoteTimes && it !in coarseMarkets }
     fun arcaCandle(event: RealmEvent): Boolean {
         if (event.type == "candle.closed") {
             val interval = CandleInterval.fromWire(event.interval ?: "")
@@ -123,8 +142,23 @@ internal class MarketDataRouter {
         val direct = bars[event.market to interval] ?: return true
         return incoming.t > direct.t // do not replay an older open frame over the selected live bar
     }
-    fun direct(update: PublicMarketUpdate, nowMs: Long): RealmEvent? = when (update) {
+    fun direct(update: PublicMarketUpdate, nowMs: Long, costNowMs: Long = nowMs): RealmEvent? = when (update) {
         is PublicMarketUpdate.Traffic -> null
+        is PublicMarketUpdate.Cost -> {
+            if (costs.record(update.key, update.bytes, costNowMs) && (lastBudgetRefreshMs == null || costNowMs - lastBudgetRefreshMs!! >= 10_000)) {
+                lastBudgetRefreshMs = costNowMs; refresh()
+            }
+            null
+        }
+        is PublicMarketUpdate.Mids -> {
+            if (subscriptions.none { it.dex == update.dex }) null else {
+                val interested = priceInterestMarkets
+                val mids = mapping.filter { (market, coin) -> market in interested && venueDex(coin) == update.dex && market !in quoteTimes }
+                    .mapNotNull { (market, coin) -> update.prices[coin]?.let { market to it } }.toMap()
+                coarseMarkets += mids.keys
+                if (mids.isEmpty()) null else { lastError = null; RealmEvent(type = "mids.updated", mids = mids) }
+            }
+        }
         is PublicMarketUpdate.Unavailable -> { unavailable(update.reason); null }
         is PublicMarketUpdate.Quote -> {
             if (subscriptions.none { it.market == update.market && it.interval == null } ||
@@ -149,7 +183,7 @@ internal class MarketDataRouter {
             }
         }
     }
-    fun status(): MarketDataSourceStatus = MarketDataSourceStatus(preference, subscriptions.size, quoteTimes.keys.toSet(), bars.keys.map { it.first }.toSet(), lastError)
+    fun status(): MarketDataSourceStatus = MarketDataSourceStatus(preference, subscriptions.size, (quoteTimes.keys + coarseMarkets).toSet(), bars.keys.map { it.first }.toSet(), lastError)
     companion object { private val canonicalHL = Regex("hl:[0-9]+:[^:\\s]+") }
 }
 

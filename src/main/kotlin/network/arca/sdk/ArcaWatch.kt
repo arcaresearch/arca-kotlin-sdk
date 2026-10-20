@@ -2,6 +2,8 @@ package network.arca.sdk
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.ensureActive
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.delay
@@ -232,6 +234,7 @@ public suspend fun Arca.watchObject(path: String, exchange: String = "sim"): Obj
 
     jobs += scope.launch {
         ws.midsEvents().collect { m ->
+            coroutineContext.ensureActive()
             mids.update { it + m }
             val base = stream.valuationMut.value ?: return@collect
             stream.push(base.revalued(mids.value))
@@ -474,6 +477,20 @@ public suspend fun Arca.watchAggregation(
  * prices. Call [ExchangeStateWatchStream.stop] when done.
  */
 public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = "sim"): ExchangeStateWatchStream {
+    var created: ExchangeStateWatchStream? = null
+    return try {
+        withContext(Dispatchers.Default) {
+            watchExchangeStateOnWorker(objectId, exchange).also { created = it }
+        }
+    } catch (error: Throwable) {
+        // withContext has prompt cancellation on return to the caller. Close a
+        // fully created watch if cancellation wins that handoff.
+        created?.stop()
+        throw error
+    }
+}
+
+private suspend fun Arca.watchExchangeStateOnWorker(objectId: String, exchange: String): ExchangeStateWatchStream {
     ws.ensureConnected()
 
     val detail = getObjectDetail(objectId)
@@ -561,7 +578,7 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
                 }
                 return
             }
-            if (epoch == observationEpoch && armExpiry(state, ++observationEpoch)) {
+            if (!stopped.get() && epoch == observationEpoch && armExpiry(state, ++observationEpoch)) {
                 clearRecovery()
                 structural.value = state
                 ws.updatePriceMarkets(priceInterest, state.positions.map { it.market }.toSet(), observationEpoch)
@@ -686,10 +703,14 @@ public suspend fun Arca.watchExchangeState(objectId: String, exchange: String = 
     jobs += scope.launch {
         ws.midsEvents().collect { m ->
             mids.update { it + m }
-            synchronized(observationLock) {
+            val input = synchronized(observationLock) {
                 val base = structural.value
-                if (base != null) {
-                    val value = base.revalued(mids.value)
+                if (stopped.get() || base == null) null else Triple(observationEpoch, base, mids.value)
+            } ?: return@collect
+            val value = input.second.revalued(input.third)
+            coroutineContext.ensureActive()
+            synchronized(observationLock) {
+                if (!stopped.get() && observationEpoch == input.first) {
                     stream.push(value); visible.observe(value)
                 }
             }
@@ -1020,6 +1041,8 @@ public suspend fun Arca.watchPrices(exchange: String = "sim", markets: List<Stri
         }
     }
     val jobs = mutableListOf<Job>()
+    val publicationLock = Any()
+    var stopped = false
 
     jobs += scope.launch {
         ws.statusStream.collect { s ->
@@ -1033,14 +1056,20 @@ public suspend fun Arca.watchPrices(exchange: String = "sim", markets: List<Stri
 
     jobs += scope.launch {
         ws.midsEvents().collect { mids ->
-            val cur = stream.prices.value
-            val merged = cur + mids
-            stream.setState(WatchStreamState.CONNECTED)
-            if (merged != cur) stream.push(merged)
+            coroutineContext.ensureActive()
+            synchronized(publicationLock) {
+                if (!stopped) {
+                    val cur = stream.prices.value
+                    val merged = cur + mids
+                    stream.setState(WatchStreamState.CONNECTED)
+                    if (merged != cur) stream.push(merged)
+                }
+            }
         }
     }
 
     stream.stopAction = {
+        synchronized(publicationLock) { stopped = true }
         jobs.forEach { it.cancel() }
         ws.releasePriceMarkets(priceInterest)
         ws.releaseMids(allMarkets = holdsAllRef.get())
@@ -1117,18 +1146,18 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
     var observationEpoch = 0L
     val jobs = mutableListOf<Job>()
 
-    fun recompute(): ActiveAssetData? {
-        val exState = exchangeStateBox.value ?: run {
-            stream.pendingReasonMut.value = MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE
-            return null
-        }
-        val mids = priceStream.prices.value
+    data class SizingInput(val epoch: Long, val state: ExchangeState, val mids: Map<String, String>)
+    data class SizingResult(val data: ActiveAssetData?, val pending: MaxOrderSizePendingReason?)
+    var stopped = false // protected by observationLock, including publication
+
+    fun recompute(input: SizingInput): SizingResult {
+        val exState = input.state
+        val mids = input.mids
         // Live mid wins; the snapshot mark only covers a market the mids map
         // has not carried yet.
         val markPx = (mids[options.market] ?: seedMark)?.toDoubleOrNull() ?: 0.0
         if (markPx <= 0) {
-            stream.pendingReasonMut.value = MaxOrderSizePendingReason.AWAITING_MARK_PRICE
-            return null
+            return SizingResult(null, MaxOrderSizePendingReason.AWAITING_MARK_PRICE)
         }
         // Re-mark the book against current mids before deriving.
         //
@@ -1157,9 +1186,7 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
             askRatio = askRatio,
             bidRatio = bidRatio,
         )
-        stream.pendingReasonMut.value =
-            if (derived == null) MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE else null
-        return derived
+        return SizingResult(derived, if (derived == null) MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE else null)
     }
 
     suspend fun fetchServerActiveAssetData(): ActiveAssetData? {
@@ -1171,18 +1198,28 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
                 leverage = options.leverage,
             )
         }.getOrNull()
-        stream.pendingReasonMut.value =
-            if (data == null) MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE else null
         return data
     }
 
     if (initialExchangeState.pricingMode == network.arca.sdk.models.PricingMode.SERVER) {
-        fetchServerActiveAssetData()?.let { stream.activeAssetDataMut.value = it }
+        fetchServerActiveAssetData().let {
+            stream.activeAssetDataMut.value = it
+            stream.pendingReasonMut.value = if (it == null) MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE else null
+        }
     } else {
-        recompute()?.let { stream.activeAssetDataMut.value = it }
+        // A suspend function can be called on Main. CPU derivation has an
+        // explicit background dispatcher even before the watch worker starts.
+        val initial = try {
+            withContext(Dispatchers.Default) {
+                recompute(SizingInput(0L, initialExchangeState, priceStream.prices.value))
+            }
+        } catch (error: Throwable) { priceStream.stop(); throw error }
+        stream.pendingReasonMut.value = initial.pending
+        stream.activeAssetDataMut.value = initial.data
     }
 
-    val detail = getObjectDetail(options.objectId)
+    val detail = try { getObjectDetail(options.objectId) }
+        catch (error: Throwable) { priceStream.stop(); throw error }
     val objectPath = detail.`object`.path
     ws.watchPath(objectPath)
 
@@ -1194,6 +1231,32 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
         }
     }
 
+    val calculations = LatestSnapshotCalculation<SizingInput, SizingResult>(scope,
+        calculate = { recompute(it) },
+        publish = { input, result ->
+            synchronized(observationLock) {
+                if (!stopped && input.epoch == observationEpoch) {
+                    stream.pendingReasonMut.value = result.pending
+                    result.data?.let { stream.push(it); stream.setState(WatchStreamState.CONNECTED) }
+                }
+            }
+        },
+    )
+    // Call only under observationLock: snapshot capture, structural acceptance,
+    // and completed-result publication use the same epoch fence.
+    fun enqueueLocal(epoch: Long) {
+        val state = exchangeStateBox.value ?: return
+        if (!stopped && state.pricingMode != network.arca.sdk.models.PricingMode.SERVER) {
+            calculations.submit(SizingInput(epoch, state, priceStream.prices.value))
+        }
+    }
+    fun publishServer(data: ActiveAssetData?, epoch: Long) = synchronized(observationLock) {
+        if (!stopped && epoch == observationEpoch) {
+            stream.pendingReasonMut.value = if (data == null) MaxOrderSizePendingReason.AWAITING_EXCHANGE_STATE else null
+            data?.let { stream.push(it); stream.setState(WatchStreamState.CONNECTED) }
+        }
+    }
+
     jobs += scope.launch {
         ws.exchangeNotifications().collect { event ->
             if (event.entityId != options.objectId && event.entityPath != objectPath) return@collect
@@ -1202,35 +1265,28 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
                 runCatching { getExchangeState(options.objectId) }.getOrNull() ?: return@collect
             }
             coroutineContext.ensureActive()
-            val accepted = synchronized(observationLock) {
-                if (epoch != observationEpoch) false else {
+            val acceptedEpoch = synchronized(observationLock) {
+                if (stopped || epoch != observationEpoch) null else {
+                    // Advancing on acceptance fences any price computation
+                    // captured while a structural fetch was still pending.
+                    ++observationEpoch
                     exchangeStateBox.value = nextState
-                    true
+                    enqueueLocal(observationEpoch)
+                    observationEpoch
                 }
-            }
-            if (!accepted) return@collect
-            val data = if (nextState.pricingMode == network.arca.sdk.models.PricingMode.SERVER) {
-                fetchServerActiveAssetData()
-            } else {
-                recompute()
-            }
-            coroutineContext.ensureActive()
-            synchronized(observationLock) {
-                if (epoch == observationEpoch && data != null) {
-                    stream.push(data)
-                    stream.setState(WatchStreamState.CONNECTED)
-                }
+            } ?: return@collect
+            if (nextState.pricingMode == network.arca.sdk.models.PricingMode.SERVER) {
+                val data = fetchServerActiveAssetData()
+                coroutineContext.ensureActive()
+                publishServer(data, acceptedEpoch)
             }
         }
     }
 
     jobs += scope.launch {
         priceStream.updates.collect {
-            if (exchangeStateBox.value?.pricingMode == network.arca.sdk.models.PricingMode.SERVER) return@collect
-            recompute()?.let {
-                stream.push(it)
-                stream.setState(WatchStreamState.CONNECTED)
-            }
+            coroutineContext.ensureActive()
+            synchronized(observationLock) { enqueueLocal(observationEpoch) }
         }
     }
 
@@ -1246,25 +1302,25 @@ public suspend fun Arca.watchMaxOrderSize(options: MaxOrderSizeWatchOptions): Ma
             val fresh = runCatching { getExchangeState(options.objectId) }.getOrNull()
             coroutineContext.ensureActive()
             if (fresh == null) continue
-            val accepted = synchronized(observationLock) {
-                if (epoch != observationEpoch) false else {
+            val acceptedEpoch = synchronized(observationLock) {
+                if (stopped || epoch != observationEpoch) null else {
+                    ++observationEpoch
                     exchangeStateBox.value = fresh
-                    true
+                    enqueueLocal(observationEpoch)
+                    observationEpoch
                 }
-            }
-            if (!accepted) continue
-            val data = if (fresh.pricingMode == network.arca.sdk.models.PricingMode.SERVER) fetchServerActiveAssetData() else recompute()
-            coroutineContext.ensureActive()
-            synchronized(observationLock) {
-                if (epoch == observationEpoch && data != null) {
-                    stream.push(data)
-                    stream.setState(WatchStreamState.CONNECTED)
-                }
+            } ?: continue
+            if (fresh.pricingMode == network.arca.sdk.models.PricingMode.SERVER) {
+                val data = fetchServerActiveAssetData()
+                coroutineContext.ensureActive()
+                publishServer(data, acceptedEpoch)
             }
         }
     }
 
     stream.stopAction = {
+        synchronized(observationLock) { stopped = true; ++observationEpoch }
+        calculations.stop()
         jobs.forEach { it.cancel() }
         priceStream.stop()
         ws.unwatchPath(objectPath)

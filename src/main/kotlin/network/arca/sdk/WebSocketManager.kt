@@ -17,7 +17,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.mapNotNull
-import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
@@ -152,6 +151,14 @@ public class WebSocketManager internal constructor(
     // long as it stays quiet. [midsEvents] replays this map to each new
     // collector as its first element.
     private var retainedMids: Map<String, String>? = null
+        set(value) {
+            field = value
+            // Conflate full merged snapshots, never sparse deltas. Clearing
+            // retention also clears replay for a later subscription lifetime.
+            midsSnapshots.value = MidsSnapshot(midsSnapshots.value.revision + 1, value)
+        }
+    private data class MidsSnapshot(val revision: Long, val prices: Map<String, String>?)
+    private val midsSnapshots = MutableStateFlow(MidsSnapshot(0, null))
     private val pendingPublicPrices = mutableMapOf<String, String>()
     private var publicFlushJob: Job? = null
     private var lastPublicFlushNs = 0L
@@ -220,6 +227,9 @@ public class WebSocketManager internal constructor(
         marketDataRouter.configure(preference, markets)
         syncPublicSourceLocked()
     }
+    internal fun setMarketDataBudget(budget: MarketDataBudget?) = lock.withLock {
+        marketDataRouter.setBudget(budget); syncPublicSourceLocked()
+    }
     public val marketDataSourceStatus: MarketDataSourceStatus get() = lock.withLock { marketDataRouter.status() }
     internal fun registerPriceMarkets(): String = lock.withLock {
         UUID.randomUUID().toString().also { marketDataRouter.register(it) }
@@ -253,7 +263,7 @@ public class WebSocketManager internal constructor(
         if (arca) syncArcaMidsLocked()
         marketDataRecorder.retain(marketDataRouter.priceInterestMarkets)
         val subscriptions = marketDataRouter.subscriptions
-        pendingPublicPrices.keys.retainAll(subscriptions.filter { it.interval == null }.map { it.market }.toSet())
+        pendingPublicPrices.keys.retainAll(marketDataRouter.directCoverageMarkets)
         if (publicSuspended || subscriptions.isEmpty()) { stopPublicSourceLocked(); return }
         if (publicSource == null) {
             val epoch = ++publicSourceEpoch
@@ -269,10 +279,12 @@ public class WebSocketManager internal constructor(
                         clearPublicPrices()
                         log.warning("market-data") { update.reason }
                     }
-                    marketDataRouter.direct(update, System.currentTimeMillis())?.let { event ->
+                    val before = marketDataRouter.subscriptions
+                    marketDataRouter.direct(update, System.currentTimeMillis(), System.nanoTime() / 1_000_000)?.let { event ->
                         marketDataRecorder.recovered()
                         if (event.mids != null) queuePublicPrices(event.mids) else { marketDataRecorder.candle(true); emit(event) }
                     }
+                    if (before != marketDataRouter.subscriptions) syncPublicSourceLocked(arca = false)
                     publishMarketDiagnostics(update is PublicMarketUpdate.Unavailable)
                 }
             }
@@ -283,9 +295,9 @@ public class WebSocketManager internal constructor(
     private fun emitArcaMarketEvent(event: RealmEvent, snapshot: Boolean = false) = lock.withLock {
         if (event.type == EventType.MIDS_UPDATED.wire && event.mids != null) {
             val mids = marketDataRouter.arcaPrices(event.mids)
-            retainedMids = if (snapshot) mids + (retainedMids ?: emptyMap()).filterKeys { it in marketDataRouter.status().directPriceMarkets }
-                else (retainedMids ?: emptyMap()) + mids
             if (snapshot || mids.isNotEmpty()) {
+                retainedMids = if (snapshot) mids + (retainedMids ?: emptyMap()).filterKeys { it in marketDataRouter.status().directPriceMarkets }
+                    else (retainedMids ?: emptyMap()) + mids
                 marketDataRecorder.prices(mids, false, marketDataRouter.priceInterestMarkets)
                 publishMarketDiagnostics()
                 emit(event.copy(mids = mids))
@@ -442,6 +454,7 @@ public class WebSocketManager internal constructor(
     public fun unsubscribeMids() {
         lock.withLock {
             subscribedMids = null
+            retainedMids = null
             sendMessage(buildJsonObject { put("action", "unsubscribe_mids") })
         }
     }
@@ -1186,21 +1199,11 @@ public class WebSocketManager internal constructor(
      * The current merged price map is replayed as the first element when one
      * is held, so a collector that subscribes after the server's
      * `mids.snapshot` starts from the same prices as the one that received it
-     * rather than from nothing. `onSubscription` runs after the subscription
-     * is registered, so a live update cannot fall between replay and
-     * registration.
+     * rather than from nothing. Each collector has only the newest pending
+     * complete snapshot. Sparse deltas are merged before conflation, so a slow
+     * valuation consumer cannot lose a quiet market's last price.
      */
-    public fun midsEvents(): Flow<Map<String, String>> = bus.asSharedFlow()
-        .onSubscription {
-            val retained = lock.withLock { retainedMids }
-            if (retained != null) {
-                emit(RealmEvent(type = EventType.MIDS_UPDATED.wire, mids = retained))
-            }
-        }
-        .mapNotNull { event ->
-            val mids = event.mids
-            if (event.type == EventType.MIDS_UPDATED.wire && mids != null) mids else null
-        }
+    public fun midsEvents(): Flow<Map<String, String>> = midsSnapshots.mapNotNull { it.prices }
 
     public fun aggregationEvents(): Flow<Triple<String, PathAggregation?, RealmEvent>> = filtered { event ->
         val id = event.entityId

@@ -116,16 +116,22 @@ class MarketDataRoutingTest {
         manager.updatePriceMarkets(owner, setOf("hl:0:BTC"))
         manager.configureMarketData(manager.beginMarketDataConfiguration(), MarketDataPreference.HYPERLIQUID, HyperliquidNetwork.MAINNET, listOf(market()))
         val values = Collections.synchronizedList(mutableListOf<String>())
-        val collector = launch(start = CoroutineStart.UNDISPATCHED) { manager.midsEvents().collect { it["hl:0:BTC"]?.let(values::add) } }
+        val observations = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) { manager.midsEvents().collect {
+            it["hl:0:BTC"]?.let { value -> values.add(value); observations.send(value) }
+        } }
+        suspend fun observed(price: String) { assertEquals(price, withTimeout(2000) { observations.receive() }) }
         delay(60)
         fun arca(price: String) = manager.injectMessage("""{"type":"mids.updated","mids":{"hl:0:BTC":"$price"}}""")
         val now = System.currentTimeMillis()
-        arca("100"); receive(1, PublicMarketUpdate.Quote("hl:0:BTC", "101", now)); arca("102")
+        arca("100"); observed("100")
+        receive(1, PublicMarketUpdate.Quote("hl:0:BTC", "101", now)); observed("101"); arca("102")
         receive(1, PublicMarketUpdate.Quote("hl:0:BTC", "101", now)) // quantity-only tick
         receive(2, PublicMarketUpdate.Unavailable("offline")); receive(1, PublicMarketUpdate.Quote("hl:0:BTC", "999", now))
-        arca("103"); receive(3, PublicMarketUpdate.Quote("hl:0:BTC", "105", now + 1)); arca("104"); manager.flushPublicPrices()
+        arca("103"); observed("103")
+        receive(3, PublicMarketUpdate.Quote("hl:0:BTC", "105", now + 1)); arca("104"); manager.flushPublicPrices(); observed("105")
         manager.beginMarketDataConfiguration(); receive(3, PublicMarketUpdate.Quote("hl:0:BTC", "999", now + 2)); arca("107")
-        withTimeout(2000) { while (values.size < 5) delay(5) }
+        observed("107")
         assertEquals(listOf("100", "101", "103", "105", "107"), values.toList())
         val diagnostics = manager.marketDataDiagnostics
         assertEquals(3L, diagnostics.arcaPriceValues); assertEquals(2L, diagnostics.hyperliquidPriceValues)

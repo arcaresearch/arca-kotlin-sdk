@@ -75,7 +75,11 @@ internal class HyperliquidMarketSource(
                     fail(epoch, "Hyperliquid subscription rejected")
                     return
                 }
-                decodePublicMarketUpdate(json, subscriptions)?.let { receive(epoch, it) }
+                decodePublicMarketUpdate(json, subscriptions)?.let {
+                    receive(epoch, it)
+                    val key = when (it) { is PublicMarketUpdate.Quote -> it.market; is PublicMarketUpdate.Mids -> "@${it.dex}"; else -> null }
+                    if (key != null) receive(epoch, PublicMarketUpdate.Cost(key, text.toByteArray(Charsets.UTF_8).size))
+                }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { fail(epoch, "Hyperliquid connection failed") }
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { fail(epoch, "Hyperliquid connection closed") }
@@ -91,17 +95,17 @@ internal class HyperliquidMarketSource(
                     if (closed || epoch != generation || !open) return@launch
                     val remove = (sent - desired).firstOrNull()
                     val add = (desired - sent).firstOrNull()
-                    val sub = remove ?: add ?: run { changes = null; return@launch }
+                    val sub = add ?: remove ?: run { changes = null; return@launch }
                     val message = buildJsonObject {
-                        put("method", if (remove != null) "unsubscribe" else "subscribe")
+                        put("method", if (add == null) "unsubscribe" else "subscribe")
                         putJsonObject("subscription") {
-                            put("type", if (sub.interval == null) "bbo" else "candle")
-                            put("coin", sub.coin)
-                            sub.interval?.let { put("interval", it.wire) }
+                            put("type", if (sub.dex != null) "allMids" else if (sub.interval == null) "bbo" else "candle")
+                            if (sub.dex != null) { if (sub.dex.isNotEmpty()) put("dex", sub.dex) }
+                            else { put("coin", sub.coin); sub.interval?.let { put("interval", it.wire) } }
                         }
                     }
                     if (socket?.send(message.toString()) != true) true
-                    else { sent = if (remove != null) sent - sub else sent + sub; false }
+                    else { sent = if (add == null) sent - sub else sent + sub; false }
                 }
                 if (failed) { fail(epoch, "Hyperliquid subscription send failed"); return@launch }
                 delay(100) // <=10 subscription messages/second, including churn
@@ -146,6 +150,15 @@ internal fun decodePublicMarketUpdate(json: JsonObject, subscriptions: Set<Publi
     val channel = json["channel"]?.jsonPrimitive?.contentOrNull
     val data = json["data"]?.jsonObject ?: return null
     when (channel) {
+        "allMids" -> {
+            val dex = data["dex"]?.jsonPrimitive?.contentOrNull ?: ""
+            if (subscriptions.none { it.dex == dex }) return null
+            val mids = data["mids"]?.jsonObject ?: return null
+            PublicMarketUpdate.Mids(dex, mids.mapNotNull { (coin, raw) ->
+                val value = (raw as? JsonPrimitive)?.contentOrNull ?: return@mapNotNull null
+                if (value.marketDecimal()?.signum() == 1) coin to value else null
+            }.toMap())
+        }
         "bbo" -> {
             val coin = data["coin"]?.jsonPrimitive?.contentOrNull ?: return null
             val sub = subscriptions.singleOrNull { it.coin == coin && it.interval == null } ?: return null
