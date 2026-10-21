@@ -17,6 +17,7 @@ internal class HyperliquidMarketSource(
     private val receive: (Long, PublicMarketUpdate) -> Unit,
     private val factory: WebSocket.Factory = publicClient,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val nowNanos: () -> Long = System::nanoTime,
 ) : PublicMarketSource {
     private val guard = Any()
     private var desired = emptySet<PublicMarketSubscription>()
@@ -32,6 +33,29 @@ internal class HyperliquidMarketSource(
     private var changes: Job? = null
     private var heartbeat: Job? = null
     private var retry: Job? = null
+    private val retryWindow = MarketRetryWindow()
+
+    override fun networkAvailable() = synchronized(guard) {
+        if (closed || desired.isEmpty() || socket != null || retry == null) return@synchronized
+        val now = nowNanos()
+        val plan = retryWindow.advance(now, Random.nextLong(250)) ?: return@synchronized
+        launchRetry(plan, now)
+    }
+
+    private fun launchRetry(plan: MarketRetryWindow.Plan, now: Long) {
+        retry?.cancel()
+        val epoch = generation
+        val timing = PublicMarketUpdate.Connection(attemptAtNanos = connectAtNs, retryAtNanos = now, retryDelayMs = plan.delayMs)
+        scope.launch { receive(epoch, timing) } // never call manager under guard
+        retry = scope.launch {
+            delay(plan.delayMs)
+            synchronized(guard) {
+                if (epoch != generation || !retryWindow.take(plan.token)) return@synchronized
+                retry = null
+                if (!closed && desired.isNotEmpty()) connect()
+            }
+        }
+    }
 
     override fun subscribe(subscriptions: Set<PublicMarketSubscription>) {
         synchronized(guard) {
@@ -44,7 +68,7 @@ internal class HyperliquidMarketSource(
     }
     private fun connect() {
         val epoch = ++generation
-        connectAtNs = System.nanoTime()
+        connectAtNs = nowNanos()
         val started = connectAtNs
         // Never call the manager while holding guard: subscribe takes the opposite lock order.
         scope.launch { receive(epoch, PublicMarketUpdate.Connection(attemptAtNanos = started)) }
@@ -53,7 +77,7 @@ internal class HyperliquidMarketSource(
             override fun onOpen(webSocket: WebSocket, response: Response) = synchronized(guard) {
                 if (closed || epoch != generation) { webSocket.cancel(); return }
                 socket = webSocket; open = true
-                openedAtNs = System.nanoTime(); lastReceivedNs = openedAtNs
+                openedAtNs = nowNanos(); lastReceivedNs = openedAtNs
                 val opened = openedAtNs
                 scope.launch { receive(epoch, PublicMarketUpdate.Connection(attemptAtNanos = started, openedAtNanos = opened)) }
                 sync()
@@ -62,7 +86,7 @@ internal class HyperliquidMarketSource(
                         delay(25_000)
                         val stale = synchronized(guard) {
                             if (epoch != generation) return@launch
-                            if (System.nanoTime() - lastReceivedNs > 45_000_000_000L) true
+                            if (nowNanos() - lastReceivedNs > 45_000_000_000L) true
                             else !webSocket.send("{\"method\":\"ping\"}")
                         }
                         if (stale) { fail(epoch, "Hyperliquid heartbeat timed out"); return@launch }
@@ -70,10 +94,10 @@ internal class HyperliquidMarketSource(
                 }
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
-                val received = System.nanoTime()
+                val received = nowNanos()
                 val subscriptions = synchronized(guard) {
                     if (closed || epoch != generation) return
-                    lastReceivedNs = System.nanoTime()
+                    lastReceivedNs = nowNanos()
                     sent
                 }
                 receive(epoch, PublicMarketUpdate.Received(PublicMarketUpdate.Traffic(text.toByteArray(Charsets.UTF_8).size), received, started, openedAtNs))
@@ -121,28 +145,24 @@ internal class HyperliquidMarketSource(
         }
     }
     private fun fail(epoch: Long, reason: String) {
-        var retryTiming: PublicMarketUpdate.Connection? = null
         val notify = synchronized(guard) {
             if (closed || epoch != generation) return
-            if (open && System.nanoTime() - openedAtNs >= 60_000_000_000L) attempt = 0
+            if (open && nowNanos() - openedAtNs >= 60_000_000_000L) attempt = 0
             stopSocket()
             if (desired.isNotEmpty()) {
                 val seconds = (2L shl attempt.coerceAtMost(5)).coerceAtMost(60)
                 attempt = (attempt + 1).coerceAtMost(6)
                 val waitMs = seconds * 1000 + Random.nextLong(0, 500)
-                retryTiming = PublicMarketUpdate.Connection(attemptAtNanos = connectAtNs, retryAtNanos = System.nanoTime(), retryDelayMs = waitMs)
-                retry = scope.launch {
-                    delay(waitMs)
-                    synchronized(guard) { retry = null; if (!closed && desired.isNotEmpty()) connect() }
-                }
+                val now = nowNanos()
+                launchRetry(retryWindow.schedule(now, waitMs), now)
             }
             generation
         }
         receive(notify, PublicMarketUpdate.Unavailable(reason))
-        retryTiming?.let { receive(notify, it) }
     }
     private fun stopSocket() {
         ++generation; open = false; sent = emptySet()
+        retry?.cancel(); retry = null; retryWindow.cancel()
         changes?.cancel(); changes = null; heartbeat?.cancel(); heartbeat = null
         socket?.cancel(); socket = null
     }

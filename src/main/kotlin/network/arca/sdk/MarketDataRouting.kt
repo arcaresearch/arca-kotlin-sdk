@@ -37,6 +37,7 @@ internal sealed interface PublicMarketUpdate {
 /** Provider boundary: implementations know wire formats/reconnection; the router knows preference. */
 internal interface PublicMarketSource {
     fun subscribe(subscriptions: Set<PublicMarketSubscription>)
+    fun networkAvailable() {}
     fun close()
 }
 

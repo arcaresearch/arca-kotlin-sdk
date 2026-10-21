@@ -5,6 +5,13 @@ import org.junit.jupiter.api.Test
 import okhttp3.OkHttpClient
 
 class MarketDataDiagnosticsTest {
+    @Test fun olderRetryNotificationCannotUndoAdvancedDeadline() {
+        val recorder = MarketDataDiagnosticsRecorder()
+        recorder.connection(PublicMarketUpdate.Connection(100, retryAtNanos = 300, retryDelayMs = 250))
+        recorder.connection(PublicMarketUpdate.Connection(100, retryAtNanos = 200, retryDelayMs = 16_000))
+        val timing = recorder.snapshot(MarketDataRouter()).hyperliquidConnection
+        assertEquals(300L, timing.lastRetryScheduledAtNanos); assertEquals(250L, timing.lastRetryDelayMs)
+    }
     @Test fun preferredSourceDoesNotMislabelFallbackAndQuietPriceIsNotFailure() {
         val router = MarketDataRouter(); val r = MarketDataDiagnosticsRecorder()
         router.register("owner"); router.update("owner", setOf("hl:0:BTC"), 1)

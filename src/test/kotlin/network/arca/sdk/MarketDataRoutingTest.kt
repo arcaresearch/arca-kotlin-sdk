@@ -11,6 +11,29 @@ import org.junit.jupiter.api.Test
 import java.util.Collections
 
 class MarketDataRoutingTest {
+    @Test fun recoveryHintDoesNotCreateOwnersOrReviveRetiredSource() {
+        val manager = WebSocketManager("http://localhost:1", "token", "realm", OkHttpClient())
+        var sources = 0; var hints = 0; var closed = 0
+        manager.publicSourceFactory = { _, _ -> sources++; object : PublicMarketSource {
+            override fun subscribe(subscriptions: Set<PublicMarketSubscription>) {}
+            override fun networkAvailable() { hints++ }
+            override fun close() { closed++ }
+        } }
+        manager.notifyMarketDataNetworkAvailable(); assertEquals(0, sources)
+        val owner = manager.registerPriceMarkets(); manager.updatePriceMarkets(owner, setOf("hl:0:BTC"))
+        manager.configureMarketData(manager.beginMarketDataConfiguration(), MarketDataPreference.HYPERLIQUID,
+            HyperliquidNetwork.MAINNET, listOf(market()))
+        manager.notifyMarketDataNetworkAvailable(); assertEquals(1, hints); assertEquals(1, sources)
+        manager.handleAppDidEnterBackground(); manager.notifyMarketDataNetworkAvailable()
+        assertEquals(1, hints); assertEquals(1, closed)
+        manager.handleAppWillEnterForeground(); manager.notifyMarketDataNetworkAvailable()
+        assertEquals(2, sources); assertEquals(2, hints)
+        manager.releasePriceMarkets(owner)
+        manager.notifyMarketDataNetworkAvailable(); assertEquals(2, hints); assertEquals(2, closed)
+        manager.updatePriceMarkets(owner, setOf("hl:0:BTC"), 2)
+        manager.notifyMarketDataNetworkAvailable(); assertEquals(2, sources)
+        manager.disconnect(); manager.notifyMarketDataNetworkAvailable(); assertEquals(2, hints)
+    }
     private fun market(name: String = "hl:0:BTC", coin: String = "BTC") = arcaJson.decodeFromString<Market>(
         """{"name":"$name","venueSymbol":"$coin","symbol":"BTC","exchange":"hl","index":0,"szDecimals":5,"maxLeverage":50,"onlyIsolated":false}""")
     private fun router(markets: List<Market> = listOf(market())) = MarketDataRouter().apply {

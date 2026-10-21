@@ -267,6 +267,9 @@ public class WebSocketManager internal constructor(
     internal fun setMarketDataBudget(budget: MarketDataBudget?) = lock.withLock {
         marketDataRouter.setBudget(budget); syncPublicSourceLocked()
     }
+    internal fun notifyMarketDataNetworkAvailable() = lock.withLock {
+        if (!publicSuspended && marketDataRouter.subscriptions.isNotEmpty()) publicSource?.networkAvailable()
+    }
     public val marketDataSourceStatus: MarketDataSourceStatus get() = lock.withLock { marketDataRouter.status() }
     internal fun registerPriceMarkets(): String = lock.withLock {
         UUID.randomUUID().toString().also { marketDataRouter.register(it) }

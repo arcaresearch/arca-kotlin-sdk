@@ -54,10 +54,12 @@ internal class MarketDataDiagnosticsRecorder {
         val next = if (old.attemptAtNanos == start) old else MarketConnectionTiming(attemptAtNanos = start,
             firstMessageAtNanos = old.firstMessageAtNanos?.takeIf { it >= start }, firstPriceAtNanos = old.firstPriceAtNanos?.takeIf { it >= start },
             lastRetryScheduledAtNanos = old.lastRetryScheduledAtNanos, lastRetryDelayMs = old.lastRetryDelayMs)
+        val newerRetry = update.retryAtNanos != null &&
+            (next.lastRetryScheduledAtNanos == null || update.retryAtNanos >= next.lastRetryScheduledAtNanos)
         counters = counters.copy(hyperliquidConnection = next.copy(
             openedAtNanos = update.openedAtNanos ?: next.openedAtNanos,
-            lastRetryScheduledAtNanos = update.retryAtNanos ?: next.lastRetryScheduledAtNanos,
-            lastRetryDelayMs = update.retryDelayMs ?: next.lastRetryDelayMs))
+            lastRetryScheduledAtNanos = if (newerRetry) update.retryAtNanos else next.lastRetryScheduledAtNanos,
+            lastRetryDelayMs = if (newerRetry) update.retryDelayMs else next.lastRetryDelayMs))
     }
     fun response(at: Long): Boolean {
         val t = counters.hyperliquidConnection
