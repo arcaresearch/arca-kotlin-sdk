@@ -24,6 +24,8 @@ public data class MarketDataSourceStatus(
 
 internal data class PublicMarketSubscription(val market: String, val coin: String, val interval: CandleInterval? = null, val dex: String? = null)
 internal sealed interface PublicMarketUpdate {
+    data class Received(val update: PublicMarketUpdate, val atNanos: Long, val attemptAtNanos: Long? = null, val openedAtNanos: Long? = null) : PublicMarketUpdate
+    data class Connection(val attemptAtNanos: Long? = null, val openedAtNanos: Long? = null, val retryAtNanos: Long? = null, val retryDelayMs: Long? = null) : PublicMarketUpdate
     data class Quote(val market: String, val price: String, val timeMs: Long) : PublicMarketUpdate
     data class Mids(val dex: String, val prices: Map<String, String>) : PublicMarketUpdate
     data class Cost(val key: String, val bytes: Int) : PublicMarketUpdate
@@ -143,7 +145,7 @@ internal class MarketDataRouter {
         return incoming.t > direct.t // do not replay an older open frame over the selected live bar
     }
     fun direct(update: PublicMarketUpdate, nowMs: Long, costNowMs: Long = nowMs): RealmEvent? = when (update) {
-        is PublicMarketUpdate.Traffic -> null
+        is PublicMarketUpdate.Traffic, is PublicMarketUpdate.Received, is PublicMarketUpdate.Connection -> null
         is PublicMarketUpdate.Cost -> {
             if (costs.record(update.key, update.bytes, costNowMs) && (lastBudgetRefreshMs == null || costNowMs - lastBudgetRefreshMs!! >= 10_000)) {
                 lastBudgetRefreshMs = costNowMs; refresh()

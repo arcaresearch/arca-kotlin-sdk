@@ -25,6 +25,7 @@ internal class HyperliquidMarketSource(
     private var open = false
     private var closed = false
     private var generation = 0L
+    private var connectAtNs = 0L
     private var openedAtNs = 0L
     private var lastReceivedNs = 0L
     private var attempt = 0
@@ -43,12 +44,18 @@ internal class HyperliquidMarketSource(
     }
     private fun connect() {
         val epoch = ++generation
+        connectAtNs = System.nanoTime()
+        val started = connectAtNs
+        // Never call the manager while holding guard: subscribe takes the opposite lock order.
+        scope.launch { receive(epoch, PublicMarketUpdate.Connection(attemptAtNanos = started)) }
         open = false; sent = emptySet()
         socket = factory.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = synchronized(guard) {
                 if (closed || epoch != generation) { webSocket.cancel(); return }
                 socket = webSocket; open = true
                 openedAtNs = System.nanoTime(); lastReceivedNs = openedAtNs
+                val opened = openedAtNs
+                scope.launch { receive(epoch, PublicMarketUpdate.Connection(attemptAtNanos = started, openedAtNanos = opened)) }
                 sync()
                 heartbeat = scope.launch {
                     while (isActive) {
@@ -63,12 +70,13 @@ internal class HyperliquidMarketSource(
                 }
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
+                val received = System.nanoTime()
                 val subscriptions = synchronized(guard) {
                     if (closed || epoch != generation) return
                     lastReceivedNs = System.nanoTime()
                     sent
                 }
-                receive(epoch, PublicMarketUpdate.Traffic(text.toByteArray(Charsets.UTF_8).size))
+                receive(epoch, PublicMarketUpdate.Received(PublicMarketUpdate.Traffic(text.toByteArray(Charsets.UTF_8).size), received, started, openedAtNs))
                 if (text.length > 262_144) { fail(epoch, "Hyperliquid frame exceeded size budget"); return }
                 val json = runCatching { arcaJson.parseToJsonElement(text).jsonObject }.getOrNull() ?: return
                 if ((json["channel"] as? JsonPrimitive)?.contentOrNull == "error") {
@@ -76,7 +84,7 @@ internal class HyperliquidMarketSource(
                     return
                 }
                 decodePublicMarketUpdate(json, subscriptions)?.let {
-                    receive(epoch, it)
+                    receive(epoch, PublicMarketUpdate.Received(it, received))
                     val key = when (it) { is PublicMarketUpdate.Quote -> it.market; is PublicMarketUpdate.Mids -> "@${it.dex}"; else -> null }
                     if (key != null) receive(epoch, PublicMarketUpdate.Cost(key, text.toByteArray(Charsets.UTF_8).size))
                 }
@@ -113,6 +121,7 @@ internal class HyperliquidMarketSource(
         }
     }
     private fun fail(epoch: Long, reason: String) {
+        var retryTiming: PublicMarketUpdate.Connection? = null
         val notify = synchronized(guard) {
             if (closed || epoch != generation) return
             if (open && System.nanoTime() - openedAtNs >= 60_000_000_000L) attempt = 0
@@ -120,14 +129,17 @@ internal class HyperliquidMarketSource(
             if (desired.isNotEmpty()) {
                 val seconds = (2L shl attempt.coerceAtMost(5)).coerceAtMost(60)
                 attempt = (attempt + 1).coerceAtMost(6)
+                val waitMs = seconds * 1000 + Random.nextLong(0, 500)
+                retryTiming = PublicMarketUpdate.Connection(attemptAtNanos = connectAtNs, retryAtNanos = System.nanoTime(), retryDelayMs = waitMs)
                 retry = scope.launch {
-                    delay(seconds * 1000 + Random.nextLong(0, 500))
+                    delay(waitMs)
                     synchronized(guard) { retry = null; if (!closed && desired.isNotEmpty()) connect() }
                 }
             }
             generation
         }
         receive(notify, PublicMarketUpdate.Unavailable(reason))
+        retryTiming?.let { receive(notify, it) }
     }
     private fun stopSocket() {
         ++generation; open = false; sent = emptySet()

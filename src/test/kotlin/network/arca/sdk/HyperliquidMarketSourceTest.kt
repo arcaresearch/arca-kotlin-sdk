@@ -13,9 +13,10 @@ class HyperliquidMarketSourceTest {
         val quotes = java.util.concurrent.atomic.AtomicInteger()
         val bars = java.util.concurrent.atomic.AtomicInteger()
         val failures = java.util.concurrent.atomic.AtomicInteger()
-        val source = HyperliquidMarketSource(HyperliquidNetwork.MAINNET.websocketUrl, { _, update ->
+        val source = HyperliquidMarketSource(HyperliquidNetwork.MAINNET.websocketUrl, { _, incoming ->
+            val update = (incoming as? PublicMarketUpdate.Received)?.update ?: incoming
             when (update) {
-                is PublicMarketUpdate.Cost, is PublicMarketUpdate.Mids, is PublicMarketUpdate.Traffic -> Unit
+                is PublicMarketUpdate.Cost, is PublicMarketUpdate.Mids, is PublicMarketUpdate.Traffic, is PublicMarketUpdate.Connection, is PublicMarketUpdate.Received -> Unit
                 is PublicMarketUpdate.Quote -> quotes.incrementAndGet()
                 is PublicMarketUpdate.Bar -> bars.incrementAndGet()
                 is PublicMarketUpdate.Unavailable -> failures.incrementAndGet()
@@ -43,7 +44,10 @@ class HyperliquidMarketSourceTest {
             }
         }))
         server.start()
-        val source = HyperliquidMarketSource(server.url("/ws").toString(), { _, update -> if (update !is PublicMarketUpdate.Traffic && update !is PublicMarketUpdate.Cost) received.trySend(update) })
+        val source = HyperliquidMarketSource(server.url("/ws").toString(), { _, incoming ->
+            val update = (incoming as? PublicMarketUpdate.Received)?.update ?: incoming
+            if (update !is PublicMarketUpdate.Traffic && update !is PublicMarketUpdate.Cost && update !is PublicMarketUpdate.Connection) received.trySend(update)
+        })
         try {
             source.subscribe(setOf(PublicMarketSubscription("hl:0:BTC", "BTC")))
             assertTrue(withTimeout(3000) { sent.receive() }.contains("bbo"))

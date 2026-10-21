@@ -2,6 +2,18 @@ package network.arca.sdk
 
 import kotlinx.coroutines.flow.StateFlow
 
+/** Latest direct connection attempt, using System.nanoTime(). Null means unobserved.
+ * Compare retry wait, handshake, first message, and first accepted price separately.
+ * This does not measure OS network availability; correlate with app connectivity callbacks. */
+public data class MarketConnectionTiming(
+    val attemptAtNanos: Long? = null,
+    val openedAtNanos: Long? = null,
+    val firstMessageAtNanos: Long? = null,
+    val firstPriceAtNanos: Long? = null,
+    val lastRetryScheduledAtNanos: Long? = null,
+    val lastRetryDelayMs: Long? = null,
+)
+
 /** Cumulative counters for one SDK client lifetime. Payload bytes exclude TLS/framing;
  * Arca bytes cover its shared socket. Routed interested quote counts are not venue latency,
  * price movement or GPU presentation. No per-market identifiers. */
@@ -24,6 +36,7 @@ public data class MarketDataDiagnostics(
     val hyperliquidFailures: Long = 0,
     val arcaPayloadBytes: Long = 0,
     val hyperliquidPayloadBytes: Long = 0,
+    val hyperliquidConnection: MarketConnectionTiming = MarketConnectionTiming(),
 )
 
 internal class MarketDataDiagnosticsRecorder {
@@ -32,7 +45,32 @@ internal class MarketDataDiagnosticsRecorder {
     private val serving = mutableMapOf<String, Boolean>()
     private var failedAtMs: Long? = null
     fun retain(interests: Set<String>) { serving.keys.retainAll(interests) }
-    fun suspend() { failedAtMs = null }
+    fun suspend() { failedAtMs = null; counters = counters.copy(hyperliquidConnection = MarketConnectionTiming()) }
+    fun connection(update: PublicMarketUpdate.Connection) {
+        val old = counters.hyperliquidConnection
+        val start = update.attemptAtNanos ?: return
+        if (old.attemptAtNanos != null && start < old.attemptAtNanos) return
+        if (old.attemptAtNanos == start && (update.openedAtNanos == null || update.openedAtNanos == old.openedAtNanos) && update.retryAtNanos == null) return
+        val next = if (old.attemptAtNanos == start) old else MarketConnectionTiming(attemptAtNanos = start,
+            firstMessageAtNanos = old.firstMessageAtNanos?.takeIf { it >= start }, firstPriceAtNanos = old.firstPriceAtNanos?.takeIf { it >= start },
+            lastRetryScheduledAtNanos = old.lastRetryScheduledAtNanos, lastRetryDelayMs = old.lastRetryDelayMs)
+        counters = counters.copy(hyperliquidConnection = next.copy(
+            openedAtNanos = update.openedAtNanos ?: next.openedAtNanos,
+            lastRetryScheduledAtNanos = update.retryAtNanos ?: next.lastRetryScheduledAtNanos,
+            lastRetryDelayMs = update.retryDelayMs ?: next.lastRetryDelayMs))
+    }
+    fun response(at: Long): Boolean {
+        val t = counters.hyperliquidConnection
+        if (t.firstMessageAtNanos != null) return false
+        counters = counters.copy(hyperliquidConnection = t.copy(firstMessageAtNanos = at))
+        return true
+    }
+    fun acceptedPrice(at: Long): Boolean {
+        val t = counters.hyperliquidConnection
+        if (t.firstPriceAtNanos != null) return false
+        counters = counters.copy(hyperliquidConnection = t.copy(firstPriceAtNanos = at))
+        return true
+    }
     fun connected(connected: Boolean) {
         counters = counters.copy(arcaConnected = connected, arcaDisconnects = counters.arcaDisconnects + if (counters.arcaConnected && !connected) 1 else 0)
     }

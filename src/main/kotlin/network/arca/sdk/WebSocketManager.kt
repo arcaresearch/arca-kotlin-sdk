@@ -9,6 +9,8 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -141,6 +143,37 @@ public class WebSocketManager internal constructor(
     private var midsAllRefs = 0
     private var midsExchange = "sim"
 
+    private data class PriceDeliveryObserver(val recorder: PriceDeliveryRecorder, val updates: MutableStateFlow<Map<String, PriceDeliveryDiagnostic>>)
+    private val priceDeliveryObservers = mutableMapOf<String, PriceDeliveryObserver>()
+    public fun watchPriceDeliveryDiagnostics(markets: Set<String>): Flow<Map<String, PriceDeliveryDiagnostic>> {
+        val scopeMarkets = markets.toSet()
+        PriceDeliveryRecorder(scopeMarkets) // validate before collection
+        return flow {
+            val id = UUID.randomUUID().toString()
+            val observer = PriceDeliveryObserver(PriceDeliveryRecorder(scopeMarkets), MutableStateFlow(emptyMap()))
+            lock.withLock { priceDeliveryObservers[id] = observer }
+            try { emitAll(observer.updates) } finally { lock.withLock { priceDeliveryObservers.remove(id) } }
+        }
+    }
+    private fun stagePriceDelivery(prices: Map<String, String>, source: MarketDataPreference, received: Long, venue: Long? = null) {
+        if (priceDeliveryObservers.isEmpty()) return
+        val changed = prices.filter { (market, price) ->
+            val queued = if (source == MarketDataPreference.HYPERLIQUID) pendingPublicPrices[market] else null
+            price != (queued ?: retainedMids?.get(market))
+        }
+        priceDeliveryObservers.values.forEach { it.recorder.stage(changed, source, received, venue) }
+    }
+    private fun publishPriceDeliveryDiagnostics(prices: Map<String, String>?, committed: Set<String> = emptySet()) {
+        if (priceDeliveryObservers.isEmpty()) return
+        val now = System.nanoTime()
+        priceDeliveryObservers.values.forEach { observer ->
+            if (prices == null) { observer.recorder.clear(); observer.updates.value = emptyMap() }
+            else observer.recorder.publish(prices, now, committed)?.let { observer.updates.value = it }
+        }
+    }
+    private fun clearDirectReceiptPending(keep: Set<String> = emptySet()) {
+        priceDeliveryObservers.values.forEach { it.recorder.clearDirectPending(keep) }
+    }
     // Latest merged mid prices, held while the mids subscription is live.
     //
     // The server answers each `subscribe_mids` with one `mids.snapshot`, and
@@ -153,6 +186,7 @@ public class WebSocketManager internal constructor(
     private var retainedMids: Map<String, String>? = null
         set(value) {
             field = value
+            if (value == null) publishPriceDeliveryDiagnostics(null)
             // Conflate full merged snapshots, never sparse deltas. Clearing
             // retention also clears replay for a later subscription lifetime.
             midsSnapshots.value = MidsSnapshot(midsSnapshots.value.revision + 1, value)
@@ -163,7 +197,7 @@ public class WebSocketManager internal constructor(
     private var publicFlushJob: Job? = null
     private var lastPublicFlushNs = 0L
     private var publicBatchEpoch = 0L
-    private fun clearPublicPrices() { ++publicBatchEpoch; publicFlushJob?.cancel(); publicFlushJob = null; pendingPublicPrices.clear() }
+    private fun clearPublicPrices() { ++publicBatchEpoch; publicFlushJob?.cancel(); publicFlushJob = null; pendingPublicPrices.clear(); clearDirectReceiptPending() }
     private fun queuePublicPrices(mids: Map<String, String>) {
         mids.forEach { (market, price) ->
             if (price != (pendingPublicPrices[market] ?: retainedMids?.get(market))) pendingPublicPrices[market] = price
@@ -185,11 +219,14 @@ public class WebSocketManager internal constructor(
         val mids = pendingPublicPrices.filter { (market, price) -> retainedMids?.get(market) != price }; pendingPublicPrices.clear()
         if (mids.isNotEmpty()) {
             lastPublicFlushNs = System.nanoTime()
-            retainedMids = (retainedMids ?: emptyMap()) + mids
+            val merged = (retainedMids ?: emptyMap()) + mids
+            publishPriceDeliveryDiagnostics(merged, mids.keys)
+            retainedMids = merged
             marketDataRecorder.prices(mids, true, marketDataRouter.priceInterestMarkets)
             publishMarketDiagnostics()
             emit(RealmEvent(type = "mids.updated", mids = mids))
         }
+        clearDirectReceiptPending()
     }
     private val marketDataRecorder = MarketDataDiagnosticsRecorder()
     private val diagnosticUpdates = MutableStateFlow(MarketDataDiagnostics())
@@ -264,40 +301,58 @@ public class WebSocketManager internal constructor(
         marketDataRecorder.retain(marketDataRouter.priceInterestMarkets)
         val subscriptions = marketDataRouter.subscriptions
         pendingPublicPrices.keys.retainAll(marketDataRouter.directCoverageMarkets)
+        clearDirectReceiptPending(marketDataRouter.directCoverageMarkets)
         if (publicSuspended || subscriptions.isEmpty()) { stopPublicSourceLocked(); return }
         if (publicSource == null) {
             val epoch = ++publicSourceEpoch
-            publicSource = publicSourceFactory(publicNetwork.websocketUrl) { connection, update ->
+            publicSource = publicSourceFactory(publicNetwork.websocketUrl) { connection, incoming ->
+                val received = (incoming as? PublicMarketUpdate.Received)?.atNanos ?: System.nanoTime()
+                val update = (incoming as? PublicMarketUpdate.Received)?.update ?: incoming
                 lock.withLock {
                     if (epoch != publicSourceEpoch || connection < publicConnectionEpoch) return@withLock
                     publicConnectionEpoch = connection
+                    if (incoming is PublicMarketUpdate.Received && incoming.attemptAtNanos != null) {
+                        marketDataRecorder.connection(PublicMarketUpdate.Connection(incoming.attemptAtNanos, incoming.openedAtNanos))
+                    }
+                    if (update is PublicMarketUpdate.Connection) {
+                        marketDataRecorder.connection(update); publishMarketDiagnostics(true); return@withLock
+                    }
                     if (update is PublicMarketUpdate.Traffic) {
-                        marketDataRecorder.bytes(update.bytes, true); publishMarketDiagnostics(); return@withLock
+                        val firstResponse = marketDataRecorder.response(received)
+                        marketDataRecorder.bytes(update.bytes, true); publishMarketDiagnostics(firstResponse); return@withLock
                     }
                     if (update is PublicMarketUpdate.Unavailable) {
                         marketDataRecorder.failure()
                         clearPublicPrices()
                         log.warning("market-data") { update.reason }
                     }
+                    var firstPrice = false
                     val before = marketDataRouter.subscriptions
                     marketDataRouter.direct(update, System.currentTimeMillis(), System.nanoTime() / 1_000_000)?.let { event ->
                         marketDataRecorder.recovered()
-                        if (event.mids != null) queuePublicPrices(event.mids) else { marketDataRecorder.candle(true); emit(event) }
+                        if (event.mids != null) {
+                            firstPrice = marketDataRecorder.acceptedPrice(received)
+                            stagePriceDelivery(event.mids, MarketDataPreference.HYPERLIQUID, received, (update as? PublicMarketUpdate.Quote)?.timeMs)
+                            queuePublicPrices(event.mids)
+                        } else { marketDataRecorder.candle(true); emit(event) }
                     }
                     if (before != marketDataRouter.subscriptions) syncPublicSourceLocked(arca = false)
-                    publishMarketDiagnostics(update is PublicMarketUpdate.Unavailable)
+                    publishMarketDiagnostics(firstPrice || update is PublicMarketUpdate.Unavailable)
                 }
             }
         }
         publicSource?.subscribe(subscriptions)
         publishMarketDiagnostics(true)
     }
-    private fun emitArcaMarketEvent(event: RealmEvent, snapshot: Boolean = false) = lock.withLock {
+    private fun emitArcaMarketEvent(event: RealmEvent, snapshot: Boolean = false, received: Long = System.nanoTime()) = lock.withLock {
         if (event.type == EventType.MIDS_UPDATED.wire && event.mids != null) {
             val mids = marketDataRouter.arcaPrices(event.mids)
             if (snapshot || mids.isNotEmpty()) {
-                retainedMids = if (snapshot) mids + (retainedMids ?: emptyMap()).filterKeys { it in marketDataRouter.status().directPriceMarkets }
+                stagePriceDelivery(mids, MarketDataPreference.ARCA, received)
+                val merged = if (snapshot) mids + (retainedMids ?: emptyMap()).filterKeys { it in marketDataRouter.status().directPriceMarkets }
                     else (retainedMids ?: emptyMap()) + mids
+                publishPriceDeliveryDiagnostics(merged, mids.keys)
+                retainedMids = merged
                 marketDataRecorder.prices(mids, false, marketDataRouter.priceInterestMarkets)
                 publishMarketDiagnostics()
                 emit(event.copy(mids = mids))
@@ -1565,7 +1620,7 @@ public class WebSocketManager internal constructor(
         }
     }
 
-    private fun handleMessage(text: String) {
+    private fun handleMessage(text: String, received: Long = System.nanoTime()) {
         lock.withLock { marketDataRecorder.bytes(text.toByteArray(Charsets.UTF_8).size, false); publishMarketDiagnostics() }
         lastMessageAtMs = System.currentTimeMillis()
         val obj = runCatching { arcaJson.parseToJsonElement(text).jsonObject }.getOrNull()
@@ -1604,7 +1659,7 @@ public class WebSocketManager internal constructor(
                     // A snapshot is the authoritative current state for
                     // whatever the socket is subscribed to, so it replaces the
                     // retained map rather than merging into it.
-                    emitArcaMarketEvent(RealmEvent(type = EventType.MIDS_UPDATED.wire, mids = mids), snapshot = true)
+                    emitArcaMarketEvent(RealmEvent(type = EventType.MIDS_UPDATED.wire, mids = mids), snapshot = true, received = received)
                     return
                 }
                 "candles.updated" -> {
@@ -1639,7 +1694,7 @@ public class WebSocketManager internal constructor(
         }
 
         runCatching { arcaJson.decodeFromString(RealmEvent.serializer(), text) }.getOrNull()?.let { event ->
-            emitArcaMarketEvent(event)
+            emitArcaMarketEvent(event, received = received)
         }
     }
 
@@ -2270,11 +2325,12 @@ public class WebSocketManager internal constructor(
      */
     private inner class SocketListener : WebSocketListener() {
         override fun onMessage(webSocket: WebSocket, text: String) {
-            route(webSocket, text)
+            route(webSocket, text, System.nanoTime())
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            route(webSocket, bytes.utf8())
+            val received = System.nanoTime()
+            route(webSocket, bytes.utf8(), received)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -2302,9 +2358,9 @@ public class WebSocketManager internal constructor(
             }
         }
 
-        private fun route(socket: WebSocket, text: String) {
+        private fun route(socket: WebSocket, text: String, received: Long) {
             when {
-                this@WebSocketManager.webSocket === socket -> handleMessage(text)
+                this@WebSocketManager.webSocket === socket -> handleMessage(text, received)
                 handoffWebSocket === socket -> handleWarmingMessage(socket, text)
             }
         }
