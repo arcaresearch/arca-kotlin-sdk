@@ -1,5 +1,15 @@
 # Arca Kotlin SDK — AI Context
 
+## Hyperliquid order response compatibility
+
+Account snapshots, order lists and individual-order reads use canonical
+`MARKET`/`LIMIT` order types and uppercase time-in-force values. Regular open
+orders report `OPEN`; waiting stop-loss/take-profit orders report
+`WAITING_FOR_TRIGGER`. For a trigger whose venue response omits TIF, Arca
+reports `GTC` for its lifetime; execution still follows `isMarket`. Preserve
+`isTrigger`, `triggerPx`, and `tpsl`. This server correction works with existing
+SDK versions and does not change the order at the venue.
+
 > com.github.arcaresearch:arca-kotlin-sdk — Kotlin/Android SDK for the Arca
 > financial infrastructure platform (accounts, payments, perpetuals trading,
 > real-time streaming, audit trails). Hand-written port of the Swift SDK; full
