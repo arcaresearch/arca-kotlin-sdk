@@ -342,7 +342,11 @@ the linked source would forward: active (allowance > 0, consent signed under the
 account's current permission version, no recovery); needs_approval (the owner must
 re-approve); needs_attention (recovery started; re-approving cannot help); off (no
 route). Source money behind an inactive route makes walletState needs_attention with
-reason auto_deposit_inactive. awaiting_approval and uncertain are states the
+reason auto_deposit_inactive. Behind an active route, autoDeposit.heldMicro and
+heldReason (below_minimum, cash_limit, link_revoked) are what the link's limits
+keep at the source; balances.pendingInMicro counts only what will be forwarded.
+DepositLink.limits carries maxDepositMicro, minDepositMicro, maxCashMicro and
+allowanceMicro. awaiting_approval and uncertain are states the
 PRODUCT layer adds from its own records.
 
 `walletAccountEvents(boundaryId)` delivers a COMPLETE WalletAccount on connect and

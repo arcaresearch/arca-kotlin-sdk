@@ -117,8 +117,14 @@ public data class DepositLinkConsent(
     val deadline: Long,
 )
 
+/** Arrivals below [minDepositMicro] stay at the source until they add up to it. */
 @Serializable
-public data class DepositLinkLimits(val allowanceMicro: String? = null)
+public data class DepositLinkLimits(
+    val maxDepositMicro: String? = null,
+    val minDepositMicro: String? = null,
+    val maxCashMicro: String? = null,
+    val allowanceMicro: String? = null,
+)
 
 @Serializable
 public data class DepositRouteAsOf(val block: Long, val hash: String? = null, val time: String? = null)

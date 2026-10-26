@@ -5,6 +5,7 @@ import network.arca.sdk.internal.arcaJson
 import network.arca.sdk.models.ArcaObjectDetailResponse
 import network.arca.sdk.models.ArcaObjectType
 import network.arca.sdk.models.DeltaType
+import network.arca.sdk.models.DepositLink
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
@@ -52,6 +53,28 @@ class ProviderModelTest {
         assertEquals("opr_1", link.operations.revokeOperationId)
         assertEquals("revoke_in_flight", link.progress)
         assertNull(link.consent)
+    }
+
+    /**
+     * The link's standing limits were dropped on decode: only the allowance
+     * survived, so an app could not show the minimum that holds dust.
+     */
+    @Test
+    fun depositLinkLimitsKeepEveryStandingLimit() {
+        val json = """
+        {"id":"dlk_1","realmId":"rlm_1",
+         "source":{"objectId":"obj_p","path":"/users/a/privy","walletId":"pwl_a","address":"0xA"},
+         "destination":{"objectId":"obj_c","path":"/users/a/cash","boundaryId":"0xb","account":{"kernel":"0xk","venue":"0xv","localId":"0xl"}},
+         "chainId":"999","token":"0xt","adapter":{"address":"0xad","kind":"cash_autodeposit_v1"},
+         "requested":{"state":"active","at":"t"},"lifetime":"until_revoked_or_invalidated","consent":null,
+         "limits":{"maxDepositMicro":"1000000000","minDepositMicro":"5000000","maxCashMicro":"10000000000","allowanceMicro":"1"},
+         "observed":{"status":"active","matchesDestination":true},"operations":{},"progress":"in_sync","createdAt":"t","updatedAt":"t"}
+        """.trimIndent()
+        val limits = arcaJson.decodeFromString<DepositLink>(json).limits!!
+        assertEquals("1000000000", limits.maxDepositMicro)
+        assertEquals("5000000", limits.minDepositMicro)
+        assertEquals("10000000000", limits.maxCashMicro)
+        assertEquals("1", limits.allowanceMicro)
     }
 
     @Test
