@@ -38,10 +38,12 @@ public data class WalletBalances(
 /**
  * The external address linked to the wallet, as the address observer
  * projects it. [balanceMicro] is null when the projection has no baseline —
- * never "0" as a stand-in for unknown.
+ * never "0" as a stand-in for unknown. [accounting] is true when Arca's
+ * executor sweeps this source (an Arca-owned accounting source).
  */
 @Serializable
 public data class WalletSource(
+    val accounting: Boolean? = null,
     val address: String,
     val balanceMicro: String? = null,
     val health: String,
@@ -53,16 +55,24 @@ public data class WalletSource(
  * The automatic-deposit route and USDC allowance of the linked source on the
  * adapter, as observed on chain. [routeId] is absent when [state] is `off`;
  * [allowanceMicro] is absent only when no baseline has been read.
+ * [heldMicro] is source money an active route will not forward now and
+ * [heldReason] says why; both are absent when nothing is held. Held money is
+ * not part of `balances.pendingInMicro`.
  */
 @Serializable
 public data class WalletAutoDeposit(
     val state: String,
     val routeId: String? = null,
     val allowanceMicro: String? = null,
+    val heldMicro: String? = null,
+    val heldReason: String? = null,
     val asOf: WalletAsOf,
 ) {
     /** The typed state, or null for a value this SDK does not know. */
     val typedState: AutoDepositState? get() = AutoDepositState.fromWire(state)
+
+    /** The typed held reason, or null when nothing is held or the value is unknown. */
+    val typedHeldReason: AutoDepositHeldReason? get() = heldReason?.let { AutoDepositHeldReason.fromWire(it) }
 }
 
 /** One owner-started operation in the closed vocabulary. */
@@ -177,6 +187,7 @@ public enum class WalletFailureReason(public val wire: String) {
     DESTINATION_REFUSED("destination_refused"),
     RECOVERY_STARTED("recovery_started"),
     CANCELLED("cancelled"),
+    SOURCE_CHANGED("source_changed"),
     UNKNOWN("unknown");
 
     public companion object {
@@ -193,5 +204,16 @@ public enum class AutoDepositState(public val wire: String) {
 
     public companion object {
         public fun fromWire(value: String): AutoDepositState? = entries.firstOrNull { it.wire == value }
+    }
+}
+
+/** `autoDeposit.heldReason` values. */
+public enum class AutoDepositHeldReason(public val wire: String) {
+    BELOW_MINIMUM("below_minimum"),
+    CASH_LIMIT("cash_limit"),
+    LINK_REVOKED("link_revoked");
+
+    public companion object {
+        public fun fromWire(value: String): AutoDepositHeldReason? = entries.firstOrNull { it.wire == value }
     }
 }

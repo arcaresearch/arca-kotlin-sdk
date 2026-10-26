@@ -17,6 +17,7 @@ import network.arca.sdk.internal.SseBackoff
 import network.arca.sdk.internal.SseFrame
 import network.arca.sdk.internal.SseParser
 import network.arca.sdk.internal.arcaJson
+import network.arca.sdk.models.AutoDepositHeldReason
 import network.arca.sdk.models.AutoDepositState
 import network.arca.sdk.models.WalletAccount
 import network.arca.sdk.models.WalletFailureReason
@@ -85,6 +86,7 @@ class WalletAccountTest {
         assertEquals(set("operationStates"), WalletOperationState.entries.map { it.wire })
         assertEquals(set("reasons"), WalletFailureReason.entries.map { it.wire })
         assertEquals(set("autoDepositStates"), AutoDepositState.entries.map { it.wire })
+        assertEquals(set("autoDepositHeldReasons"), AutoDepositHeldReason.entries.map { it.wire })
         val attention = set("attention")
         val kinds = set("operationKinds")
 
@@ -116,6 +118,10 @@ class WalletAccountTest {
                 assertNotNull(auto.typedState, "${file.name}: autoDeposit state ${auto.state}")
                 autoDepositSeen += auto.state
                 if (auto.state == AutoDepositState.OFF.wire) assertNull(auto.routeId, file.name) else assertNotNull(auto.routeId, file.name)
+                auto.heldReason?.let { reason ->
+                    assertNotNull(auto.typedHeldReason, "${file.name}: heldReason $reason")
+                    assertNotNull(auto.heldMicro?.toLongOrNull(), "${file.name}: heldReason without an integer heldMicro")
+                }
             }
             listOf(account.balances.confirmedMicro, account.balances.availableMicro, account.balances.reservedMicro, account.balances.pendingInMicro, account.balances.pendingOutMicro)
                 .forEach { assertNotNull(it.toLongOrNull(), "${file.name}: balance $it") }
