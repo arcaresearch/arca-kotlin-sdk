@@ -1,5 +1,9 @@
 # Arca Kotlin SDK — AI Context
 
+## Trading payments to another owner’s Cash
+
+After the corresponding platform deployment, `trading_to_cash` may name another owner’s Cash object with `fromArcaId`/`toArcaId`; omit the external `recipient` field. Cross-owner movement requires sender consent before staging and the matched Cash custody leg before credit. Clients declare and verify `arca.kernel.v9.Move/trading_cash_account` (signing registry revision 5), including exact source, recipient Cash identity, amount, nonce and deadline. Same-owner policy transfers retain their existing authorization. Pending cross-owner operations belong to the sender’s wallet projection.
+
 ## Hyperliquid order response compatibility
 
 Account snapshots, order lists and individual-order reads use canonical
