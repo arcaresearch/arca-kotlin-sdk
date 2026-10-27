@@ -594,3 +594,16 @@ marketDataDiagnostics.hyperliquidConnection retains latest attemptAtNanos, actua
 ## Network restoration hint (2.16.0)
 
 `arca.notifyMarketDataNetworkAvailable()` is an event-driven hint from restored validated default connectivity. Only an already-pending public Hyperliquid retry is advanced to 250–499 ms jitter; it never postpones an earlier deadline. At most one advancement per 30 seconds per source. It preserves exponential failure backoff, healthy/in-flight connections, subscription ownership, and stopped/background source retirement. It does not reconnect the authenticated Arca transport or guarantee server reachability/freshness. No polling or new network watch is required.
+
+## Historical candle coverage (requires matching backend deployment)
+
+`candleHistory.earliestMs` is the earliest stored daily row, not a registry listing year.
+`hlEarliestMs` includes only recognized native provenance; zero means none is known.
+Negative epoch milliseconds are valid. These bounds do not prove uninterrupted coverage.
+For All/Max, traverse bounded daily windows to the observed lower bound, retain source
+metadata, keep reference sessions entirely before native coverage, and maintain the live
+SDK chart subscription separately. Explicit REST `1d` windows of at most 1,500 days with
+`skipBackfill=true` read durable storage and return an error when it is unavailable.
+CDN-enabled SDK reads can bypass REST; archive reconciliation must use a REST-only
+configuration. Do not interpret a failed page or an unknown bound as end-of-history.
+Historical CDN files published before the source-preserving worker fix may need repair.
