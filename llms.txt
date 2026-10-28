@@ -1,5 +1,20 @@
 # Arca Kotlin SDK — AI Context
 
+## Deposits arriving on Cash
+
+After the corresponding platform deployment, a deposit a provider confirmed
+(or a client claimed) shows as an `EXPECTED` arriving leg on Cash as well as
+on trading accounts, from the moment the signal reaches Arca (for Apple Pay
+through Stripe, seconds after payment). Once on chain it leaves the expected
+leg and is Cash's `IN_TRANSIT` pending-in leg alone, so it is counted once.
+The leg's counterparty is `MoneyCounterparty.External`; the snapshot's
+`from.kind` names the pathway (`stripe`, `coinbase`, `unifold`, `blink`,
+`external`) for a caption. Declared, lapsed and merged deposits are never
+listed. `WalletMoney.compose` needs no change: never add expected money to a
+figure, and never derive "arriving" from provider callbacks in the app.
+Product backends announce deposits with
+`POST /custody/v9/funding/deposit-signals` (TypeScript and Go SDKs).
+
 ## V9 exchange capabilities before authorization
 
 After the corresponding platform deployment, `GET /objects/{id}/exchange/capabilities`
@@ -12,6 +27,15 @@ Keep confirmed capabilities account-scoped and reject late responses after switc
 ## Trading payments to another owner’s Cash
 
 After the corresponding platform deployment, `trading_to_cash` may name another owner’s Cash object with `fromArcaId`/`toArcaId`; omit the external `recipient` field. Cross-owner movement requires sender consent before staging and the matched Cash custody leg before credit. Clients declare and verify `arca.kernel.v9.Move/trading_cash_account` (signing registry revision 5), including exact source, recipient Cash identity, amount, nonce and deadline. Same-owner policy transfers retain their existing authorization. Pending cross-owner operations belong to the sender’s wallet projection.
+
+## Cash setup readiness
+
+Wallet Account stays `setting_up` until the preferred deposit receiver is
+active, including the gap after account creation and before receiver admission.
+Follow wallet snapshots for readiness; account creation alone is insufficient.
+Pending creation and receiver setup process every streamed chain head; the
+realm's configured confirmation depth and settlement checks still apply.
+This correction requires the corresponding platform deployment.
 
 ## Hyperliquid order response compatibility
 

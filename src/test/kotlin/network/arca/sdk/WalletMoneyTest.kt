@@ -85,7 +85,7 @@ class WalletMoneyTest {
     fun everyFrameDecodesAsSchemaTwoWithItsFigures() {
         assumeTrue(fixturesDirectory.isDirectory, "fixtures not present at ${fixturesDirectory.absolutePath}")
         val files = fixturesDirectory.listFiles { f -> f.name.endsWith(".json") }!!.sortedBy { it.name }
-        assertTrue(files.size >= 17, "fixture set shrank: ${files.size}")
+        assertTrue(files.size >= 19, "fixture set shrank: ${files.size}")
         for (file in files) {
             val snapshot = try {
                 arcaJson.decodeFromString(WalletSnapshot.serializer(), file.readText())
@@ -206,6 +206,23 @@ class WalletMoneyTest {
         assertEquals("0", figure.arrivingMicro, "expected money is listed, never counted")
         assertFalse(figure.inMotion)
         assertEquals("30920000", money.total.settledMicro)
+    }
+
+    @Test
+    fun cashDepositIsExpectedThenCountedOnceAsPendingIn() {
+        val expected = WalletMoney.compose(fixture("17-cash-deposit-expected"))
+        val leg = expected.cash.arriving.single()
+        assertEquals(MoneyLegStage.EXPECTED, leg.stage)
+        assertEquals(MoneyCounterparty.External(null), leg.counterparty)
+        assertEquals("3000000", expected.cash.expectedMicro)
+        assertEquals("0", expected.cash.arrivingMicro, "expected money is listed, never counted")
+        assertFalse(expected.cash.inMotion)
+        assertEquals("30920000", expected.total.settledMicro)
+        val onChain = WalletMoney.compose(fixture("18-cash-deposit-pending-in"), expected)
+        assertEquals(listOf("3000000:in_transit"), onChain.cash.arriving.map { "${it.amountMicro}:${it.stage.wire}" }, "on chain, the deposit is Cash's pending figure alone")
+        assertEquals("0", onChain.cash.expectedMicro)
+        assertEquals(listOf("3000000"), onChain.total.arriving.map { it.amountMicro })
+        assertEquals("30920000", onChain.total.settledMicro)
     }
 
     @Test
