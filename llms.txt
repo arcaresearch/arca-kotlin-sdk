@@ -619,3 +619,15 @@ SDK chart subscription separately. Explicit REST `1d` windows of at most 1,500 d
 CDN-enabled SDK reads can bypass REST; archive reconciliation must use a REST-only
 configuration. Do not interpret a failed page or an unknown bound as end-of-history.
 Historical CDN files published before the source-preserving worker fix may need repair.
+
+## Trading exits from unified collateral (requires matching platform deployment)
+
+Trading-to-Cash and external-send quotes include native-perps withdrawable USDC
+plus free spot USDC (total minus hold), less activation/network fee allowance.
+A zero perps balance does not imply a zero maximum. The server exports existing
+free spot first and stages only the shortfall; admitted routes remain pinned on
+retry. Advisory wallet route previews use stored subscription balances. Binding
+quotes and initial dispatch validate positioned chain evidence; unavailable
+evidence is an error, never a zero balance. Settlement books actual fees and
+updates both collateral compartments before crediting Cash. No SDK upgrade is
+required. Trading-to-trading retains its native-perps route.
