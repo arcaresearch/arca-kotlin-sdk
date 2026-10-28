@@ -325,7 +325,9 @@ id, a path outside the credential's scope) and never closes the socket; an
 error that names a `requestId` fails only that request. The server answers a
 create within 8 s: one it cannot finish in time, or one past 16 outstanding on
 the connection, comes back as such an error rather than as a silent client-side
-timeout. The reconnect backoff
+timeout. `watchProjection` creates and scope updates follow the same rule and
+count toward the same 16; updates of one watch apply in the order sent. The
+reconnect backoff
 (1 s doubling to 30 s) resets only after a
 connection has stayed up for 30 s, `ws.ensureConnected()` does not cut a
 pending backoff short, and returning to the foreground reconnects at once
