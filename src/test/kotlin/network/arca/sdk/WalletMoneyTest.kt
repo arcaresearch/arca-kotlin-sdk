@@ -56,6 +56,24 @@ import java.util.concurrent.TimeUnit
  */
 class WalletMoneyTest {
 
+    @Test fun personSendDoesNotArriveInSendersCash() {
+        var previous: WalletMoney? = null
+        for (name in listOf("19-person-send-reserved", "20-person-send-in-transit", "21-person-send-paid")) {
+            val money = WalletMoney.compose(fixture(name), previous = previous)
+            assertTrue(money.cash.arriving.isEmpty() && money.cash.departing.isEmpty(), name)
+            assertNull(money.cash.change, "A recipient credit never changes sender Cash")
+            if (name != "21-person-send-paid") {
+                assertEquals(1, money.total.departing.size, name)
+                assertEquals(1, money.account(hl1)?.departing?.size, name)
+                assertEquals(MoneyCounterparty.External("0xabcabcabcabcabcabcabcabcabcabcabcabcabca"), money.total.departing.first().counterparty)
+            } else {
+                assertTrue(money.total.departing.isEmpty())
+                assertEquals("succeeded", money.total.change?.operationStatus)
+            }
+            previous = money
+        }
+    }
+
     private lateinit var server: MockWebServer
 
     @BeforeEach

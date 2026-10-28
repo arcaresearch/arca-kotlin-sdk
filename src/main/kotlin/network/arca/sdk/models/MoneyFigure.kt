@@ -343,8 +343,13 @@ public data class WalletMoney(
         }
 
         internal fun counterparty(endpoint: WalletEndpoint, snapshot: WalletSnapshot): MoneyCounterparty {
-            if (endpoint.isCash || (endpoint.boundaryIdOrNull != null && endpoint.boundaryIdOrNull == snapshot.boundaryId && snapshot.boundaryId.isNotEmpty())) {
-                return MoneyCounterparty.Cash
+            if (endpoint.isCash) {
+                // Only an unqualified local-prediction sentinel implies this wallet.
+                val identities = listOf(endpoint.boundaryIdOrNull to snapshot.boundaryId,
+                    endpoint.arcaIdOrNull to snapshot.cashTarget.arcaIdOrNull,
+                    endpoint.arcaPath to snapshot.cashTarget.arcaPath)
+                val owned = identities.all { (value, expected) -> value.isNullOrEmpty() || (!expected.isNullOrEmpty() && value == expected) }
+                return if (owned) MoneyCounterparty.Cash else MoneyCounterparty.External(endpoint.addressOrNull)
             }
             endpoint.arcaIdOrNull?.let { arcaId ->
                 val account = snapshot.account(arcaId)

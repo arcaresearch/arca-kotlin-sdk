@@ -657,3 +657,7 @@ quotes and initial dispatch validate positioned chain evidence; unavailable
 evidence is an error, never a zero balance. Settlement books actual fees and
 updates both collateral compartments before crediting Cash. No SDK upgrade is
 required. Trading-to-trading retains its native-perps route.
+
+## Cash counterparty ownership
+
+A Cash endpoint belongs to this wallet only when every supplied boundaryId, arcaId and arcaPath matches its boundaryId/cashTarget. A different Cash identity is an external counterparty: a person send stays outgoing on the source and total, never arriving in the sender's Cash. An unqualified kind=cash remains the local-prediction sentinel.
