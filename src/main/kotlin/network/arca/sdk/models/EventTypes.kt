@@ -68,6 +68,17 @@ public enum class EventType(public val wire: String) {
     TWAP_COMPLETED("twap.completed"),
     TWAP_CANCELLED("twap.cancelled"),
     TWAP_FAILED("twap.failed"),
+
+    /**
+     * Fee-collector events, addressed to the collector arca's path: a
+     * referral reward booked from the venue's per-referred-user counter,
+     * the sweep's claim of the rewards bucket, and the sweep's settlement
+     * into the realm's treasury. Delivered as generic realm events with a
+     * `collector` payload.
+     */
+    COLLECTOR_REFERRAL_REWARD("collector.referral_reward"),
+    COLLECTOR_REWARDS_CLAIMED("collector.rewards_claimed"),
+    COLLECTOR_SWEPT("collector.swept"),
     ;
 
     public companion object {
