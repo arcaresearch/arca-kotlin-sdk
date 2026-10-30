@@ -141,9 +141,18 @@ public data class PnlPoint(
      */
     public val unflooredEquityUsd: String? = null,
     public val status: ChartPointStatus? = null,
+    /**
+     * The path's lifetime external inflows through this bucket. Null on
+     * SDK-built points (the live tip and boundary promotions).
+     */
     public val cumInflowsUsd: String? = null,
+    /** The path's lifetime external outflows through this bucket. */
     public val cumOutflowsUsd: String? = null,
-    /** Present when the chart is created with [PnlAnchor.EQUITY]. */
+    /**
+     * Present when the chart is created with [PnlAnchor.EQUITY]: the bucket's
+     * account value, [equityUsd], which moves with deposits and withdrawals.
+     * On the live point it is the current account equity.
+     */
     public var valueUsd: String? = null,
 )
 
@@ -152,7 +161,10 @@ public enum class PnlAnchor {
     /** Standard P&L chart starting at 0. */
     ZERO,
 
-    /** P&L shifted so the live value equals current account equity. */
+    /**
+     * Also set each point's `valueUsd` to its account value (`equityUsd`), so
+     * the live value is the current account equity.
+     */
     EQUITY,
 }
 
@@ -228,8 +240,39 @@ public data class EquityChartUpdate(
     public val points: List<EquityPoint>,
 )
 
+/**
+ * The history point a live P&L chart counts from: its `pnlUsd` is zero and
+ * every other point's `pnlUsd` is measured from it. Fixed for the life of a
+ * `watchPnlChart` stream, so a window that slides forward never moves the
+ * line.
+ *
+ * `startingEquityUsd − cumInflowsUsd + cumOutflowsUsd` is the account's
+ * flow-adjusted value at the baseline. Two streams opened at different times
+ * differ by exactly the difference of that quantity, which is how to join one
+ * stream's points onto another's.
+ */
+public data class PnlChartBaseline(
+    /** Timestamp of the baseline point. */
+    public val timestamp: String,
+    /** Equity at the baseline point (the unfloored value). */
+    public val startingEquityUsd: String,
+    /** The path's lifetime external inflows through the baseline point. Null on servers that predate it. */
+    public val cumInflowsUsd: String? = null,
+    /** The path's lifetime external outflows through the baseline point. */
+    public val cumOutflowsUsd: String? = null,
+)
+
 /** Emitted by a P&L-chart stream on each update. */
 public data class PnlChartUpdate(
     public val points: List<PnlPoint>,
     public val externalFlows: List<ExternalFlowEntry>,
+    /**
+     * The history point every `pnlUsd` in this update counts from — the
+     * historical buckets, the buckets the stream promotes at each boundary,
+     * and the live point alike. Fixed for the life of the stream: when a live
+     * window slides, refreshed history is re-derived onto it rather than
+     * counted from the new window start. Null until the stream has a history
+     * point to count from.
+     */
+    public val baseline: PnlChartBaseline? = null,
 )

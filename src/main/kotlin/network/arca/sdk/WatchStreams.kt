@@ -387,14 +387,24 @@ public class PnlChartStream internal constructor() : BaseWatchStream() {
     internal val chartMut: MutableStateFlow<List<network.arca.sdk.models.PnlPoint>> = MutableStateFlow(emptyList())
     internal val updatesMut: MutableSharedFlow<network.arca.sdk.models.PnlChartUpdate> = snapshotUpdatesFlow()
 
+    internal val baselineMut: MutableStateFlow<network.arca.sdk.models.PnlChartBaseline?> = MutableStateFlow(null)
+
     /** Current P&L chart points (historical + live tail). */
     public val chart: StateFlow<List<network.arca.sdk.models.PnlPoint>> get() = chartMut.asStateFlow()
+
+    /**
+     * The history point every `pnlUsd` on this stream counts from; see
+     * [network.arca.sdk.models.PnlChartUpdate.baseline]. Null until the stream
+     * has a history point to count from.
+     */
+    public val baseline: StateFlow<network.arca.sdk.models.PnlChartBaseline?> get() = baselineMut.asStateFlow()
 
     /** A stream of P&L chart updates. */
     public val updates: Flow<network.arca.sdk.models.PnlChartUpdate> get() = updatesMut.asSharedFlow()
 
     internal fun push(update: network.arca.sdk.models.PnlChartUpdate) {
         chartMut.value = update.points
+        baselineMut.value = update.baseline
         updatesMut.tryEmit(update)
     }
 }

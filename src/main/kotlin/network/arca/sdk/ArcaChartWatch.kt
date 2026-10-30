@@ -14,12 +14,13 @@ import network.arca.sdk.models.EquityHistoryResponse
 import network.arca.sdk.models.EquityPoint
 import network.arca.sdk.models.ExternalFlowEntry
 import network.arca.sdk.models.PnlAnchor
+import network.arca.sdk.models.PnlChartBaseline
 import network.arca.sdk.models.PnlChartUpdate
+import network.arca.sdk.models.PnlHistoryResponse
 import network.arca.sdk.models.PnlPoint
 import network.arca.sdk.models.applyEquityAnchor
 import java.time.Instant
 import java.time.OffsetDateTime
-import java.util.Locale
 import kotlin.math.abs
 
 // MARK: - Helpers
@@ -31,8 +32,6 @@ private fun parseInstantOrNull(s: String): Instant? =
 private fun parseDoubleOrZero(s: String?): Double = s?.toDoubleOrNull() ?: 0.0
 
 private fun parseDoubleOrNull(s: String?): Double? = s?.toDoubleOrNull()
-
-private fun formatUsd(value: Double): String = String.format(Locale.US, "%.2f", value)
 
 private fun nowEpochSeconds(): Long = Instant.now().epochSecond
 
@@ -325,8 +324,13 @@ public suspend fun Arca.watchEquityChart(
  * @param points Number of historical samples (default 1000, max 1000).
  * @param exchange Exchange identifier for mid prices (default `"sim"`).
  * @param anchor [PnlAnchor.ZERO] (default) for standard P&L; [PnlAnchor.EQUITY]
- *   to shift the chart so the live value equals current account equity (each
- *   point then carries `valueUsd`).
+ *   to also set each point's `valueUsd` to its account value (`equityUsd`), so
+ *   the live value is the current account equity.
+ *
+ * Every `pnlUsd` the stream emits counts from one fixed point,
+ * [PnlChartUpdate.baseline]: the first point of the opening history. When a
+ * live window slides, refreshed history is re-derived onto that baseline, so
+ * the line does not move.
  */
 public suspend fun Arca.watchPnlChart(
     path: String,
@@ -365,21 +369,17 @@ public suspend fun Arca.watchPnlChart(
 
     val history = getPnlHistory(path, from, to, points)
     ws.watchPath(path)
-    // `flowsSince` must align with the instant `startingEquityUsd` is
-    // measured at, or the live tick double-counts flows already baked into
-    // the anchor. The server anchors on the first point of the requested
-    // window and does not trim leading zero-equity points, so the window
-    // start IS the anchor instant. (This previously read a server
-    // `effectiveFrom` field for a trimming behaviour the consolidated read
-    // path does not implement and never emitted.)
-    val flowsSince = from
+    // `flowsSince` must name the instant `startingEquityUsd` is measured at,
+    // or the live tick subtracts a flow already inside it. That is the close
+    // of the first bucket, not the requested `from`.
+    val flowsSince = alignedFlowsSince(history, fallback = from)
     val aggStream = watchAggregation(
         sources = listOf(AggregationSource(type = AggregationSourceType.PREFIX, value = path)),
         exchange = exchange,
         flowsSince = flowsSince,
     )
 
-    val startingEquity = parseDoubleOrZero(history.startingEquityUsd)
+    var baseline: PnlChartBaseline? = pnlBaselineFrom(history.pnlPoints, history.startingEquityUsd)
 
     var cumInflows = 0.0
     var cumOutflows = 0.0
@@ -387,36 +387,47 @@ public suspend fun Arca.watchPnlChart(
         val v = parseDoubleOrZero(flow.valueUsd)
         if (flow.direction == "inflow") cumInflows += v else cumOutflows += v
     }
+    var flowInputs: List<String> = (history.externalFlows ?: emptyList()).map { it.valueUsd }
 
     var resolutionSeconds = chartResolutionSeconds(history.resolution)
     var hourBoundary = bucketBoundary(nowEpochSeconds(), resolutionSeconds)
 
     // Override the flow seed with server-provided cumulative flows from the
-    // initial aggregation snapshot (authoritative, covers from..now).
+    // initial aggregation snapshot (authoritative, covers flowsSince..now).
     aggStream.aggregation.value?.let { agg ->
         parseDoubleOrNull(agg.cumInflowsUsd)?.let { cumInflows = it }
         parseDoubleOrNull(agg.cumOutflowsUsd)?.let { cumOutflows = it }
+        if (agg.cumInflowsUsd != null || agg.cumOutflowsUsd != null) {
+            flowInputs = listOfNotNull(agg.cumInflowsUsd, agg.cumOutflowsUsd)
+        }
+    }
+
+    // Live P&L on the stream's baseline, at the precision of its inputs.
+    fun livePnl(equity: String?): String {
+        val start = baseline?.startingEquityUsd ?: history.startingEquityUsd
+        val pnl = parseDoubleOrZero(equity) - parseDoubleOrZero(start) - cumInflows + cumOutflows
+        return formatPnlUsd(pnl, listOf(equity, start) + flowInputs)
     }
 
     // Trim trailing points within the current time bucket so the server's live
     // tip doesn't create a discontinuity with the SDK's live (revalued) tip.
-    val trimmed = history.pnlPoints.toMutableList()
+    val trimmed = rebasePnlPoints(history.pnlPoints, baseline).toMutableList()
     while (trimmed.isNotEmpty()) {
         val ts = parseInstantOrNull(trimmed.last().timestamp) ?: break
         if (ts.epochSecond > hourBoundary) trimmed.removeAt(trimmed.size - 1) else break
     }
 
     var historical = trimmed.toMutableList()
+    var historyRevision = 0
+    var lastEmittedRevision = 0
     var flows: List<ExternalFlowEntry> = history.externalFlows ?: emptyList()
     var liveEquity: String? = aggStream.aggregation.value?.totalEquityUsd
     var lastAggAtMs = System.currentTimeMillis()
 
     var initialChart = trimmed.toMutableList()
     aggStream.aggregation.value?.let { agg ->
-        val liveEq = parseDoubleOrZero(agg.totalEquityUsd)
-        val pnl = liveEq - startingEquity - cumInflows + cumOutflows
         initialChart.add(
-            PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = formatUsd(pnl), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN),
+            PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = livePnl(agg.totalEquityUsd), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN),
         )
         if (anchor == PnlAnchor.EQUITY) initialChart = applyEquityAnchor(initialChart).toMutableList()
     }
@@ -424,6 +435,22 @@ public suspend fun Arca.watchPnlChart(
     val stream = PnlChartStream()
     stream.setState(WatchStreamState.CONNECTED)
     stream.chartMut.value = initialChart
+    stream.baselineMut.value = baseline
+
+    // Installs a refetched window as the chart's history; call with `mutex`
+    // held. A live window slides on every refresh, and the server counts the
+    // new window from its own first point; re-derive it onto the baseline this
+    // stream opened with, so the line never moves.
+    fun absorbHistoryLocked(fresh: PnlHistoryResponse): List<PnlPoint> {
+        resolutionSeconds = chartResolutionSeconds(fresh.resolution)
+        hourBoundary = bucketBoundary(nowEpochSeconds(), resolutionSeconds)
+        if (baseline == null) baseline = pnlBaselineFrom(fresh.pnlPoints, fresh.startingEquityUsd)
+        val filtered = rebasePnlPoints(fresh.pnlPoints, baseline).filter { it.status != ChartPointStatus.OPEN }
+        historical = filtered.toMutableList()
+        historyRevision++
+        flows = fresh.externalFlows ?: emptyList()
+        return filtered
+    }
 
     val chartWatchId = ws.watchChartHistory(path)
     val jobs = mutableListOf<Job>()
@@ -440,25 +467,17 @@ public suspend fun Arca.watchPnlChart(
         )
         historyCache.delete(key)
         val fresh = runCatching { getPnlHistory(path, w.first, w.second, points) }.getOrNull() ?: return
-        val allPoints: List<PnlPoint>
-        val flowsSnapshot: List<ExternalFlowEntry>
+        val update: PnlChartUpdate
         mutex.withLock {
-            resolutionSeconds = chartResolutionSeconds(fresh.resolution)
-            hourBoundary = bucketBoundary(nowEpochSeconds(), resolutionSeconds)
-            val filtered = fresh.pnlPoints.filter { it.status != ChartPointStatus.OPEN }
-            historical = filtered.toMutableList()
-            flows = fresh.externalFlows ?: emptyList()
-            flowsSnapshot = flows
-            var pts = filtered.toMutableList()
+            var pts = absorbHistoryLocked(fresh).toMutableList()
             aggStream.aggregation.value?.let { agg ->
-                val liveEq = parseDoubleOrZero(agg.totalEquityUsd)
-                val pnl = liveEq - startingEquity - cumInflows + cumOutflows
-                pts.add(PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = formatUsd(pnl), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN))
+                pts.add(PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = livePnl(agg.totalEquityUsd), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN))
             }
             if (anchor == PnlAnchor.EQUITY) pts = applyEquityAnchor(pts).toMutableList()
-            allPoints = pts
+            lastEmittedRevision = historyRevision
+            update = PnlChartUpdate(points = pts, externalFlows = flows, baseline = baseline)
         }
-        stream.push(PnlChartUpdate(points = allPoints, externalFlows = flowsSnapshot))
+        stream.push(update)
     }
 
     val gapId = ws.onGap {
@@ -474,12 +493,7 @@ public suspend fun Arca.watchPnlChart(
             )
             historyCache.delete(key)
             val fresh = runCatching { getPnlHistory(path, w.first, w.second, points) }.getOrNull() ?: return@launch
-            mutex.withLock {
-                resolutionSeconds = chartResolutionSeconds(fresh.resolution)
-                hourBoundary = bucketBoundary(nowEpochSeconds(), resolutionSeconds)
-                historical = fresh.pnlPoints.filter { it.status != ChartPointStatus.OPEN }.toMutableList()
-                flows = fresh.externalFlows ?: emptyList()
-            }
+            mutex.withLock { absorbHistoryLocked(fresh) }
         }
     }
 
@@ -493,8 +507,7 @@ public suspend fun Arca.watchPnlChart(
                 // so a boundary cross emits the value current right before the
                 // boundary (matching the TS PnlChartStream behaviour).
                 val previousLiveEquityStr = liveEquity
-                val previousLiveEquity = parseDoubleOrZero(previousLiveEquityStr ?: "0")
-                val previousLivePnl = previousLiveEquity - startingEquity - cumInflows + cumOutflows
+                val previousLivePnl = livePnl(previousLiveEquityStr)
 
                 val currentBoundary = bucketBoundary(nowEpochSeconds(), resolutionSeconds)
                 val lastBoundary = hourBoundary
@@ -508,35 +521,39 @@ public suspend fun Arca.watchPnlChart(
                         historical.add(
                             PnlPoint(
                                 timestamp = iso8601String(Instant.ofEpochSecond(lastBoundary)),
-                                pnlUsd = formatUsd(previousLivePnl),
+                                pnlUsd = previousLivePnl,
                                 equityUsd = previousLiveEquityStr,
                             ),
                         )
+                        historyRevision++
                         hourBoundary = currentBoundary
                     }
 
                     parseDoubleOrNull(agg.cumInflowsUsd)?.let { cumInflows = it }
                     parseDoubleOrNull(agg.cumOutflowsUsd)?.let { cumOutflows = it }
+                    if (agg.cumInflowsUsd != null || agg.cumOutflowsUsd != null) {
+                        flowInputs = listOfNotNull(agg.cumInflowsUsd, agg.cumOutflowsUsd)
+                    }
                     liveEquity = agg.totalEquityUsd
 
-                    val liveEq = parseDoubleOrZero(agg.totalEquityUsd)
-                    val pnl = liveEq - startingEquity - cumInflows + cumOutflows
                     var allPoints = historical.toMutableList().apply {
-                        add(PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = formatUsd(pnl), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN))
+                        add(PnlPoint(timestamp = iso8601String(Instant.now()), pnlUsd = livePnl(agg.totalEquityUsd), equityUsd = agg.totalEquityUsd, status = ChartPointStatus.OPEN))
                     }
                     if (anchor == PnlAnchor.EQUITY) allPoints = applyEquityAnchor(allPoints).toMutableList()
 
+                    // Sub-cent moves update `chart` without waking consumers.
                     val prevPoints = stream.chartMut.value
                     val isSameValue = if (anchor == PnlAnchor.EQUITY) {
-                        prevPoints.lastOrNull()?.valueUsd == allPoints.lastOrNull()?.valueUsd
+                        sameCents(prevPoints.lastOrNull()?.valueUsd, allPoints.lastOrNull()?.valueUsd)
                     } else {
-                        prevPoints.lastOrNull()?.pnlUsd == allPoints.lastOrNull()?.pnlUsd
+                        sameCents(prevPoints.lastOrNull()?.pnlUsd, allPoints.lastOrNull()?.pnlUsd)
                     }
 
-                    if (prevPoints.size == allPoints.size && isSameValue) {
+                    if (historyRevision == lastEmittedRevision && prevPoints.size == allPoints.size && isSameValue) {
                         stream.chartMut.value = allPoints
                     } else {
-                        emit = PnlChartUpdate(points = allPoints, externalFlows = flows)
+                        lastEmittedRevision = historyRevision
+                        emit = PnlChartUpdate(points = allPoints, externalFlows = flows, baseline = baseline)
                     }
                 }
             }

@@ -198,7 +198,7 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | — Fill trigger context | Fill.isTrigger (false = known regular order; null = unattributable — external trade/liquidation), Fill.tpsl "tp"\|"sl", Fill.triggerPx — decorated server-side, no per-fill order lookup needed. Liquidation fills carry Fill.liquidationKind "liquidation"\|"adl" (null on pre-stamp liquidations). |
 | arca.watchFunding(id) | Flow<Pair<FundingPayment, EventEnvelope>> |
 | arca.watchEquityChart(path, from, to) | StateFlow<List<EquityPoint>> + EquityChartUpdate |
-| arca.watchPnlChart(path, from, to) | StateFlow<List<PnlPoint>> + PnlChartUpdate |
+| arca.watchPnlChart(path, from, to) | StateFlow<List<PnlPoint>> + PnlChartUpdate + StateFlow<PnlChartBaseline?> baseline — every `pnlUsd` (history, boundary promotions, live tip) counts from one fixed baseline, the first point of the opening history; a sliding window's refreshed buckets are re-derived onto it from each point's lifetime `cumInflowsUsd`/`cumOutflowsUsd`, so a bucket never changes value when the window moves (do not realign by overlapping buckets). Live `pnlUsd` keeps its inputs' precision, so `equityUsd − pnlUsd` is exact. With `PnlAnchor.EQUITY`, `valueUsd` is each bucket's `equityUsd`. |
 | arca.watchCandleChart(market, interval, ...) | StateFlow<List<Candle>> + CandleChartUpdate |
 | arca.watchOI(coins, intervals) | Flow<OIEvent> (market, interval, bar, isClosed) |
 | arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> + StateFlow<MaxOrderSizePendingReason?> pendingReason |

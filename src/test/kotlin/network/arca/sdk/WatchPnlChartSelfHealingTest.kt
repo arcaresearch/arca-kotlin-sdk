@@ -103,7 +103,7 @@ class WatchPnlChartSelfHealingTest {
         // The boundary point must be built from the captured `previousLivePnl`,
         // not from the last historical point's pnl/equity.
         assertTrue(
-            pnlBody.contains("pnlUsd = formatUsd(previousLivePnl)"),
+            pnlBody.contains("pnlUsd = previousLivePnl,"),
             "watchPnlChart's boundary point must use the captured previousLivePnl — not a historical-tail copy — to avoid an off-by-one boundary value.",
         )
 
