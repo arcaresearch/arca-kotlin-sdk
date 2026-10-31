@@ -236,6 +236,12 @@ public data class ExchangeState(
      * [observedBefore]. Null from a platform that predates the field.
      */
     public val observedAt: String? = null,
+    /**
+     * "fold" when this state was computed by the platform's own Hyperliquid
+     * account fold from Arca's records rather than read from the venue;
+     * [observedAt] is then the fold's publication time. Null on a venue read.
+     */
+    public val stateSource: String? = null,
 )
 
 /**
