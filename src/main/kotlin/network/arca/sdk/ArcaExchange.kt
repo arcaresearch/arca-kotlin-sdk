@@ -83,11 +83,14 @@ import kotlin.math.roundToLong
  *   `resolveMarkets("BTC", exchange = "gllt")`, then use `market.name`. The
  *   symbol is the base asset (`"BTC"`), not the venue symbol
  *   (`"BTC-USD-PERP"`, which is `market.venueSymbol` and display text only).
- *   Leverage is fixed per market (10x on the crypto perps) and `setLeverage`
- *   refuses; there is no TP/SL or TWAP in v1. The book is SHARED and PUBLIC
- *   and the venue is a testnet its operator can reset without notice — both
- *   belong in user-facing copy. A one-time ~1 USDT activation fee is charged
- *   on first activity.
+ *   The venue account id is a 20-byte `0x` wallet address. Leverage is fixed
+ *   per market (10x on the crypto perps); `setLeverage` and `setMarginMode`
+ *   refuse, and margin mode is chosen per order instead. Post-only (`ALO`) is
+ *   supported, reduce-only must be IOC or a market order, and there is no
+ *   TP/SL or TWAP. The book is SHARED and PUBLIC and the venue is a testnet
+ *   its operator can reset without notice — both belong in user-facing copy.
+ *   The venue's one-time activation fee is paid on top of the first deposit,
+ *   so equity equals the amount deposited.
  * @param operationPath Optional idempotency key.
  */
 public fun Arca.ensurePerpsExchange(
