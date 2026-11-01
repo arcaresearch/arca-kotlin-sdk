@@ -211,7 +211,7 @@ projection's `fields` (each is granted separately), then pass
 `window = ProjectionWindow.THIRTY_DAYS` to `watchProjection` or
 `getProjectionValuations`. Rows then carry whichever figures the projection
 grants; a window on a projection that grants neither is rejected
-(`invalid_window`). Without a window nothing changes; `setPaths` / `setPrefix`
+with a validation error (REST `400 VALIDATION_ERROR`). Without a window nothing changes; `setPaths` / `setPrefix`
 keep it, and `stream.window` reports it.
 
 - `row.pnl: ProjectedPnl?` (`window`, `from`, `asOf`, `coverage`,
