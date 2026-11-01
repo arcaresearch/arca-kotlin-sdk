@@ -37,7 +37,11 @@ public data class RealmEvent(
     public val watchId: String? = null,
     /** Projection name, present on projection-watch `object.valuation` frames. */
     public val projection: String? = null,
-    /** Changed rows keyed by object path (projection delta frames). */
+    /**
+     * Changed rows keyed by object path (projection delta frames). Rows decode
+     * one by one: a row this SDK cannot read is dropped, not the frame.
+     */
+    @Serializable(with = ProjectedRowMapSerializer::class)
     public val valuations: Map<String, ProjectedValuation>? = null,
     /** Paths of objects deleted since the last frame (projection delta frames). */
     public val removed: List<String>? = null,

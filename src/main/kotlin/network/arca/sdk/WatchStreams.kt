@@ -290,7 +290,18 @@ public class ProjectionWatchStream internal constructor(
     public val projection: String,
     /** The projection's field set at watch-creation time. */
     public val fields: List<String>,
+    /** The window the rows' `pnl` / `volume` figures cover, when the watch asked for one. */
+    public val window: String? = null,
 ) : BaseWatchStream() {
+    internal val resyncingMut: MutableStateFlow<Boolean> = MutableStateFlow(false)
+
+    /**
+     * True while the stream is reconnecting or re-reading its scope after a
+     * delivery gap: the rows are the last ones delivered, not current, and
+     * never zeros.
+     */
+    public val isStale: Boolean get() = state.value != WatchStreamState.CONNECTED || resyncingMut.value
+
     internal val watchIdMut: MutableStateFlow<String> = MutableStateFlow("")
     internal val scopeMut: MutableStateFlow<ProjectionWatchScope> = MutableStateFlow(ProjectionWatchScope())
     internal val valuationsMut: MutableStateFlow<Map<String, ProjectedValuation>> = MutableStateFlow(emptyMap())

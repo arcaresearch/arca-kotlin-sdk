@@ -143,7 +143,7 @@ Mutations return `OperationHandle<R>` (HTTP runs in background):
 | Market meta | arca.getMarketMeta() / market(id) / resolveMarkets(symbol, opts) |
 | Mids/tickers/book | arca.getMarketMids / getMarketTickers / getOrderBook |
 | Projection registry | arca.upsertProjection(name, fields, resources) / getProjection / listProjections / deleteProjection — requires arca:ManageProjection; fields from the bounded catalog equity/realizedValue/unrealizedValue/positions; resources are path patterns ("/users/*") |
-| Projection batched read | arca.getProjectionValuations(name, prefix?, path?, paths?, cursor?, limit?) -> ProjectionValuationsPage (keyset-paginated ProjectedValuation rows; only registered fields + identity are ever present) — requires arca:ReadProjection on the projection NAME |
+| Projection batched read | arca.getProjectionValuations(name, prefix?, path?, paths?, cursor?, limit?, window?) -> ProjectionValuationsPage (keyset-paginated ProjectedValuation rows; only registered fields + identity are ever present) — requires arca:ReadProjection on the projection NAME |
 | Candles | arca.getCandles(market, interval, options) |
 | OI history | arca.getOIHistory(market, interval, options) -> OHLC open interest + 24h ntlVlm + mark; intervals 1m/5m/1h/1d |
 | Funding history | arca.getFundingHistory(market, startTime?, endTime?) -> SETTLED funding observations {t, fundingRate, premium?, s?}; no interval (event series); default 7d, max 30d; HIP-3 supported; not predicted (use ticker funding/nextFundingTime) |
@@ -202,7 +202,47 @@ projection and carry the server's own status (`sealed`/`carried`/`incomplete`).
 | arca.watchCandleChart(market, interval, ...) | StateFlow<List<Candle>> + CandleChartUpdate |
 | arca.watchOI(coins, intervals) | Flow<OIEvent> (market, interval, bar, isClosed) |
 | arca.watchMaxOrderSize(options) | StateFlow<ActiveAssetData?> + StateFlow<MaxOrderSizePendingReason?> pendingReason |
-| arca.watchProjection(name, paths = listOf(...), prefix = null) | StateFlow<Map<String,ProjectedValuation>> valuations keyed by path — one batched watch over the accounts named (`paths`, max 500, and/or a `prefix` sub-tree; both only narrow the registration). `setPaths(paths)` / `setPrefix(prefix)` replace the scope in place under the same watch id (ack carries the new scope's snapshot, which replaces the rows); `scope` is the current interest set. No paths and no prefix is an EMPTY watch (delivers nothing until setPaths) — never every covered account. Loads the scope's snapshot (watch reply + REST pages for a prefix), merges per-account DELTA frames (only changed rows arrive; a `removed` list drops deleted paths), re-marks rows client-side on every mids tick (subscribing to mids only for the markets its rows hold), and re-creates the server-side watch with the current scope on reconnect/rotation. Requires arca:ReadProjection. |
+| arca.watchProjection(name, paths = listOf(...), prefix = null) | StateFlow<Map<String,ProjectedValuation>> valuations keyed by path — one batched watch over the accounts named (`paths`, max 500, and/or a `prefix` sub-tree; both only narrow the registration). `setPaths(paths)` / `setPrefix(prefix)` replace the scope in place under the same watch id (ack carries the new scope's snapshot, which replaces the rows); `scope` is the current interest set. No paths and no prefix is an EMPTY watch (delivers nothing until setPaths) — never every covered account. Loads the scope's snapshot (watch reply + REST pages for a prefix), merges per-account DELTA frames (only changed rows arrive; a `removed` list drops deleted paths), re-marks rows client-side on every mids tick (subscribing to mids only for the markets its rows hold), and re-creates the server-side watch with the current scope on reconnect/rotation. Requires arca:ReadProjection. Pass `window = ProjectionWindow.THIRTY_DAYS` for rolling 30-day `pnl` / `volume` figures (see below). |
+
+### Rolling 30-day P&L and volume on projections (2.20.0)
+
+Requires the matching platform deployment. Register `pnl` and/or `volume` in a
+projection's `fields` (each is granted separately), then pass
+`window = ProjectionWindow.THIRTY_DAYS` to `watchProjection` or
+`getProjectionValuations`. Rows then carry whichever figures the projection
+grants; a window on a projection that grants neither is rejected
+(`invalid_window`). Without a window nothing changes; `setPaths` / `setPrefix`
+keep it, and `stream.window` reports it.
+
+- `row.pnl: ProjectedPnl?` (`window`, `from`, `asOf`, `coverage`,
+  `coveredFrom`, `status`, `pnlUsd`). P&L over `(from, asOf]` is
+  `A(asOf) - A(from)` with `A(t) = equity(t) - cumInflows(t) + cumOutflows(t)`:
+  deposits, withdrawals and transfers never count; realized and unrealized
+  gains, fees, funding and liquidations do. It equals the P&L history's value
+  for the same `from`. `from` is an hour boundary and advances hourly.
+- `row.volume: ProjectedVolume?` (`window`, `from`, `asOf`, `coverage`,
+  `coveredFrom`, `status`, `volumeUsd`). Sum of `|size × price|` over executed
+  fills in `(from, asOf]`, liquidations and partial fills included, each fill
+  once; unfilled orders, deposits, transfers, fees, funding and price moves
+  never count. It changes only when a fill lands or the window advances.
+- `windowedStatus` per figure: `COMPLETE`, `INCOMPLETE` (P&L only: a mark was
+  missing, so the value is off by that position's move) or `PENDING` (not
+  computed yet — `pnlUsd` / `volumeUsd` is null, never `"0"`; render unknown).
+  `coverage == "since_creation"` marks an account younger than the window.
+  Rank or sum rows only when their `from` matches. Values are exact decimal
+  strings; parse with `BigDecimal`, never `Double`.
+- Between server frames the stream re-marks `equity`, `unrealizedValue` and
+  `pnl.pnlUsd` by the change in position P&L, in exact decimals, so unsettled
+  funding stays in; `volume` is never re-marked; server-priced rows are left as
+  delivered.
+- A row the client cannot decode (or a malformed figure) is dropped on its
+  own; the rest of the frame or page still applies.
+- Recovery: a delivery gap or a server `stream.resync` re-reads the current
+  scope under the same watch; a reconnect re-creates the watch with the current
+  scope and window, retrying with backoff (1 s doubling to 30 s) until it
+  lands. `isStale` is true while either is under way — show the held rows as
+  stale, not as zero. A removal and a new row for the same path in one frame
+  (an account replaced at that path) keeps the new row.
 
 Buying power is TWO numbers on a venue with a cross-dex reservation (the live
 `hl` venue), not one. The venue-native dex (`hl:0:*`) keeps

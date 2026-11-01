@@ -75,34 +75,86 @@ public fun ObjectValuation.revalued(mids: Map<String, String>): ObjectValuation 
 }
 
 /**
- * Returns a copy with price-derived fields recomputed from current mid prices:
- * each position is re-marked, `unrealizedValue` (when projected) is replaced by
- * the fresh P&L sum, and `equity` (when projected) is rebuilt as
- * `realizedValue + newPnl` when the realized component is available, else
- * shifted by the P&L delta. Rows without positions pass through unchanged.
+ * Returns a copy re-marked at the given mids, in exact decimals.
+ *
+ * One rule covers every price-derived figure: `equity`, `unrealizedValue` and
+ * the windowed `pnl` each shift by the change in position P&L from the
+ * delivered row to the new mids. Everything else the server put in them
+ * (cash, unsettled funding, the P&L baseline) is kept as delivered. `volume`
+ * is never re-marked.
+ *
+ * Rows the server prices ([PricingMode.SERVER]), rows without positions, and
+ * positions without a mid pass through unchanged. Always re-mark the row as
+ * delivered, never an already re-marked one.
  */
 public fun ProjectedValuation.revalued(mids: Map<String, String>): ProjectedValuation {
-    // Server-authoritative pricing: trust the delivered values verbatim.
     if (pricingMode == PricingMode.SERVER) return this
     val positions = positions
     if (positions.isNullOrEmpty()) return this
 
-    val newPositions = positions.map { it.revalued(mids) }
-    val oldPnl = positions.fold(BigDecimal.ZERO) { sum, p -> sum + parseDecimalOrZero(p.unrealizedPnl ?: "0") }
-    val newPnl = newPositions.fold(BigDecimal.ZERO) { sum, p -> sum + parseDecimalOrZero(p.unrealizedPnl ?: "0") }
-
-    val newUnrealized = if (unrealizedValue != null) decToString(newPnl) else null
-    val newEquity = when {
-        equity == null -> null
-        realizedValue != null -> decToString(parseDecimalOrZero(realizedValue) + newPnl)
-        else -> decToString(parseDecimalOrZero(equity) + (newPnl - oldPnl))
+    var shift = BigDecimal.ZERO
+    var moved = false
+    var allMarked = true
+    val newPositions = positions.map { p ->
+        val remarked = p.remarkedWithShift(mids)
+        if (remarked == null) {
+            if (p.markPrice == null) allMarked = false
+            p
+        } else {
+            moved = true
+            shift += remarked.second
+            remarked.first
+        }
     }
+    if (!moved) return this
 
+    fun shifted(raw: String?): String? {
+        val value = parseDecimalOrNull(raw) ?: return raw
+        return decToString(value + shift)
+    }
+    val newPnl = pnl?.let { p ->
+        if (p.windowedStatus == WindowedStatus.PENDING) p
+        else parseDecimalOrNull(p.pnlUsd)?.let { p.copy(pnlUsd = decToString(it + shift)) } ?: p
+    }
     return copy(
-        equity = newEquity,
-        unrealizedValue = newUnrealized,
+        midsComplete = if (midsComplete == false && allMarked) null else midsComplete,
+        equity = shifted(equity),
+        unrealizedValue = shifted(unrealizedValue),
         positions = newPositions,
+        pnl = newPnl,
     )
+}
+
+/**
+ * Re-marks a projected position at a new mid: the position and the change in
+ * its P&L from the delivered row, or null when the mid or the position's
+ * numbers are unusable. The change is measured from the delivered mark; a
+ * position the server could not mark was left out of its row's figures, so
+ * its whole P&L is the change.
+ */
+private fun PositionValue.remarkedWithShift(mids: Map<String, String>): Pair<PositionValue, BigDecimal>? {
+    val mid = mids[market] ?: return null
+    val midDec = parseDecimalOrNull(mid) ?: return null
+    val sizeDec = parseDecimalOrNull(size) ?: return null
+    val signedSize = when (side) {
+        "short" -> sizeDec.abs().negate()
+        "long" -> sizeDec.abs()
+        else -> sizeDec
+    }
+    val delivered = parseDecimalOrNull(unrealizedPnl)
+    val markDec = parseDecimalOrNull(markPrice)
+    val pnl: BigDecimal
+    val shift: BigDecimal
+    if (markDec != null && delivered != null) {
+        shift = signedSize * (midDec - markDec)
+        pnl = delivered + shift
+    } else {
+        val entryDec = parseDecimalOrNull(entryPrice) ?: return null
+        pnl = signedSize * (midDec - entryDec)
+        shift = pnl - (delivered ?: BigDecimal.ZERO)
+    }
+    val pnlStr = decToString(pnl)
+    return copy(markPrice = mid, unrealizedPnl = pnlStr, valueUsd = pnlStr) to shift
 }
 
 /**

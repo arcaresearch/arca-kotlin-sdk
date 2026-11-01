@@ -1015,16 +1015,25 @@ public class WebSocketManager internal constructor(
      * socket and callers must re-create it on reconnect or rotation (see
      * [rotatedStream]).
      */
-    public suspend fun createProjectionWatch(projection: String, scope: ProjectionWatchScope = ProjectionWatchScope()): ProjectionWatchCreated =
-        projectionRequest("watch_projection '$projection'") { id -> watchProjectionMsg(projection, scope, id) }
+    public suspend fun createProjectionWatch(
+        projection: String,
+        scope: ProjectionWatchScope = ProjectionWatchScope(),
+        window: String? = null,
+    ): ProjectionWatchCreated =
+        projectionRequest("watch_projection '$projection'") { id -> watchProjectionMsg(projection, scope, window, id) }
 
     /**
      * Replace a live projection watch's interest set in place and suspend
      * until the server replies with the snapshot of the NEW scope. The
-     * watch keeps its ID; the caller swaps the rows wholesale.
+     * watch keeps its ID; the caller swaps the rows wholesale. Without
+     * [window] the watch keeps the one it has.
      */
-    public suspend fun updateProjectionWatch(watchId: String, scope: ProjectionWatchScope): ProjectionWatchCreated =
-        projectionRequest("update_projection_watch '$watchId'") { id -> updateProjectionWatchMsg(watchId, scope, id) }
+    public suspend fun updateProjectionWatch(
+        watchId: String,
+        scope: ProjectionWatchScope,
+        window: String? = null,
+    ): ProjectionWatchCreated =
+        projectionRequest("update_projection_watch '$watchId'") { id -> updateProjectionWatchMsg(watchId, scope, window, id) }
 
     private suspend fun projectionRequest(label: String, build: (String) -> JsonObject): ProjectionWatchCreated {
         val deferred = CompletableDeferred<ProjectionWatchCreated>()
@@ -1839,14 +1848,10 @@ public class WebSocketManager internal constructor(
     private fun handleProjectionWatchCreated(obj: JsonObject) {
         val requestId = obj["requestId"]?.jsonPrimitive?.contentOrNull ?: return
         val deferred = lock.withLock { pendingProjectionRequests.remove(requestId) } ?: return
-        val valuations = obj["valuations"]?.let { el ->
-            runCatching {
-                arcaJson.decodeFromJsonElement(
-                    kotlinx.serialization.builtins.ListSerializer(ProjectedValuation.serializer()),
-                    el,
-                )
-            }.getOrNull()
-        } ?: emptyList()
+        // Row by row: one row this SDK cannot read must not empty the snapshot.
+        val valuations = (obj["valuations"] as? JsonArray).orEmpty().mapNotNull { el ->
+            runCatching { arcaJson.decodeFromJsonElement(ProjectedValuation.serializer(), el) }.getOrNull()
+        }
         deferred.complete(
             ProjectionWatchCreated(
                 watchId = obj["watchId"]?.jsonPrimitive?.contentOrNull ?: "",
@@ -1854,6 +1859,7 @@ public class WebSocketManager internal constructor(
                 fields = obj["fields"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList(),
                 valuations = valuations,
                 cursor = obj["cursor"]?.jsonPrimitive?.contentOrNull,
+                window = obj["window"]?.jsonPrimitive?.contentOrNull,
             ),
         )
     }
@@ -2262,17 +2268,19 @@ public class WebSocketManager internal constructor(
         put("intervals", buildJsonArray { intervals.forEach { add(it) } })
     }
 
-    private fun watchProjectionMsg(projection: String, scope: ProjectionWatchScope, requestId: String): JsonObject = buildJsonObject {
+    private fun watchProjectionMsg(projection: String, scope: ProjectionWatchScope, window: String?, requestId: String): JsonObject = buildJsonObject {
         put("action", "watch_projection")
         put("projection", projection)
         putProjectionScope(scope)
+        if (!window.isNullOrEmpty()) put("window", window)
         put("requestId", requestId)
     }
 
-    private fun updateProjectionWatchMsg(watchId: String, scope: ProjectionWatchScope, requestId: String): JsonObject = buildJsonObject {
+    private fun updateProjectionWatchMsg(watchId: String, scope: ProjectionWatchScope, window: String?, requestId: String): JsonObject = buildJsonObject {
         put("action", "update_projection_watch")
         put("watchId", watchId)
         putProjectionScope(scope)
+        if (!window.isNullOrEmpty()) put("window", window)
         put("requestId", requestId)
     }
 
@@ -2455,6 +2463,8 @@ public data class ProjectionWatchCreated(
     public val valuations: List<ProjectedValuation>,
     /** Set when the snapshot has more pages; fetch the rest via REST. */
     public val cursor: String?,
+    /** The window the rows' `pnl` / `volume` figures cover, when the watch asked for one. */
+    public val window: String? = null,
 )
 
 /** Projection delta-frame payload: changed rows, removed paths, and the raw event. */

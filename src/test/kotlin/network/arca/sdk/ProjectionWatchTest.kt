@@ -68,13 +68,13 @@ class ProjectionWatchTest {
     // MARK: - Revalue math
 
     @Test
-    fun revaluedRecomputesEquityFromRealizedPlusPnl() {
+    fun revaluedShiftsEquityByThePnlChange() {
         val row = projected(
             path = "/users/alice", equity = "1010", realizedValue = "1000", unrealizedValue = "10",
             positions = listOf(position(entryPrice = "100", unrealizedPnl = "10")),
         )
         val out = row.revalued(mapOf("hl:0:BTC" to "120"))
-        // pnl = 1 * (120 - 100) = 20; equity = realized 1000 + 20
+        // long 1 marked 110 → 120: pnl 10 → 20, equity 1010 + 10
         assertEquals("1020", out.equity)
         assertEquals("20", out.unrealizedValue)
         assertEquals("120", out.positions?.first()?.markPrice)
