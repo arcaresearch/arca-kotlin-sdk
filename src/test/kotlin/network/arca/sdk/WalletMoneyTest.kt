@@ -27,6 +27,7 @@ import network.arca.sdk.models.MoneyRevaluation
 import network.arca.sdk.models.WALLET_SNAPSHOT_SCHEMA
 import network.arca.sdk.models.WalletEndpoint
 import network.arca.sdk.models.WalletMoney
+import network.arca.sdk.models.WalletNativeBalances
 import network.arca.sdk.models.WalletSnapshot
 import network.arca.sdk.models.WalletState
 import okhttp3.OkHttpClient
@@ -136,13 +137,32 @@ class WalletMoneyTest {
             for (account in snapshot.accounts) {
                 val figure = money.account(account.arcaId) ?: fail("${file.name}: ${account.arcaId}")
                 assertEquals(account.balances?.totalMicro, figure.settledMicro, "${file.name}: ${account.arcaId} is balances.totalMicro")
-                assertEquals(account.balances?.withdrawableMicro, figure.availableMicro, file.name)
+                assertEquals(account.balances?.let { Micro.sum(listOf(it.withdrawableMicro, it.spotMicro)) }, figure.availableMicro, file.name)
                 assertEquals(account.current, figure.current, file.name)
                 assertEquals(account.asOf, figure.asOf, file.name)
             }
             assertEquals(snapshot.totals.complete, money.complete, file.name)
             assertTrue(money.diagnostics.isEmpty(), "${file.name}: ${money.diagnostics}")
         }
+    }
+
+    /** Under Hyperliquid's unified mode the venue reports withdrawable 0 and keeps the free money in spot. */
+    @Test
+    fun unifiedAccountAvailableCountsFreeSpot() {
+        val money = WalletMoney.compose(fixture("22-unified-collateral"))
+        assertEquals("1100000", money.account(hl1)!!.availableMicro, "free spot beside a held position")
+        assertEquals("1500000", money.account(hl1)!!.settledMicro)
+        assertEquals("1000000", money.account(hl2)!!.availableMicro, "nothing held: all of it")
+    }
+
+    @Test
+    fun malformedAccountBalanceHasNoAvailable() {
+        fun balances(withdrawable: String, spot: String) =
+            WalletNativeBalances(totalMicro = "1", withdrawableMicro = withdrawable, spotMicro = spot, source = "hyperliquid_ws")
+        assertNull(WalletMoney.payout(balances("", "5")))
+        assertNull(WalletMoney.payout(balances("5", "x")))
+        assertNull(WalletMoney.payout(balances("-1", "5")))
+        assertEquals("5", WalletMoney.payout(balances("2", "3")))
     }
 
     @Test

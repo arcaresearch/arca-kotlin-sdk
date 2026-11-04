@@ -128,7 +128,10 @@ public data class MoneyFigure(
     val kind: MoneyFigureKind,
     /** Arca's figure verbatim: Cash `confirmedMicro`, an account's `balances.totalMicro`, the wallet's `totals.totalMicro`. */
     val settledMicro: String?,
-    /** What the figure can pay out now: Cash `availableMicro`, an account's `withdrawableMicro`; null for the total. */
+    /**
+     * What the figure can pay out now: Cash `availableMicro`, an account's `withdrawableMicro` plus `spotMicro`;
+     * null for the total and for an account with no well-formed balances.
+     */
     val availableMicro: String?,
     /** Money on its way in, one leg per operation. */
     val arriving: List<MoneyLeg>,
@@ -269,7 +272,7 @@ public data class WalletMoney(
                 var figure = MoneyFigure(
                     kind = MoneyFigureKind.Account(account.arcaId),
                     settledMicro = account.balances?.totalMicro,
-                    availableMicro = account.balances?.withdrawableMicro,
+                    availableMicro = account.balances?.let(::payout),
                     arriving = ends.arriving,
                     departing = ends.departing,
                     asOf = account.asOf,
@@ -462,6 +465,18 @@ public data class WalletMoney(
                 ?: return if (account.balances == null) Revaluation.Failure("no figure to revalue") else Revaluation.Success(revaluation.equityMicro)
             if (revaluation.observedAt.isBefore(figureTime)) return Revaluation.Failure("venue frame older than the figure")
             return Revaluation.Success(revaluation.equityMicro)
+        }
+
+        /**
+         * What an account can pay out now: the venue's perps withdrawable plus its free spot USDC, two parts
+         * of the one observation the frame carries, counted as Arca's route previews count them. Under
+         * Hyperliquid's unified and portfolio-margin modes withdrawable is 0 and free spot is all of it.
+         * Null unless both are non-negative integers.
+         */
+        internal fun payout(balances: WalletNativeBalances): String? {
+            val withdrawable = Micro.parse(balances.withdrawableMicro)?.takeIf { it >= 0 } ?: return null
+            val spot = Micro.parse(balances.spotMicro)?.takeIf { it >= 0 } ?: return null
+            return (withdrawable + spot).toString()
         }
 
         /** `cash.confirmed + moving(in transit) + Σ accounts`, for the diagnostic only. */
